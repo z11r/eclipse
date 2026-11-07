@@ -13,6 +13,8 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+from eclipse.text_detect.covers import MOVE, REREAD, STAY, CoverTracks, Sighting
+
 Box = tuple[int, int, int, int, str]
 CATEGORIES = frozenset({'email', 'phone', '2fa', 'api_key', 'card', 'keyword'})
 
@@ -204,18 +206,49 @@ def _join(area, other):
     )
 
 
+def _inside(rect) -> tuple[slice, slice]:
+    """The rows and columns of a (left, top, right, bottom, ...) box, for indexing a mask."""
+    x1, y1, x2, y2 = rect[:4]
+    return (
+        slice(max(int(y1), 0), max(int(y2) + 1, 0)),
+        slice(max(int(x1), 0), max(int(x2) + 1, 0)),
+    )
+
+
+def _part_of_a_pixel(now_rows, before_rows) -> float:
+    """How much further than a whole pixel some aligned rows moved.
+
+    Downscaled frames scroll by fractions of a pixel. Rounding every frame's shift
+    would add up and slide covers off their text during a long scroll.
+    """
+    slope = np.gradient(before_rows)
+    steepness = float((slope * slope).sum())
+
+    if steepness == 0:
+        return 0.0
+
+    return float(np.clip((slope * (before_rows - now_rows)).sum() / steepness, -0.5, 0.5))
+
+
+def _text_hash(text: str) -> int:
+    """Tells text apart across reads, so tracks never have to keep the text itself."""
+    return hash(''.join(text.split()).lower())
+
+
 class Detector:
     """Read text from images and find sensitive information.
 
     Use one detector per screen or camera. Only rows that changed are read
-    again; text read earlier keeps being reported until its pixels change, so a
-    secret that sits still stays covered. Changing settings clears saved results."""
+    again, and text read earlier is kept until its pixels change. A secret's cover
+    lives in CoverTracks, so one read missing it doesn't uncover it. Each result is
+    everything to cover in that frame. Changing settings clears saved results."""
 
     def __init__(self, keywords=(), enabled=None, padding=0, reader=None, pixel_scale=1):
         self.stats = {
             'frames': 0, 'full_scans': 0, 'partial_scans': 0, 'scan_seconds': 0.0,
             'scanned_share': 0.0, 'diff_seconds': 0.0, 'find_seconds': 0.0,
             'det_seconds': 0.0, 'rec_seconds': 0.0, 'reads': 0, 'lines': 0, 'scrolls': 0,
+            'checks': 0,
         }
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
@@ -231,6 +264,8 @@ class Detector:
         self._scroll_edge = _SCROLL_EDGE * pixel_scale
         self._unread_read_at = _UNREAD_READ_AT * pixel_scale
         self._unread_keep = _UNREAD_KEEP * pixel_scale
+        self._tracks = CoverTracks(pixel_scale)
+        self._shape = None
         self._lock = threading.RLock()
         self.configure(keywords, enabled)
 
@@ -250,13 +285,41 @@ class Detector:
             self.reset()
 
     def reset(self):
-        """Forget the last image and boxes. The pipeline must clear its buffer too."""
+        """Forget everything, covers included, because old positions no longer apply.
+
+        For a new source or new settings. The pipeline must clear its buffer too."""
         with self._lock:
-            self._previous = None
-            self._regions = []
-            self._boxes = ()
-            self._unread = None
-            self._scrolled = False
+            self._forget_scan()
+            self._tracks.clear()
+
+    def _forget_scan(self):
+        """Forget what was read, so the next frame is read whole. Covers stay."""
+        self._previous = None
+        self._regions = []
+        self._boxes = ()
+        self._unread = {}  # one strip for each way rows can come in: 1 is down, -1 is up
+        self._scrolled = False
+        self._view = None  # top and bottom of the area scrolling now
+
+    def _scroll_action(self, rect, image, changed, top, bottom, left, right) -> str:
+        """What a scroll of the given area does to a piece of text or a cover."""
+        x1, y1, x2, y2 = rect[:4]
+
+        if not (x1 < right and x2 > left and y1 < bottom and y2 > top):
+            return STAY
+
+        if not changed[_inside(rect)].any():
+            pixels = image[_inside(rect)]
+            if pixels.size and int(pixels.max()) - int(pixels.min()) > _SCROLL_TOLERANCE:
+                # Text that didn't change hasn't moved: it's still text beside the scroll
+                # that the area's bounds took in. Blank pixels prove nothing either way.
+                return STAY
+
+        if x1 >= left - self._scroll_edge and x2 <= right + self._scroll_edge:
+            return MOVE
+
+        # Text cut by the edge of the scrolling area can't be trusted.
+        return REREAD
 
     def _follow_scroll(self, image, changed):
         """If the change is a clean vertical scroll, move known text along with it.
@@ -313,22 +376,39 @@ class Detector:
         solid = cv2.dilate(solid, np.ones((5, 5), np.uint8)) > 0
         remaining[top + now_start:top + now_start + length, left:right] = solid
         moved = []
+        # Rows that look the same frame to frame don't count as changed, so this frame's
+        # changed rows can fall short of the area's real edges. Remember the widest yet.
+        if self._view is not None:
+            top_of_view, bottom_of_view = min(top, self._view[0]), max(bottom, self._view[1])
+        else:
+            top_of_view, bottom_of_view = top, bottom
+        self._view = top_of_view, bottom_of_view
+        exact_shift = shift + _part_of_a_pixel(
+            now_rows[now_start:now_start + length], before_rows[before_start:before_start + length]
+        )
 
-        for x1, y1, x2, y2, text in self._regions:
-            inside = (
-                x1 >= left - self._scroll_edge and x2 <= right + self._scroll_edge
-                and y1 < bottom and y2 > top
+        def action(rect) -> str:
+            return self._scroll_action(
+                rect, image, changed, top_of_view, bottom_of_view, left, right
             )
-            if not inside:
-                # Text cut by the edge of the scrolling area can't be trusted.
-                if x1 < right and x2 > left and y1 < bottom and y2 > top:
-                    remaining[max(int(y1), 0):int(y2) + 1, max(int(x1), 0):int(x2) + 1] = True
-                    continue
-                moved.append((x1, y1, x2, y2, text))
-                continue
-            new_top, new_bottom = max(y1 + shift, top), min(y2 + shift, bottom)
-            if new_bottom > new_top:
-                moved.append((x1, new_top, x2, new_bottom, text))
+
+        for region in self._regions:
+            todo = action(region)
+            if todo == STAY:
+                moved.append(region)
+            elif todo == REREAD:
+                remaining[_inside(region)] = True
+            else:
+                x1, y1, x2, y2, text = region
+                new_top = max(y1 + exact_shift, top_of_view)
+                new_bottom = min(y2 + exact_shift, bottom_of_view)
+                if new_bottom > new_top:
+                    moved.append((x1, new_top, x2, new_bottom, text))
+
+        for place in self._tracks.follow_scroll(
+            action, exact_shift, top_of_view, bottom_of_view, image
+        ):
+            remaining[_inside(place)] = True
 
         self._regions = moved
         self.stats['scrolls'] += 1
@@ -340,33 +420,50 @@ class Detector:
         """Track rows new to the screen. They stay black until they can be read.
 
         A line coming onto the screen can't be read until enough of it shows, so
-        rows wait here, covered, until there are enough to hold whole lines.
+        rows wait here, covered, until there are enough to hold whole lines. These
+        are per-frame covers, not secrets: each frame reports only what is still
+        unread, and a read replaces them with whatever it actually found.
         """
+        top_of_view, bottom_of_view = self._view
         first = top + now_start
-        strip = (top, first) if shift > 0 else (first + length, bottom)
-        unread = (strip[0], strip[1], max(left - self._scroll_edge, 0), right + self._scroll_edge)
+        rows = (top_of_view, first) if shift > 0 else (first + length, bottom_of_view)
+        incoming = (rows[0], rows[1], max(left - self._scroll_edge, 0), right + self._scroll_edge)
+        direction = 1 if shift > 0 else -1
+        strips = {}
 
-        if self._unread is not None:
-            old_top, old_bottom, old_left, old_right = self._unread
-            old_top, old_bottom = max(old_top + shift, top), min(old_bottom + shift, bottom)
-            if old_bottom > old_top:
-                unread = _join(unread, (old_top, old_bottom, old_left, old_right))
-
-        self._unread = unread
-
-        if unread[1] - unread[0] >= self._unread_read_at:
-            remaining[unread[0]:unread[1], unread[2]:unread[3]] = True
-            if shift > 0:
-                self._unread = (unread[0], unread[0] + self._unread_keep, unread[2], unread[3])
+        for way, strip in self._unread.items():
+            if strip[2] >= right or strip[3] <= left:
+                # Its pane stopped scrolling, so what it covers can be read now.
+                remaining[strip[0]:strip[1], strip[2]:strip[3]] = True
+                continue
+            moved = (
+                max(strip[0] + shift, top_of_view), min(strip[1] + shift, bottom_of_view),
+                strip[2], strip[3],
+            )
+            if moved[1] <= moved[0]:
+                continue
+            if way == direction:
+                incoming = _join(incoming, moved)
             else:
-                self._unread = (unread[1] - self._unread_keep, unread[1], unread[2], unread[3])
+                strips[way] = moved  # a reversal left these rows at the other edge
+
+        if incoming[1] - incoming[0] >= self._unread_read_at:
+            remaining[incoming[0]:incoming[1], incoming[2]:incoming[3]] = True
+            if shift > 0:
+                incoming = (incoming[0], incoming[0] + self._unread_keep, *incoming[2:])
+            else:
+                incoming = (incoming[1] - self._unread_keep, incoming[1], *incoming[2:])
+
+        strips[direction] = incoming
+        self._unread = strips
 
     def _read_unread(self, changed) -> None:
         """Scrolling has stopped, so read whatever is still covered."""
-        if self._unread is not None and not self._scrolled:
-            top, bottom, left, right = self._unread
-            changed[top:bottom, left:right] = True
-            self._unread = None
+        if not self._scrolled:
+            for top, bottom, left, right in self._unread.values():
+                changed[top:bottom, left:right] = True
+            self._unread = {}
+            self._view = None
 
     def _changed_areas(self, image) -> list[tuple[int, int, int, int]]:
         """Areas to read again, each grown to hold whole pieces of known text."""
@@ -379,6 +476,11 @@ class Detector:
         changed = cv2.bitwise_or(cv2.bitwise_or(difference[0], difference[1]), difference[2]) > 0
         changed = self._follow_scroll(image, changed)
         self._read_unread(changed)
+
+        for place in self._tracks.due():
+            changed[_inside(place)] = True
+            self.stats['checks'] += 1
+
         rows = np.flatnonzero(changed.any(axis=1))
         bands = _merge_bands([
             (max(int(row) - self._band_margin, 0), min(int(row) + self._band_margin + 1, height))
@@ -399,7 +501,7 @@ class Detector:
                 max(math.floor(y1), 0), min(math.ceil(y2), height),
                 max(math.floor(x1), 0), min(math.ceil(x2), width),
             )
-            for x1, y1, x2, y2, _ in self._regions
+            for x1, y1, x2, y2 in [*(r[:4] for r in self._regions), *self._tracks.places()]
         ]
 
         # Grow until no area cuts through known text or overlaps another area.
@@ -493,8 +595,20 @@ class Detector:
         return [group for group in groups if len(group) > 1]
 
     def _cover(self, part, start: int, end: int) -> tuple[float, float, float, float]:
-        """Estimate where characters start to end sit inside a text region."""
+        """Estimate where characters start to end sit inside a text region.
+
+        OCR places whole words at best. A match that stops partway through a word
+        has no known edge, so it takes the whole word. Apple's OCR gives one region
+        per word, so there this is that word's own box.
+        """
         x1, y1, x2, y2, text = part
+
+        while start > 0 and not text[start - 1].isspace():
+            start -= 1
+
+        while end < len(text) and not text[end].isspace():
+            end += 1
+
         width = (x2 - x1) / max(len(text), 1)
         # Characters vary in width, so allow extra rather than clip the secret.
         left = max(x1, x1 + (start - _CHAR_MARGIN) * width)
@@ -506,7 +620,9 @@ class Detector:
 
         for region in regions:
             for category, start, end in find_matches(region[4], self._keywords):
-                areas.add((category, self._cover(region, start, end)))
+                areas.add((
+                    category, self._cover(region, start, end), _text_hash(region[4][start:end]),
+                ))
 
         # Text split across regions, tried with and without spaces.
         for group in self._groups(regions):
@@ -526,7 +642,10 @@ class Detector:
 
                     if len(touched) > 1:
                         for part, first, last in touched:
-                            areas.add((category, self._cover(part, first, last)))
+                            areas.add((
+                                category, self._cover(part, first, last),
+                                _text_hash(joined[start:end]),
+                            ))
 
         return areas
 
@@ -543,6 +662,10 @@ class Detector:
                 raise ValueError('invalid frame')
 
             with self._lock:
+                if frame.shape != self._shape:
+                    self.reset()  # nothing known about the old size fits this one
+                    self._shape = frame.shape
+
                 # Save our own copy of this image.
                 snapshot = np.array(frame, copy=True, order='C')
                 diff_started = time.monotonic()
@@ -591,20 +714,27 @@ class Detector:
                 found = self._find_areas(regions)
                 self.stats['find_seconds'] += time.monotonic() - find_started
 
-                for category, (x1, y1, x2, y2) in found:
-                    if category not in self._enabled:
-                        continue
+                self._tracks.update(snapshot, [
+                    Sighting(
+                        category, rect, text_hash,
+                        any(_overlaps((rect[1], rect[3], rect[0], rect[2]), a) for a in areas),
+                    )
+                    for category, rect, text_hash in found
+                    if category in self._enabled
+                ], areas)
 
+                for category, (x1, y1, x2, y2) in self._tracks.covers():
                     left = max(0, min(width, math.floor(x1) - self.padding))
-                    top = max(0, min(height, math.floor(y1) - self.padding))
+                    top = max(0, min(height - 1, math.floor(y1) - self.padding))
                     right = max(0, min(width, math.ceil(x2) + self.padding))
-                    bottom = max(0, min(height, math.ceil(y2) + self.padding))
+                    # A cover still in use keeps a sliver on screen, even if its box has
+                    # just left, because OCR boxes can stop short of the last of the text.
+                    bottom = max(top + 1, min(height, math.ceil(y2) + self.padding))
 
-                    if right > left and bottom > top:
+                    if right > left:
                         boxes.add((left, top, right - left, bottom - top, category))
 
-                if self._unread is not None:
-                    top, bottom, left, right = self._unread
+                for top, bottom, left, right in self._unread.values():
                     boxes.add((left, top, min(right, width) - left, bottom - top, 'unread'))
 
                 # Save results only after the whole scan succeeds.
@@ -615,7 +745,9 @@ class Detector:
                 return list(self._boxes)
 
         except Exception:
-            self.reset()
+            # Known secrets are still on screen, so a failed scan keeps their covers.
+            with self._lock:
+                self._forget_scan()
 
             raise DetectionError('Text detection failed; black out this frame.') from None
 

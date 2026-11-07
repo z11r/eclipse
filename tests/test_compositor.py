@@ -54,12 +54,11 @@ def test_fill_uses_none_of_the_pixels_under_it():
 
 
 def test_overlapping_boxes_share_one_fill_in_any_order():
-    compositor = Compositor(padding=0)
     first, second = box(x=50), box(x=60)
-    compositor.process(noise_frame(), lambda f: [first, second])
-    # Seeing the first box again leaves it under the second when boxes are drawn.
-    output = compositor.process(noise_frame(ts=0.01, frame_id=1), lambda f: [first])
-    assert is_hidden(output, 50, 30, 50, 20)
+    one_way = Compositor(padding=0).process(noise_frame(), lambda f: [first, second])
+    other_way = Compositor(padding=0).process(noise_frame(), lambda f: [second, first])
+    assert is_hidden(one_way, 50, 30, 50, 20)
+    assert (one_way == other_way).all()
 
 
 def test_the_original_frame_is_not_changed():
@@ -120,34 +119,57 @@ def test_a_good_box_next_to_a_bad_one_does_not_let_the_frame_out():
     assert not output.any()
 
 
-def test_held_frame_is_never_the_failed_frames_pixels_after_recovery():
+def test_only_this_frames_boxes_are_painted():
+    compositor = Compositor(padding=0)
+    compositor.process(noise_frame(), lambda f: [box(ttl_ms=500)])
+    later = noise_frame(ts=0.01, frame_id=1)
+    output = compositor.process(later, nothing)
+    assert (output == later.image).all()
+    assert compositor.covered_areas(100, 200) == []
+
+
+def test_recovering_from_a_failed_scan_paints_only_the_new_frames_boxes():
     compositor = Compositor(padding=0)
     compositor.process(noise_frame(ts=0.0), lambda f: [box()])
     compositor.process(noise_frame(ts=0.1, frame_id=1), crash)
-    recovered = compositor.process(noise_frame(ts=0.2, frame_id=2), nothing)
-    assert is_hidden(recovered)
+    recovered = noise_frame(ts=0.2, frame_id=2)
+    output = compositor.process(recovered, lambda f: [box(x=100, frame_id=2)])
+    assert is_hidden(output, 100)
+    assert not is_hidden(output)
 
 
-def test_blur_holds_for_ttl_after_the_clue_is_gone():
-    compositor = Compositor(padding=0)
-    compositor.process(noise_frame(ts=0.0), lambda f: [box(ttl_ms=500)])
-    held = compositor.process(noise_frame(ts=0.4, frame_id=1), nothing)
-    assert is_hidden(held)
+def test_a_box_from_another_frame_is_a_failed_scan():
+    compositor = Compositor()
+    compositor.process(noise_frame(), nothing)
+    stale = noise_frame(ts=0.1, frame_id=1)
+    compositor.process(stale, lambda f: [box(frame_id=0)])
+    assert compositor.held_frames == 1
 
 
-def test_blur_ends_after_ttl():
-    compositor = Compositor(padding=0)
-    compositor.process(noise_frame(ts=0.0), lambda f: [box(ttl_ms=500)])
-    expired = compositor.process(noise_frame(ts=0.6, frame_id=1), nothing)
-    assert not is_hidden(expired)
+def test_moving_box_leaves_no_trail():
+    """30 positions at 60 Hz, 6 px apart. This used to paint a 214 px band."""
+    compositor = Compositor()
+    width, height = 400, 720
+    for index in range(30):
+        y = 100 + index * 6
+        frame = Frame(np.full((height, width, 3), 200, dtype=np.uint8), index / 60, "screen", index)
+        detection = Detection(50, y, 100, 20, "api_key", 1.0, 500, index)
+        output = compositor.process(frame, lambda f: [detection])
+        covered = (output == 0).all(axis=2)
+        rows = np.flatnonzero(covered[:, 100])
+        assert rows.size == 40
+        assert (rows[0], rows[-1]) == (y - 10, y + 29)
+        assert covered.sum() == 120 * 40  # the padded cover, and nothing else
 
 
-def test_seeing_a_clue_again_restarts_its_ttl():
-    compositor = Compositor(padding=0)
-    compositor.process(noise_frame(ts=0.0), lambda f: [box(ttl_ms=500)])
-    compositor.process(noise_frame(ts=0.4, frame_id=1), lambda f: [box(ttl_ms=500)])
-    still_held = compositor.process(noise_frame(ts=0.8, frame_id=2), nothing)
-    assert is_hidden(still_held)
+def test_jittering_boxes_never_add_up():
+    compositor = Compositor()
+    for index in range(20):
+        frame = noise_frame(ts=index / 60, frame_id=index)
+        wobble = index % 3
+        detection = box(x=50 + wobble, y=30 - wobble, w=40 + wobble, frame_id=index)
+        compositor.process(frame, lambda f: [detection])
+        assert len(compositor.covered_areas(100, 200)) == 1
 
 
 def test_error_text_is_not_printed(capsys):

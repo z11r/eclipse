@@ -64,10 +64,9 @@ def test_missed_secret_is_reported_for_every_frame_it_shows(clip):
     assert report["leaks_by_secret"]["email"] == frames_on_screen(clip[1], "email")
 
 
-def test_still_secret_leaks_once_its_ttl_runs_out(clip):
+def test_still_secret_leaks_as_soon_as_the_detector_stops_reporting_it(clip):
     report = evaluate(clip, fakes.first_sighting_only)
-    frames_covered_by_ttl = int(fakes.TTL_MS / 1000 * clip[1]["fps"]) + 1
-    expected = frames_on_screen(clip[1], "still_api_key") - frames_covered_by_ttl
+    expected = frames_on_screen(clip[1], "still_api_key") - 1
     assert report["leaks_by_secret"]["still_api_key"] == expected
 
 

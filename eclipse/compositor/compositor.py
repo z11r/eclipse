@@ -1,8 +1,13 @@
 """Compositor: the last stop before output, and where fail closed is enforced.
 
-Every frame goes through process(). It either returns a frame with all active
+Every frame goes through process(). It either returns a frame with that frame's
 detections hidden, or, if anything went wrong, the last safe frame. The raw frame
 is never returned unless its scan finished cleanly.
+
+The compositor keeps no boxes between frames. A screen position goes stale as soon
+as anything moves, and holding old ones paints trails behind moving text. A detector
+must report everything to cover on every frame, and it decides how long a cover
+lasts, because it can tell where the text went.
 
 Use one Compositor per source, since boxes are in that source's pixels.
 """
@@ -24,22 +29,25 @@ FILL = (0, 0, 0)  # BGR. Fixed, so a cover carries nothing from the pixels under
 class Compositor:
     def __init__(self, padding: int = PADDING) -> None:
         self._padding = padding
-        self._active: dict[tuple[int, int, int, int], float] = {}  # box -> expiry time
+        self._boxes: list[tuple[int, int, int, int]] = []  # this frame's boxes
         self._last_safe: np.ndarray | None = None
         self.held_frames = 0
 
     def process(self, frame: Frame, detect: Detector) -> np.ndarray:
         """Scan a frame and return what is safe to send."""
         try:
-            self._remember(frame, detect(frame))
+            self._boxes = self._checked(frame, detect(frame))
             output = self._redact(frame)
         except Exception as error:
             return self._hold(frame, error)
         self._last_safe = output
         return output
 
-    def _remember(self, frame: Frame, detections: list[Detection]) -> None:
+    def _checked(
+        self, frame: Frame, detections: list[Detection]
+    ) -> list[tuple[int, int, int, int]]:
         height, width = frame.image.shape[:2]
+        boxes = []
         for detection in detections:
             outside = (
                 detection.x >= width
@@ -51,15 +59,15 @@ class Compositor:
                 # A secret was found but we can't tell where it is.
                 raise ValueError("detection box is not inside the frame")
             if not detection.ttl_ms >= 0:  # also catches NaN
-                # Its cover would expire before it is drawn.
                 raise ValueError("detection ttl_ms must not be negative")
-            box = (detection.x, detection.y, detection.w, detection.h)
-            expiry = frame.ts + detection.ttl_ms / 1000
-            self._active[box] = max(expiry, self._active.get(box, expiry))
-        self._active = {box: end for box, end in self._active.items() if end >= frame.ts}
+            if detection.frame_id != frame.frame_id:
+                # Its position belongs to some other picture.
+                raise ValueError("detection is from a different frame")
+            boxes.append((detection.x, detection.y, detection.w, detection.h))
+        return boxes
 
     def covered_areas(self, height: int, width: int) -> list[tuple[int, int, int, int]]:
-        """Each active box as left, top, right, bottom, padded and clipped to the frame."""
+        """Each box as left, top, right, bottom, padded and clipped to the frame."""
         return [
             (
                 max(x - self._padding, 0),
@@ -67,7 +75,7 @@ class Compositor:
                 min(x + w + self._padding, width),
                 min(y + h + self._padding, height),
             )
-            for x, y, w, h in self._active
+            for x, y, w, h in self._boxes
         ]
 
     def _redact(self, frame: Frame) -> np.ndarray:
