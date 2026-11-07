@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 from eclipse.capture.clip import ClipCapture
-from eclipse.compositor.compositor import Compositor
+from eclipse.compositor.compositor import PADDING, Compositor
 from eval.fake_detectors import FAKE_DETECTORS
 from eval.truth import CLIPS_DIR, EVAL_DIR, box_at, is_on_screen, load_labels
 
@@ -117,7 +117,8 @@ def evaluate(
                 for secret in active:
                     x, y, w, h = box_at(secret, frame.frame_id)
                     # Padding around a real secret isn't false blur.
-                    covered[max(y - 8, 0) : y + h + 8, max(x - 8, 0) : x + w + 8] = False
+                    top, left = max(y - PADDING, 0), max(x - PADDING, 0)
+                    covered[top : y + h + PADDING, left : x + w + PADDING] = False
                 false_blur_shares.append(float(covered.mean()))
 
     if not latencies:

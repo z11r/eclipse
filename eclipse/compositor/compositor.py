@@ -17,9 +17,12 @@ from eclipse.types import Detection, Frame
 
 Detector = Callable[[Frame], list[Detection]]
 
+PADDING = 10  # the spec's minimum, in pixels
+FILL = (0, 0, 0)  # BGR. Fixed, so a cover carries nothing from the pixels under it.
+
 
 class Compositor:
-    def __init__(self, padding: int = 6) -> None:
+    def __init__(self, padding: int = PADDING) -> None:
         self._padding = padding
         self._active: dict[tuple[int, int, int, int], float] = {}  # box -> expiry time
         self._last_safe: np.ndarray | None = None
@@ -68,10 +71,8 @@ class Compositor:
         output = frame.image.copy()
         height, width = output.shape[:2]
         for left, top, right, bottom in self.covered_areas(height, width):
-            region = output[top:bottom, left:right]
-            if region.size:
-                # A solid fill, because blurred text can sometimes be recovered.
-                region[:] = region.mean(axis=(0, 1))
+            # A solid fill, because blurred text can sometimes be recovered.
+            output[top:bottom, left:right] = FILL
         return output
 
     def _hold(self, frame: Frame, error: Exception) -> np.ndarray:

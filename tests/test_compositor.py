@@ -38,9 +38,26 @@ def test_box_is_hidden_and_the_rest_is_untouched():
     assert (output[untouched] == frame.image[untouched]).all()
 
 
-def test_padding_covers_the_edges_of_the_box():
-    output = Compositor(padding=6).process(noise_frame(), lambda f: [box()])
-    assert is_hidden(output, 44, 24, 52, 32)
+def test_default_padding_covers_at_least_10_px_around_the_box():
+    output = Compositor().process(noise_frame(), lambda f: [box()])
+    assert is_hidden(output, 40, 20, 60, 40)
+
+
+def test_fill_uses_none_of_the_pixels_under_it():
+    dark = Frame(np.full((100, 200, 3), 10, dtype=np.uint8), 0.0, "screen", 0)
+    bright = Frame(np.full((100, 200, 3), 240, dtype=np.uint8), 0.0, "screen", 0)
+    dark_output = Compositor(padding=0).process(dark, lambda f: [box()])
+    bright_output = Compositor(padding=0).process(bright, lambda f: [box()])
+    assert (dark_output[30:50, 50:90] == bright_output[30:50, 50:90]).all()
+
+
+def test_overlapping_boxes_share_one_fill_in_any_order():
+    compositor = Compositor(padding=0)
+    first, second = box(x=50), box(x=60)
+    compositor.process(noise_frame(), lambda f: [first, second])
+    # Seeing the first box again leaves it under the second when boxes are drawn.
+    output = compositor.process(noise_frame(ts=0.01, frame_id=1), lambda f: [first])
+    assert is_hidden(output, 50, 30, 50, 20)
 
 
 def test_the_original_frame_is_not_changed():
