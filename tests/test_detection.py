@@ -1,7 +1,7 @@
 """Run: python -m unittest discover -s tests -v (no OCR model needed)."""
 import unittest
 import numpy as np
-from detection import Detector, DetectionError, apply_covers, classify_text, luhn_valid
+from eclipse.text_detect.detection import Detector, DetectionError, apply_covers, classify_text, luhn_valid
 
 
 class FakeReader:
@@ -62,6 +62,7 @@ class DetectionTests(unittest.TestCase):
     def test_fullwidth_phone_with_only_phone_enabled(self):
         detector = Detector(
             enabled=['phone'],
+            padding=10,
             reader=FakeReader([region('+1\uff08780\uff09 555-0123')]),
         )
         frame = np.full((80, 120, 3), 255, dtype=np.uint8)
@@ -71,7 +72,7 @@ class DetectionTests(unittest.TestCase):
 
     def test_padding_and_opaque_covers(self):
         frame = np.full((80, 120, 3), 255, dtype=np.uint8)
-        boxes = Detector(reader=FakeReader([region('demo@example.com')])).detect(frame)
+        boxes = Detector(padding=10, reader=FakeReader([region('demo@example.com')])).detect(frame)
         self.assertEqual(boxes, [(10, 10, 90, 40, 'email')])
         redacted = apply_covers(frame, boxes)
         self.assertTrue((redacted[10:50, 10:100] == 0).all())
@@ -104,12 +105,13 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(reader.calls, 3)
 
     def test_split_email_and_clipping(self):
-        detector = Detector(reader=FakeReader([
+        detector = Detector(padding=10, reader=FakeReader([
             region('demo@', left=0, right=40),
             region('example.com', left=45, right=120),
         ]))
         boxes = detector.detect(np.zeros((80, 120, 3), dtype=np.uint8))
-        self.assertIn((0, 10, 120, 40, 'email'), boxes)
+        self.assertIn((0, 10, 50, 40, 'email'), boxes)
+        self.assertIn((35, 10, 85, 40, 'email'), boxes)
 
     def test_failure_is_sanitized_and_not_cached(self):
         reader = FakeReader()

@@ -114,11 +114,6 @@ def test_empty_label_box_is_an_error_not_a_pass():
         run_eval.visible_share(blank, blank, (0, 0, 100, 20))
 
 
-def test_real_detector_missing_is_reported_clearly(capsys):
-    assert run_eval.main(["--no-ocr"]) == 2
-    assert "no detect()" in capsys.readouterr().out
-
-
 def test_split_screen_video_has_every_frame_side_by_side(clip, tmp_path):
     path, labels = clip
     video = tmp_path / "split.mp4"

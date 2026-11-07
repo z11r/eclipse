@@ -4,7 +4,6 @@ import pytest
 from eclipse import main as app
 from eclipse.capture.pattern import TestPattern
 from eclipse.capture.screen import to_bgr
-from eclipse.compositor.compositor import Compositor
 from eclipse.output.virtual_cam import OUTPUT_HEIGHT, OUTPUT_WIDTH, fit
 
 
@@ -65,31 +64,144 @@ def test_pattern_frames_follow_the_contract():
     assert second.ts >= first.ts
 
 
-def test_run_stops_at_max_frames():
-    sink = FakeSink()
-    latencies = app.run(TestPattern(320, 240), sink, lambda f: [], Compositor(), max_frames=5)
-    assert len(sink.images) == 5
-    assert len(latencies) == 5
-
-
-def test_real_screen_is_refused_by_default(monkeypatch):
-    def fail(*args, **kwargs):
-        pytest.fail("capture must not start")
-
-    monkeypatch.setattr(app, "ScreenCapture", fail)
-    assert app.main([]) == 2
-
-
 def test_blank_screen_capture_stops_instead_of_streaming(monkeypatch):
     def fail(*args, **kwargs):
         pytest.fail("capture must not start")
 
     monkeypatch.setattr(app, "screen_capture_allowed", lambda: False)
     monkeypatch.setattr(app, "ScreenCapture", fail)
-    assert app.main(["--unsafe-passthrough"]) == 1
+    assert app.main([]) == 1
+
+
+def test_real_screen_always_goes_through_the_text_layer(monkeypatch):
+    seen = []
+
+    def detector():
+        def detect(frame):
+            seen.append(frame.frame_id)
+            return []
+
+        return detect
+
+    monkeypatch.setattr(app, "screen_capture_allowed", lambda: True)
+    monkeypatch.setattr(app, "ScreenCapture", lambda max_width, retina: TestPattern(320, 240))
+    monkeypatch.setattr(app, "TextDetector", detector)
+    monkeypatch.setattr(app, "VirtualCam", FakeSink)
+    assert app.main(["--max-frames", "3", "--delay", "0.05"]) == 0
+    assert seen == [0, 1, 2]
+
+
+def test_there_is_no_way_to_skip_scanning():
+    with pytest.raises(SystemExit):
+        app.main(["--unsafe-passthrough"])
 
 
 def test_test_pattern_needs_no_screen_permission(monkeypatch):
     monkeypatch.setattr(app, "screen_capture_allowed", lambda: False)
     monkeypatch.setattr(app, "VirtualCam", FakeSink)
-    assert app.main(["--test-pattern", "--max-frames", "3"]) == 0
+    assert app.main(["--test-pattern", "--max-frames", "3", "--delay", "0.05"]) == 0
+
+
+def test_stats_log_has_numbers_and_no_screen_text(monkeypatch, tmp_path):
+    log = tmp_path / "run.log"
+    monkeypatch.setattr(app, "VirtualCam", FakeSink)
+    monkeypatch.setattr(app.StatsLog, "__init__", _quick_stats_log)
+    assert app.main(["--test-pattern", "--max-frames", "40", "--delay", "0.05", "--fps", "60", "--log", str(log)]) == 0
+    text = log.read_text()
+    assert "capture" in text and "cores" in text
+    assert "sk-FAKE" not in text
+
+
+_real_stats_init = app.StatsLog.__init__
+
+
+def _quick_stats_log(self, path, pipeline, parts):
+    _real_stats_init(self, path, pipeline, parts, every=0.1)
+
+
+def test_repeated_frame_is_not_resized_again(monkeypatch):
+    calls = []
+
+    class Camera:
+        device = "fake"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def send(self, image):
+            pass
+
+        def sleep_until_next_frame(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("eclipse.output.virtual_cam.pyvirtualcam.Camera", Camera)
+    monkeypatch.setattr(
+        "eclipse.output.virtual_cam.fit", lambda image, w, h: calls.append(1) or image
+    )
+    from eclipse.output.virtual_cam import VirtualCam
+
+    first = np.zeros((4, 4, 3), dtype=np.uint8)
+    second = first.copy()
+    with VirtualCam() as cam:
+        cam.send(first)
+        cam.send(first)
+        cam.send(first)
+        cam.send(second)
+    assert len(calls) == 2
+    assert cam.stats["sends"] == 4
+
+
+def test_apple_mode_scans_retina_frames_with_doubled_distances(monkeypatch):
+    captured = {}
+    detectors = {}
+
+    class RecordingCompositor(app.Compositor):
+        def __init__(self, padding):
+            captured["padding"] = padding
+            super().__init__(padding)
+
+    def screen(max_width, retina):
+        captured.update(max_width=max_width, retina=retina)
+        return TestPattern(320, 240)
+
+    def text_detector(reader=None, pixel_scale=1):
+        detectors.update(reader=reader, pixel_scale=pixel_scale)
+        return lambda frame: []
+
+    monkeypatch.setattr(app, "screen_capture_allowed", lambda: True)
+    monkeypatch.setattr(app, "ScreenCapture", screen)
+    monkeypatch.setattr(app, "TextDetector", text_detector)
+    monkeypatch.setattr(app, "AppleVisionReader", lambda: "apple reader")
+    monkeypatch.setattr(app, "Compositor", RecordingCompositor)
+    monkeypatch.setattr(app, "VirtualCam", FakeSink)
+    assert app.main(["--ocr", "apple", "--max-frames", "2", "--delay", "0.05"]) == 0
+    assert captured["retina"] is True
+    assert captured["max_width"] > 3024
+    assert captured["padding"] == app.PADDING * 2
+    assert detectors == {"reader": "apple reader", "pixel_scale": 2}
+
+
+def test_rapid_is_still_the_default(monkeypatch):
+    used = {}
+
+    def text_detector(reader=None, pixel_scale=1):
+        used.update(reader=reader, pixel_scale=pixel_scale)
+        return lambda frame: []
+
+    monkeypatch.setattr(app, "screen_capture_allowed", lambda: True)
+    monkeypatch.setattr(app, "ScreenCapture", lambda max_width, retina: TestPattern(320, 240))
+    monkeypatch.setattr(app, "TextDetector", text_detector)
+    monkeypatch.setattr(app, "VirtualCam", FakeSink)
+    assert app.main(["--max-frames", "2", "--delay", "0.05"]) == 0
+    assert used == {"reader": None, "pixel_scale": 1}
+
+
+def test_to_bgr_keeps_odd_retina_sizes_even_without_a_resize():
+    raw = np.zeros((101, 201, 4), dtype=np.uint8)
+    raw[:, :] = (1, 2, 3, 255)
+    image = to_bgr(raw, max_width=6016)
+    assert image.shape == (100, 200, 3)
+    assert tuple(image[0, 0]) == (1, 2, 3)

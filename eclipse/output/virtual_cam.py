@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import cv2
 import numpy as np
 import pyvirtualcam
@@ -35,6 +37,9 @@ class VirtualCam:
     def __init__(self, fps: int = 30) -> None:
         self._fps = fps
         self._camera = None
+        self._last_image = None
+        self._last_fitted = None
+        self.stats = {"fit_seconds": 0.0, "send_seconds": 0.0, "fits": 0, "sends": 0}
 
     def __enter__(self) -> "VirtualCam":
         return self
@@ -52,5 +57,14 @@ class VirtualCam:
                 fmt=pyvirtualcam.PixelFormat.BGR,
             )
             print(f"Sending {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} to {self._camera.device}")
-        self._camera.send(fit(image, OUTPUT_WIDTH, OUTPUT_HEIGHT))
+        started = time.monotonic()
+        if image is not self._last_image:  # a repeated frame is already fitted
+            self._last_fitted = fit(image, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+            self._last_image = image
+            self.stats["fits"] += 1
+        fitted = time.monotonic()
+        self._camera.send(self._last_fitted)
+        self.stats["fit_seconds"] += fitted - started
+        self.stats["send_seconds"] += time.monotonic() - fitted
+        self.stats["sends"] += 1
         self._camera.sleep_until_next_frame()

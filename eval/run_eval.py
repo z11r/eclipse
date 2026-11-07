@@ -1,6 +1,6 @@
 """Measures leaks and latency. Run from the repo root: python -m eval.run_eval
 
-Exits 0 with no leaks, 1 with leaks, 2 if it can't run. A frame leaks if either
+Exits 0 with no leaks, 1 with leaks. A frame leaks if either
 check finds a planted secret still visible in the output:
 
 - Pixels (every frame): is the secret's text still there, even a small part of it?
@@ -21,6 +21,8 @@ import numpy as np
 
 from eclipse.capture.clip import ClipCapture
 from eclipse.compositor.compositor import PADDING, Compositor
+from eclipse.platform import AppleVisionReader
+from eclipse.text_detect import TextDetector
 from eval.fake_detectors import FAKE_DETECTORS
 from eval.truth import CLIPS_DIR, EVAL_DIR, box_at, is_on_screen, load_labels
 
@@ -180,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         default="text-layer",
         help="text-layer is the real one; the rest are fakes for checking the eval",
     )
+    parser.add_argument("--reader", choices=["rapid", "apple"], default="rapid")
     parser.add_argument("--no-ocr", action="store_true", help="pixel check only, faster")
     parser.add_argument("--ocr-every", type=int, default=15, help="OCR every Nth frame")
     parser.add_argument(
@@ -189,14 +192,7 @@ def main(argv: list[str] | None = None) -> int:
 
     labels = load_labels(args.clip)
     if args.detector == "text-layer":
-        try:
-            from eclipse.text_detect import detect
-        except ImportError:
-            print(
-                "eclipse.text_detect has no detect() yet.\n"
-                "Use --detector perfect or another fake to check the eval itself."
-            )
-            return 2
+        detect = TextDetector(reader=AppleVisionReader() if args.reader == "apple" else None)
     else:
         detect = FAKE_DETECTORS[args.detector](labels)
 

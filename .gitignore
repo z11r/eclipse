@@ -4,8 +4,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# Eval videos
+# Eval videos and run logs
 eval/output/
+eclipse-run.log
 
 # Secrets: never commit these, this repo is public
 .env

@@ -50,6 +50,9 @@ class Compositor:
             if detection.w <= 0 or detection.h <= 0 or outside:
                 # A secret was found but we can't tell where it is.
                 raise ValueError("detection box is not inside the frame")
+            if not detection.ttl_ms >= 0:  # also catches NaN
+                # Its cover would expire before it is drawn.
+                raise ValueError("detection ttl_ms must not be negative")
             box = (detection.x, detection.y, detection.w, detection.h)
             expiry = frame.ts + detection.ttl_ms / 1000
             self._active[box] = max(expiry, self._active.get(box, expiry))

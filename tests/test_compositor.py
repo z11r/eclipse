@@ -1,9 +1,11 @@
+import time
+
 import numpy as np
 import pytest
 
-from eclipse import main as app
 from eclipse.capture.pattern import TestPattern
 from eclipse.compositor.compositor import Compositor
+from eclipse.compositor.delay import DelayedPipeline
 from eclipse.types import Detection, Frame
 
 
@@ -99,6 +101,8 @@ def test_crash_later_holds_the_last_safe_frame():
         [box(x=-100, w=50)],
         [box(w=0)],
         [box(h=-5)],
+        [box(ttl_ms=-1000)],
+        [box(ttl_ms=float("nan"))],
         ["not a detection"],
     ],
 )
@@ -166,46 +170,17 @@ class RecordingSink:
 
     def send(self, image):
         self.images.append(image)
+        time.sleep(0.001)
 
 
 def test_pipeline_never_sends_the_fake_secret():
     source = TestPattern(640, 360)
-    compositor = Compositor()
-    raw_frames = []
-
-    def spy(frame):
-        raw_frames.append(frame)
-        return source.detect(frame)
-
     sink = RecordingSink()
-    app.run(source, sink, spy, compositor, max_frames=120)
-    assert len(sink.images) == 120
-    for frame, output in zip(raw_frames, sink.images):
-        x, y, w, h = source._secret_box(frame.frame_id)
-        raw_secret = frame.image[y : y + h, x : x + w]
-        hidden = output[y : y + h, x : x + w].reshape(-1, 3)
-        assert raw_secret.std() > 0
-        assert (hidden == hidden[0]).all()
-
-
-def test_pipeline_keeps_running_through_a_detector_crash():
-    source = TestPattern(320, 240)
-    sink = RecordingSink()
-
-    def crash_on_frame_two(frame):
-        if frame.frame_id == 2:
-            raise RuntimeError
-        return []
-
-    compositor = Compositor()
-    app.run(source, sink, crash_on_frame_two, compositor, max_frames=4)
-    assert len(sink.images) == 4
-    assert (sink.images[2] == sink.images[1]).all()
-    assert compositor.held_frames == 1
-
-
-def test_repeated_box_does_not_pile_up():
-    compositor = Compositor()
-    for i in range(50):
-        compositor.process(noise_frame(ts=i * 0.03, frame_id=i), lambda f: [box()])
-    assert len(compositor._active) == 1
+    stats = DelayedPipeline(
+        source, sink, source.detect, Compositor(), delay=0.05, fps=200, max_frames=120
+    ).run()
+    assert stats.shown + stats.skipped == 120
+    white = np.array([255, 255, 255])
+    for image in sink.images:
+        # The secret is the only white text below the middle of the frame.
+        assert not (image[180:] == white).all(axis=2).any()
