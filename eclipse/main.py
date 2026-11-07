@@ -36,6 +36,9 @@ from eclipse.text_detect.read_ahead import OcrPool, ReadAhead, ReadError
 
 
 RETINA_MAX_WIDTH = 6016  # wide enough never to shrink a built-in or Studio Display
+# A camera's 8x8 block averages wander up to about 6 from noise alone. New text moves
+# them far more, so only the parts of the picture that really changed are read again.
+WEBCAM_NOISE_FLOOR = 8
 
 
 class StatsLog:
@@ -307,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         detect = source.detect
     elif args.webcam is not None:
         source = WebcamCapture(args.webcam)
-        detect = TextDetector()
+        detect = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR)
     else:
         if not screen_capture_allowed():
             print(

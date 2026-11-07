@@ -30,6 +30,7 @@ _SCROLL_TOLERANCE = 40  # blurred pixels this close count as the same text
 _SCROLL_MAX_MISMATCH = 0.03  # past this share, it isn't a clean scroll
 _SCROLL_EDGE = 16  # OCR boxes can sit this far outside the text they cover
 _NOISE_FLOOR = 8  # a pixel this close to where it came from hasn't changed
+_CHANGE_BLOCK = 8  # with a sensor noise floor, compare blocks this size, not single pixels
 _WHOLE_PIXEL = 0.05  # a shift this close to a whole number lands text on the same pixels
 _SCROLL_RECHECK = 30  # frames of fractional scrolling between reads of the whole view
 _UNREAD_READ_AT = 96  # rows of incoming text to collect before reading them
@@ -333,7 +334,9 @@ class Detector:
     lives in CoverTracks, so one read missing it doesn't uncover it. Each result is
     everything to cover in that frame. Changing settings clears saved results."""
 
-    def __init__(self, keywords=(), enabled=None, padding=0, reader=None, pixel_scale=1):
+    def __init__(
+        self, keywords=(), enabled=None, padding=0, reader=None, pixel_scale=1, noise_floor=0,
+    ):
         self.stats = {
             'frames': 0, 'full_scans': 0, 'partial_scans': 0, 'scan_seconds': 0.0,
             'scanned_share': 0.0, 'diff_seconds': 0.0, 'find_seconds': 0.0,
@@ -343,8 +346,15 @@ class Detector:
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
 
+        if not isinstance(noise_floor, int) or noise_floor < 0:
+            raise ValueError('noise_floor must be a nonnegative integer')
+
         self.padding = padding
         self._reader = reader
+        # Cameras redraw every pixel with sensor noise, so any-pixel-changed would read
+        # the whole frame every time. Above 0, blocks whose average moved less than
+        # this count as unchanged. Screens are exact, so they keep 0.
+        self._noise_floor = noise_floor
         # Distances below are for standard frames. Retina frames have twice the pixels.
         self._band_margin = _BAND_MARGIN * pixel_scale
         self._side_margin = _SIDE_MARGIN * pixel_scale
@@ -606,8 +616,13 @@ class Detector:
         if self._previous is None or self._previous.shape != image.shape:
             return [(0, height, 0, width)]
 
-        difference = cv2.split(cv2.absdiff(image, self._previous))
-        changed = cv2.bitwise_or(cv2.bitwise_or(difference[0], difference[1]), difference[2]) > 0
+        if self._noise_floor:
+            changed = self._changed_blocks(image)
+        else:
+            difference = cv2.split(cv2.absdiff(image, self._previous))
+            changed = cv2.bitwise_or(
+                cv2.bitwise_or(difference[0], difference[1]), difference[2]
+            ) > 0
         changed = self._follow_scroll(image, changed)
         self._read_unread(changed)
 
@@ -662,6 +677,41 @@ class Detector:
             return [(0, height, 0, width)]
 
         return areas
+
+    def _changed_blocks(self, image) -> np.ndarray:
+        """Pixels in blocks whose average colour moved past the noise floor.
+
+        Averaging a block cancels sensor noise but not new text: a character changes
+        many pixels of its block by far more than noise does.
+        """
+        height, width = image.shape[:2]
+        size = _CHANGE_BLOCK
+        rows, columns = -(-height // size), -(-width // size)  # round up: edges count too
+
+        def small(picture):
+            padded = cv2.copyMakeBorder(
+                picture, 0, rows * size - height, 0, columns * size - width,
+                cv2.BORDER_REPLICATE,
+            )
+            return cv2.resize(padded, (columns, rows), interpolation=cv2.INTER_AREA)
+
+        moved = _strongest(cv2.absdiff(small(image), small(self._previous))) > self._noise_floor
+        changed = np.repeat(np.repeat(moved, size, axis=0), size, axis=1)
+        return np.ascontiguousarray(changed[:height, :width])
+
+    def _remember(self, snapshot, areas) -> None:
+        """Keep this frame as the one later frames are compared with.
+
+        With a noise floor, only the areas just read take the new pixels. Elsewhere the
+        old pixels stay, so a slow change can't creep past the floor one frame at a time.
+        """
+        if not self._noise_floor or self._previous is None or self._scrolled:
+            self._previous = snapshot
+            return
+        previous = self._previous.copy()
+        for top, bottom, left, right in areas:
+            previous[top:bottom, left:right] = snapshot[top:bottom, left:right]
+        self._previous = previous
 
     def _read(self, image, top: int, left: int) -> list[tuple]:
         """Read one area and return text regions in full-frame coordinates."""
@@ -883,7 +933,7 @@ class Detector:
                 # Save results only after the whole scan succeeds.
                 self._boxes = tuple(sorted(boxes))
                 self._regions = regions
-                self._previous = snapshot
+                self._remember(snapshot, areas)
 
                 return list(self._boxes)
 

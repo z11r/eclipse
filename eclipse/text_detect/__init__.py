@@ -16,8 +16,17 @@ _DETECTOR_NAMES = {shared: name for name, shared in _CATEGORY_NAMES.items()}
 class TextDetector:
     """Use one per source. Raises DetectionError if a scan fails."""
 
-    def __init__(self, keywords: Iterable[str] = (), reader=None, pixel_scale: int = 1) -> None:
-        self._detector = Detector(keywords=keywords, reader=reader, pixel_scale=pixel_scale)
+    def __init__(
+        self,
+        keywords: Iterable[str] = (),
+        reader=None,
+        pixel_scale: int = 1,
+        noise_floor: int = 0,
+    ) -> None:
+        """noise_floor above 0 ignores sensor noise; use it for cameras, not screens."""
+        self._detector = Detector(
+            keywords=keywords, reader=reader, pixel_scale=pixel_scale, noise_floor=noise_floor
+        )
         self._source = None
         self._read_ahead = reader if hasattr(reader, "prepare") else None
 
