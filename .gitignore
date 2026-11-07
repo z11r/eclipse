@@ -1,7 +1,7 @@
 # Python
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 
 # Eval videos
