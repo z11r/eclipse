@@ -24,7 +24,9 @@ let eventRows = [];
 let logAvailable = true;
 let statePollInFlight = false;
 let logPollInFlight = false;
-let requestPending = false;
+let configPending = false;
+let detectorConfigPending = false;
+let safetyPending = false;
 let revealTimeouts = new Map();
 
 async function api(path, options={}) {
@@ -70,7 +72,12 @@ function setConnection(value) {
   }
 }
 function renderState(state) {
+  if(detectorConfigPending && state.config_status==='applied'){
+    configDirty=false;keywordDirty=false;
+    notice('Settings applied and private keywords saved.',true);
+  }
   serverState=state;setConnection(true);
+  detectorConfigPending=state.config_status==='pending';
   const mock=Boolean(state.simulated);
   $('mock-warning').classList.toggle('hidden',!mock);
   $('mode-chip').textContent=state.mode==='irl'?'IRL mode':'Desktop mode';
@@ -93,8 +100,8 @@ function renderState(state) {
   else {label='Protection not verified';description=state.message || 'Capture or protected output is not available.';safety='UNVERIFIED';}
   $('status-heading').textContent=label;$('status-description').textContent=description;
   $('safety-label').textContent=safety;$('status-orb').className=orb;
-  $('panic-button').disabled=requestPending || !connected || Boolean(state.panic);
-  $('resume-button').disabled=requestPending || !connected || !state.panic;
+  $('panic-button').disabled=safetyPending || !connected || Boolean(state.panic);
+  $('resume-button').disabled=safetyPending || !connected || !state.panic;
   $('panic-hint').textContent=mock?'Mock controls only — no real OBS output exists.':state.panic?'Blackout stays active until explicit resume.':'Use panic to request immediate black output.';
   // Preserve any user edits while polling; an unchanged draft follows authoritative state.
   if(!configDirty) draftEnabled=new Set(state.enabled);
@@ -115,7 +122,7 @@ function renderCategories(state) {
       info.append(name,sub);
       const toggle=document.createElement('span');toggle.className='switch';
       const input=document.createElement('input');input.type='checkbox';input.checked=draftEnabled.has(id);
-      input.disabled=!connected || requestPending;input.setAttribute('aria-label',`Enable ${label}`);
+      input.disabled=!connected || configPending || detectorConfigPending;input.setAttribute('aria-label',`Enable ${label}`);
       input.addEventListener('change',()=>{
         if(input.checked)draftEnabled.add(id);else draftEnabled.delete(id);
         configDirty=true;updateSaveControls();
@@ -142,39 +149,46 @@ function renderKeywords(){
     reveal.addEventListener('keydown',e=>{if(e.key===' '||e.key==='Enter')show();});
     reveal.addEventListener('keyup',hide);reveal.addEventListener('blur',hide);
     const remove=document.createElement('button');remove.className='tiny-button';remove.textContent='Remove';remove.type='button';
-    remove.setAttribute('aria-label','Remove keyword');remove.disabled=!connected||requestPending;
+    remove.setAttribute('aria-label','Remove keyword');remove.disabled=!connected||configPending||detectorConfigPending;
     remove.addEventListener('click',()=>{draftKeywords.splice(index,1);keywordDirty=true;renderKeywords();updateSaveControls();});
     item.append(val,reveal,remove);parent.append(item);
   }
   updateSaveControls();
 }
 function updateSaveControls(){
-  $('save-settings').disabled=!connected||requestPending||!configDirty;
-  $('save-keywords').disabled=!connected||requestPending||!keywordDirty;
-  $('add-keyword').disabled=!connected||requestPending;
-  $('settings-status').textContent=configDirty?'Unsaved category changes':'Category settings up to date';
+  $('save-settings').disabled=!connected||configPending||detectorConfigPending||!configDirty;
+  $('save-keywords').disabled=!connected||configPending||detectorConfigPending||!keywordDirty;
+  $('add-keyword').disabled=!connected||configPending||detectorConfigPending;
+  $('settings-status').textContent=configPending?'Submitting settings…':detectorConfigPending?'Settings pending — waiting for detector':serverState?.config_status==='failed'?(serverState.config_message || 'Settings failed — retry saving'):configDirty?'Unsaved category changes':'Settings applied';
   $('category-count').textContent=`${draftEnabled.size} / ${TEXT.length+VISUAL.length} ENABLED`;
 }
 async function saveConfig(kind){
-  if(!serverState || requestPending)return;
-  requestPending=true;updateSaveControls();
+  if(!serverState || configPending || detectorConfigPending)return;
+  configPending=true;updateSaveControls();
   try{
     // Always send full lists, preserving the other unsaved section as draft.
     const state=await api('/api/config',{method:'PUT',body:JSON.stringify({enabled:[...draftEnabled],keywords:[...draftKeywords]})});
-    configDirty=false;keywordDirty=false;clearNotice();renderState(state);
-    notice(kind==='keywords'?'Private keywords saved.':'Detection configuration saved.',true);
-  }catch(e){notice('Could not save configuration: '+e.message);}
-  finally{requestPending=false;updateSaveControls();}
+    if(state.config_status==='pending'){
+      detectorConfigPending=true;
+      notice('Settings pending. Waiting for the detector to confirm application.',true);
+    } else {
+      configDirty=false;keywordDirty=false;
+      draftEnabled=new Set(state.enabled);draftKeywords=[...state.keywords];
+      notice('Settings applied and private keywords saved.',true);
+    }
+    await refreshState();
+  }catch(e){notice('Could not save configuration: '+e.message);await refreshState();}
+  finally{configPending=false;updateSaveControls();}
 }
 async function sendSafety(route){
-  if(requestPending)return;
-  requestPending=true;$('panic-button').disabled=true;$('resume-button').disabled=true;
+  if(safetyPending || !connected)return;
+  safetyPending=true;$('panic-button').disabled=true;$('resume-button').disabled=true;
   try{
     const state=await api(route,{method:'POST'});clearNotice();renderState(state);
     if(state.simulated)notice('Mock action applied. No real stream or OBS output was changed.',true);
     else if(route.endsWith('panic') && state.output_state!=='black')notice('Blackout requested, but black output has not been confirmed.');
   }catch(e){notice('Unable to confirm pipeline action: '+e.message);await refreshState();}
-  finally{requestPending=false;if(serverState)renderState(serverState);}
+  finally{safetyPending=false;if(serverState && connected)renderState(serverState);}
 }
 function renderEvents(){
   const parent=$('event-list');parent.replaceChildren();

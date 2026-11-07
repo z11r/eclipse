@@ -648,3 +648,74 @@ def test_a_new_panic_needs_a_new_black_frame():
     assert not gate.black_confirmed
     gate.panic()
     assert not gate.black_confirmed
+
+
+def test_pending_settings_keep_confirmed_state_and_file_until_acknowledged(tmp_path, monkeypatch):
+    from eclipse.compositor.delay import PolicyChange
+
+    live = Live(tmp_path)
+    live.controller._apply_wait = 0
+    live.controller._store.save([])
+    changes = []
+
+    def queue(apply, stricter):
+        change = PolicyChange(apply, 1)
+        changes.append(change)
+        return change
+
+    monkeypatch.setattr(live.pipeline, 'change_policy', queue)
+    state = live.controller.set_config(live.config([KEYWORD]))
+    assert state.config_status == 'pending'
+    assert state.keywords == []
+    assert live.controller._store.load() == []
+    with pytest.raises(HTTPException) as caught:
+        live.controller.set_config(live.config(['OTHER']))
+    assert caught.value.status_code == 409
+    # Pending settings do not prevent the authoritative panic request.
+    assert live.controller.panic().panic is True
+    changes[0].apply()
+    changes[0].finish()
+    state = live.controller.get_state()
+    assert state.config_status == 'applied'
+    assert state.keywords == [KEYWORD]
+    assert live.controller._store.load() == [KEYWORD]
+    assert state.panic is True
+
+
+def test_late_settings_failure_preserves_previous_settings_and_allows_retry(tmp_path, monkeypatch):
+    from eclipse.compositor.delay import PolicyChange
+
+    live = Live(tmp_path)
+    live.controller._apply_wait = 0
+    live.controller._store.save([])
+    change = PolicyChange(lambda: None, 1)
+    monkeypatch.setattr(live.pipeline, 'change_policy', lambda *args: change)
+    assert live.controller.set_config(live.config([KEYWORD])).config_status == 'pending'
+    change.finish(ValueError(KEYWORD))
+    state = live.controller.get_state()
+    assert state.config_status == 'failed'
+    assert KEYWORD not in state.config_message
+    assert state.keywords == []
+    assert live.controller._store.load() == []
+    assert not (tmp_path / 'config.tmp').exists()
+    replacement = PolicyChange(lambda: None, 2)
+    replacement.finish()
+    monkeypatch.setattr(live.pipeline, 'change_policy', lambda *args: replacement)
+    assert live.controller.set_config(live.config([])).config_status == 'applied'
+
+
+def test_persistence_failure_reports_applied_but_unsaved_settings(tmp_path, monkeypatch):
+    live = Live(tmp_path)
+
+    def fail_commit(staged):
+        raise HTTPException(status_code=503, detail='disk unavailable')
+
+    monkeypatch.setattr(live.controller._store, 'commit', fail_commit)
+    with pytest.raises(HTTPException):
+        live.controller.set_config(live.config([KEYWORD]))
+    state = live.controller.get_state()
+    assert state.config_status == 'failed'
+    assert state.keywords == [KEYWORD]
+    assert live.detect.keywords == (KEYWORD,)
+    assert 'Settings applied' in state.config_message
+    assert 'could not be saved' in state.config_message
