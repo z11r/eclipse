@@ -42,6 +42,14 @@ def screen_capture_allowed() -> bool:
     return bool(graphics.CGPreflightScreenCaptureAccess())
 
 
+def peak_memory_mb() -> float:
+    """The most memory this process has used. macOS counts in bytes, Linux in kilobytes."""
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / 1024**2 if IS_MAC else peak / 1024
+
+
 def keyboard_listening_allowed() -> bool:
     """Whether this process can see key presses in other apps.
 
