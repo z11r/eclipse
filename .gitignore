@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets: never commit these, this repo is public
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Personal Claude files
+CLAUDE.local.md
+.claude/settings.local.json
