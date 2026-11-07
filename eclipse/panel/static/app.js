@@ -20,6 +20,7 @@ let configDirty = false;
 let keywordDirty = false;
 let connected = false;
 let lastSeq = 0;
+let logSession = null;
 let eventRows = [];
 let logAvailable = true;
 let statePollInFlight = false;
@@ -216,17 +217,17 @@ async function refreshEvents(){
   if(!connected||logPollInFlight)return;
   logPollInFlight=true;
   try {
-    const data=await api(`/api/log?after=${lastSeq}`);
+    const sessionQuery=logSession===null?'':`&session_id=${encodeURIComponent(logSession)}`;
+    const data=await api(`/api/log?after=${lastSeq}${sessionQuery}`);
+    if(data.session_id!==logSession){
+      eventRows=[];
+      lastSeq=0;
+      logSession=data.session_id;
+    }
     for(const event of data.events){
-      // The API issues a fresh seq when a rolling catch count changes.
-      // Merge only within the event's 2-second repeat window; a new catch
-      // after a quiet gap must remain a separate visible occurrence.
-      const oldIndex=eventRows.findIndex(old =>
-        old.source===event.source && old.category===event.category &&
-        old.seq<event.seq && event.time>=old.time && event.time-old.time<=2.0 &&
-        event.count>old.count);
-      if(oldIndex>=0)eventRows[oldIndex]=event;
-      else if(!eventRows.some(old=>old.seq===event.seq))eventRows.push(event);
+      const oldIndex=eventRows.findIndex(old=>old.incident_id===event.incident_id);
+      if(oldIndex<0)eventRows.push(event);
+      else if(event.seq>eventRows[oldIndex].seq)eventRows[oldIndex]=event;
     }
     lastSeq=Math.max(lastSeq,data.last);
     eventRows.sort((a,b)=>b.seq-a.seq);
