@@ -75,3 +75,57 @@ def test_docs_and_health(setup):
     assert client.get("/").status_code == 200
     assert client.get("/docs").status_code == 200
     assert client.get("/api/health").json()["ok"] is True
+
+
+def test_frontend_served_with_assets(setup):
+    client, _ = setup
+    index = client.get("/")
+    assert "Your privacy," in index.text
+    assert "SIMULATION MODE" in index.text
+    assert "/static/app.js" in index.text
+    js = client.get("/static/app.js")
+    css = client.get("/static/styles.css")
+    assert js.status_code == 200 and "refreshState" in js.text
+    assert css.status_code == 200 and ".hero" in css.text
+
+
+def test_panel_does_not_contain_sample_sensitive_data(setup):
+    client, _ = setup
+    assert "FAKE_DEMO_STREET" not in client.get("/").text
+
+
+def test_event_merging_survives_interleaved_categories(setup):
+    client, controller = setup
+    controller.events.record("screen", "email", timestamp=100.0)
+    controller.events.record("screen", "phone", timestamp=100.1)
+    controller.events.record("screen", "email", timestamp=100.4)
+    events = client.get("/api/log?after=0").json()["events"]
+    assert len(events) == 2
+    assert next(e for e in events if e["category"] == "email")["count"] == 2
+    assert next(e for e in events if e["category"] == "phone")["count"] == 1
+
+
+def test_old_catches_create_separate_event_after_quiet_gap(setup):
+    client, controller = setup
+    controller.events.record("screen", "email", timestamp=100.0)
+    controller.events.record("screen", "email", timestamp=105.0)
+    events = client.get("/api/log?after=0").json()["events"]
+    assert len(events) == 2
+    assert [e["count"] for e in events] == [1, 1]
+
+
+def test_event_history_is_bounded(setup):
+    client, controller = setup
+    for i in range(300):
+        controller.events.record("screen", "email", timestamp=1000.0 + i * 4)
+    events = client.get("/api/log?after=0").json()
+    assert len(events["events"]) == 200
+    assert events["last"] == 300
+
+
+def test_activity_status_is_present_in_frontend(setup):
+    client, _ = setup
+    assert 'id="log-connection"' in client.get("/").text
+    js = client.get("/static/app.js").text
+    assert "Activity log unavailable" in js
+    assert "Output unverified" in js
