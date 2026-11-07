@@ -21,7 +21,7 @@ Every frame is scanned by the text layer and drawn by the compositor before the 
 | `compositor/compositor.py` | Draws a solid black box over each detection, padded by at least 10 px. If the scan failed, it returns the last safe frame instead. It keeps no boxes between frames: the text layer reports everything to cover on every frame. |
 | `compositor/delay.py` | Runs capture, scanning and output side by side. Output sends each frame `--delay` seconds (1.0 by default) after capture, so a slow scan uses up some of the delay instead of freezing the picture. A frame that can't be scanned in time is dropped. |
 | `compositor/gate.py` | The last check before a picture leaves. Panic, resume and settings changes land here, so they take effect at the output however far behind the scanner is. Panic blacks out everything, including frames already in the buffer. After resume, nothing captured before it is shown. A setting that hides more blocks anything scanned under the old setting. On shutdown the gate closes and the last frame sent is black. |
-| `output/virtual_cam.py` | Fits each frame to the camera size and sends it to OBS Virtual Camera through `pyvirtualcam`. |
+| `output/virtual_cam.py` | Fits each frame to the camera size and sends it to OBS Virtual Camera on a fixed 60 Hz grid. Each frame is prepared before its tick and stamped with the tick, not with when it left. On macOS `obs_mac_camera.py` writes UYVY frames straight to OBS's camera extension so it can set that stamp. Elsewhere `pyvirtualcam` sends them and stamps them as they leave. OBS paces by the stamps only when the Video Capture Device has Use Buffering ticked. Without it, OBS shows whatever arrived last at each of its own ticks, and frames landing near a tick are doubled or skipped. |
 | `panel/` | A local page at http://127.0.0.1:8000 with category toggles, a keyword list, a catch log, and panic and resume buttons. Keywords are saved in `~/.eclipse/config.json`. The catch log records categories and times only, never screen text. `hotkey.py` adds a global panic key, Control+Option+B on a Mac. |
 | `types.py` | `Frame`, `Detection` and `Rendered`, the shared contract between modules. |
 | `platform.py` | The only module that checks which OS it is on: permission checks, ScreenCaptureKit and Retina settings, the camera driver (Media Foundation on Windows), peak memory, and Apple's OCR. |
@@ -69,6 +69,6 @@ Eclipse reduces risk. It doesn't guarantee that nothing leaks.
 | `python -m eval.sustained_motion --seconds 60` | The whole pipeline over time, with failed reads, panic and resume, and new keywords. Uses fake OCR. |
 | `python -m eval.scroll_compare` | How covers behave during a scripted scroll |
 | `python -m eval.capture_bench` | Capture speed alone, per backend |
-| `python -m eval.obs_path send`, then `verify` | Which frames really reach an OBS recording |
+| `python -m eval.obs_path send`, then `verify` | Which frames really reach an OBS recording. `--plan` runs output paths back to back in one recording. |
 
 Test clips and scenes use fake secrets only.

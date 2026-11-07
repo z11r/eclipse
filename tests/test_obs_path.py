@@ -77,3 +77,24 @@ def test_a_recording_with_nothing_readable_reports_nothing():
     report = analyse([None] * 10, 60)
     assert report.distinct == 0
     assert report.fresh_fps == 0
+
+
+def test_segments_of_one_recording_are_reported_apart():
+    from eval.obs_path import SEGMENT, split_segments
+
+    numbers = [None] * 5 + list(range(300)) + [None] * 90 + [SEGMENT + i // 2 for i in range(300)]
+    parts = split_segments(numbers)
+    assert sorted(parts) == [0, 1]
+    assert analyse(parts[0], 60).fresh_fps == pytest.approx(60, abs=0.5)
+    assert analyse(parts[1], 60).fresh_fps == pytest.approx(30, abs=0.5)
+    assert analyse(parts[1], 60).backwards == 0
+
+
+def test_a_plan_names_known_outputs_only():
+    from eval.obs_path import parse_plan
+
+    assert parse_plan("pyvirtualcam, stamped+late") == [("pyvirtualcam", False), ("stamped", True)]
+    with pytest.raises(ValueError):
+        parse_plan("stamped+early")
+    with pytest.raises(ValueError):
+        parse_plan(",".join(["stamped"] * 7))
