@@ -514,6 +514,7 @@ def test_a_broken_event_log_does_not_touch_the_stream(tmp_path):
 def test_the_routes_drive_the_real_pipeline(tmp_path):
     with Live(tmp_path) as live:
         with TestClient(create_app(live.controller), base_url="http://127.0.0.1:8000") as client:
+            client.headers["Authorization"] = "Bearer " + client.app.state.panel_token
             assert client.get("/api/health").json()["pipeline_mode"] == "live"
             assert client.get("/api/state").json()["simulated"] is False
             panicked = client.post("/api/panic").json()

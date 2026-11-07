@@ -13,6 +13,9 @@ function panel() {
   const state = {panic:false, simulated:false, output_state:'protected',
     output_connected:true, enabled:['email'], keywords:[], detector_health:{email:'ready'}};
   const context = vm.createContext({
+    URLSearchParams,
+    window:{location:{hash:'#token=test-launch-token',pathname:'/',search:''},
+      history:{replaceState(){}},sessionStorage:{setItem(){},getItem(){return null;}}},
     document:{getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id);},
       createElement:element},
     fetch(url){
@@ -125,4 +128,34 @@ test('log failure retains history and later polling resumes with the same cursor
   await logResponse(context,{session_id:'one',last:5,events:[catchEvent(1,5,2)]});
   assert.equal(vm.runInContext('eventRows.length',context),1);
   assert.equal(elements.get('log-connection').textContent,'Log connected');
+});
+
+test('API includes launch authorization even when custom headers are supplied',async()=>{
+  const {context}=panel();
+  let received;
+  context.fetch=async(url,options)=>{received=options;return {ok:true,json:async()=>({})};};
+  await vm.runInContext("api('/api/panic',{method:'POST',headers:{'X-Test':'yes'}})",context);
+  assert.equal(received.headers.Authorization,'Bearer test-launch-token');
+  assert.equal(received.headers['X-Test'],'yes');
+});
+
+test('launch token is removed from address and retained for refresh in this tab',()=>{
+  const {context}=panel();
+  const storage = new Map();
+  let cleaned;
+  context.window.sessionStorage={setItem:(key,value)=>storage.set(key,value),getItem:key=>storage.get(key)};
+  context.window.history.replaceState=(state,title,url)=>{cleaned=url;};
+  assert.equal(vm.runInContext('loadPanelToken()',context),'test-launch-token');
+  assert.equal(cleaned,'/');
+  context.window.location.hash='';
+  assert.equal(vm.runInContext('loadPanelToken()',context),'test-launch-token');
+});
+
+test('expired authorization disconnects controls and explains the new launch link',async()=>{
+  const {context,elements}=panel();
+  context.fetch=async()=>({status:401,ok:false});
+  await vm.runInContext('refreshState()',context);
+  assert.match(elements.get('notice').textContent,/current launch link/);
+  assert.equal(elements.get('resume-button').disabled,true);
+  assert.equal(elements.get('panic-button').disabled,true);
 });
