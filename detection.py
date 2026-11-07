@@ -156,6 +156,7 @@ class Detector:
 
                     self._reader = RapidOCR()
 
+                # This is where OCR reads the image.
                 results, _ = self._reader(snapshot)
 
                 regions = []
