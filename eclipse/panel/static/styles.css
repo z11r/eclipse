@@ -1537,3 +1537,19 @@ a:focus-visible {
     outline: 2px solid #7DD3FC;
     outline-offset: 3px;
 }
+
+/* Phase 4: independent activity-service connection indicator */
+.log-health {
+    font-size: 11px;
+    color: #9BA8AB;
+    margin: 12px 0 4px;
+    letter-spacing: .02em;
+}
+
+.log-health.good {
+    color: #66d8bb;
+}
+
+.log-health.bad {
+    color: #f9a0a0;
+}

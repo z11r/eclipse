@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#0b0a10" />
   <title>Eclipse — Privacy Control</title>
   <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="icon" type="image/png" href="/static/assets/eclipse_favicon.png">
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -23,7 +24,8 @@
       </nav>
       <div class="aside-spacer"></div>
       <div class="sidebar-bottom">
-       
+        <!-- <div class="mini-product"><span class="mini-product-icon">◉</span><span><strong>On-device privacy</strong><small>Local processing architecture</small></span></div>
+        <div class="version"><span class="dot"></span> ECLIPSE / HACKATHON BUILD <span>v0.3</span></div> -->
       </div>
     </aside>
 
@@ -67,7 +69,7 @@
         <div class="secondary-column">
           <section class="panel keywords-panel" aria-labelledby="keywords-title"><div class="section-heading"><div><div class="label">PERSONAL PROTECTION</div><h3 id="keywords-title">Private keywords</h3></div><span class="section-icon">⌘</span></div><p>Protect personal names, places and phrases. Keywords are stored locally, outside the repository.</p><form id="keyword-form"><label class="input-label" for="keyword-input">NEW PRIVATE KEYWORD</label><div class="keyword-entry"><input id="keyword-input" type="password" autocomplete="off" maxlength="120" placeholder="Enter keyword"/><button type="submit" class="button outline" id="add-keyword" disabled>Add +</button></div></form><div id="keyword-list" class="keywords-list"><div class="empty">No keywords configured</div></div><div class="form-actions"><span class="help">Hidden until held to reveal</span><button id="save-keywords" class="button primary" disabled>Save list <span>↗</span></button></div></section>
           <section class="panel mode-panel" aria-labelledby="mode-title"><div class="section-heading"><div><div class="label">INPUT ENVIRONMENT</div><h3 id="mode-title">Processing mode</h3></div><span class="section-icon">▤</span></div><div class="mode-row"><div class="mode-emblem">▣</div><div class="mode-info"><strong>Desktop mode</strong><p>Screen and webcam</p></div><span class="mode-active">SELECTED</span></div><div class="mode-row disabled"><div class="mode-emblem">◉</div><div class="mode-info"><strong>IRL streaming</strong><p>Moving camera or remote feed</p></div><span class="coming-soon" id="irl-label">Unavailable</span></div></section>
-          <section class="panel activity" id="activity" aria-labelledby="activity-title"><div class="section-heading"><div><div class="label">RECENT ACTIVITY</div><h3 id="activity-title">Privacy catches</h3></div><span id="events-count" class="tiny-tag">0 EVENTS</span></div><p>Only safe metadata is shown. Sensitive information never appears in this log.</p><div class="activity-table-head"><span>DETECTION</span><span>COUNT</span></div><div id="event-list" class="event-list"><div class="empty">No detection events reported.</div></div></section>
+          <section class="panel activity" id="activity" aria-labelledby="activity-title"><div class="section-heading"><div><div class="label">RECENT ACTIVITY</div><h3 id="activity-title">Privacy catches</h3></div><span id="events-count" class="tiny-tag">0 EVENTS</span></div><p>Only safe metadata is shown. Sensitive information never appears in this log.</p><div class="activity-table-head"><span>DETECTION</span><span>COUNT</span></div><div id="log-connection" class="log-health">Awaiting log connection</div><div id="event-list" class="event-list"><div class="empty">No detection events reported.</div></div></section>
         </div>
       </section>
       <footer><span>© Eclipse · Local privacy control</span><span>Designed for protection, not exposure. <span class="footer-star">✳</span></span></footer>

@@ -20,7 +20,10 @@ let configDirty = false;
 let keywordDirty = false;
 let connected = false;
 let lastSeq = 0;
-let eventMap = new Map();
+let eventRows = [];
+let logAvailable = true;
+let statePollInFlight = false;
+let logPollInFlight = false;
 let requestPending = false;
 let revealTimeouts = new Map();
 
@@ -43,7 +46,7 @@ function notice(message, info=false) {
 function clearNotice() { $('notice').classList.add('hidden'); }
 function setConnection(value) {
   connected=value;
-  $('connection').textContent=value?'● Local service connected':'● Control service disconnected';
+  $('connection').textContent=value?'● Stream connected':'● Control service disconnected';
   $('connection').className='connection '+(value?'good':'bad');
   if (!value) {
     $('status-heading').textContent='Status unavailable';
@@ -54,6 +57,16 @@ function setConnection(value) {
     $('save-settings').disabled=true;$('save-keywords').disabled=true;
     $('add-keyword').disabled=true;
     $('settings-status').textContent='Disconnected';
+    $('metric-output').textContent='Unknown';
+    $('metric-held').textContent='—';
+    $('metric-detectors').textContent='—';
+    $('metric-detector-sub').textContent='Cannot verify detector health';
+    $('output-chip').textContent='Output unverified';
+    $('mode-chip').textContent='Mode unverified';
+    $('irl-label').textContent='Unknown';
+    const logState=$('log-connection');
+    if(logState){logState.textContent='Service disconnected';logState.className='log-health bad';}
+
   }
 }
 function renderState(state) {
@@ -68,7 +81,8 @@ function renderState(state) {
   const ready=detectorStates.filter(s=>s==='ready').length;
   const degraded=detectorStates.filter(s=>s==='degraded').length;
   $('metric-detectors').textContent=`${ready}/${detectorStates.length} ready`;
-  $('metric-detector-sub').textContent=degraded?`${degraded} degraded`: 'Availability from pipeline';
+  const unavailable=detectorStates.filter(s=>s==='unavailable').length;
+  $('metric-detector-sub').textContent=[degraded?`${degraded} degraded`:null,unavailable?`${unavailable} unavailable`:null].filter(Boolean).join(' · ') || 'All detectors available';
   $('irl-label').textContent=state.irl_available?'Available':'Unavailable';
   let label,description, safety,orb='status-orb';
   if(mock){label='Demo / simulation only';description='The API is running, but no video is being captured or protected.';safety='NOT ACTIVE';}
@@ -164,9 +178,9 @@ async function sendSafety(route){
 }
 function renderEvents(){
   const parent=$('event-list');parent.replaceChildren();
-  $('events-count').textContent=`${eventMap.size} EVENTS`;
-  if(eventMap.size===0){const el=document.createElement('div');el.className='empty';el.textContent='No detection events reported.';parent.append(el);return;}
-  for(const event of [...eventMap.values()].sort((a,b)=>b.seq-a.seq).slice(0,60)){
+  $('events-count').textContent=`${eventRows.length} EVENTS`;
+  if(eventRows.length===0){const el=document.createElement('div');el.className='empty';el.textContent='No detection events reported.';parent.append(el);return;}
+  for(const event of [...eventRows].sort((a,b)=>b.seq-a.seq).slice(0,60)){
     const row=document.createElement('div');row.className='event-row';
     const icon=document.createElement('span');icon.className='event-icon';icon.textContent='◇';
     const copy=document.createElement('div');copy.className='event-copy';
@@ -178,25 +192,41 @@ function renderEvents(){
   }
 }
 async function refreshState(){
+  if(statePollInFlight)return;
+  statePollInFlight=true;
   try{const state=await api('/api/state');renderState(state);}
   catch(e){setConnection(false);notice('Cannot reach the local Eclipse server. Current protection status is unknown.');}
+  finally{statePollInFlight=false;}
 }
 async function refreshEvents(){
-  if(!connected)return;
+  if(!connected||logPollInFlight)return;
+  logPollInFlight=true;
   try {
     const data=await api(`/api/log?after=${lastSeq}`);
     for(const event of data.events){
-      // Updates to merged events arrive with a new seq. They replace the previous
-      // entry for the same source/category, rather than filling the UI with duplicates.
-      const key=event.source+':'+event.category;
-      const old=eventMap.get(key);
-      if(!old || old.seq<event.seq)eventMap.set(key,event);
+      // The API issues a fresh seq when a rolling catch count changes.
+      // Merge only within the event's 2-second repeat window; a new catch
+      // after a quiet gap must remain a separate visible occurrence.
+      const oldIndex=eventRows.findIndex(old =>
+        old.source===event.source && old.category===event.category &&
+        old.seq<event.seq && event.time>=old.time && event.time-old.time<=2.0 &&
+        event.count>old.count);
+      if(oldIndex>=0)eventRows[oldIndex]=event;
+      else if(!eventRows.some(old=>old.seq===event.seq))eventRows.push(event);
     }
-    lastSeq=data.last;
-    // Keep a bounded browser-side summary.
-    if(eventMap.size>80)eventMap=new Map([...eventMap.entries()].sort((a,b)=>b[1].seq-a[1].seq).slice(0,80));
+    lastSeq=Math.max(lastSeq,data.last);
+    eventRows.sort((a,b)=>b.seq-a.seq);
+    if(eventRows.length>80)eventRows=eventRows.slice(0,80);
+    logAvailable=true;
+    const status=$('log-connection');
+    if(status){status.textContent='Log connected';status.className='log-health good';}
     renderEvents();
-  } catch(e) {notice('Activity log temporarily unavailable: '+e.message);}
+  } catch(e) {
+    logAvailable=false;
+    const status=$('log-connection');
+    if(status){status.textContent='Activity log unavailable';status.className='log-health bad';}
+    notice('Activity log temporarily unavailable: '+e.message);
+  } finally {logPollInFlight=false;}
 }
 $('categories-form').addEventListener('submit',e=>{e.preventDefault();saveConfig('categories');});
 $('keyword-form').addEventListener('submit',e=>{
