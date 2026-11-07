@@ -1,20 +1,77 @@
+from pathlib import Path
+import pytest
 from fastapi.testclient import TestClient
 from eclipse.panel.app import create_app
+from eclipse.panel.controller import MockPipelineController
 
 
-def test_health():
-    with TestClient(create_app()) as client:
-        response = client.get('/api/health')
-        assert response.status_code == 200
-        assert response.json() == {'service': 'eclipse-panel', 'ok': True, 'pipeline_mode': 'mock'}
+@pytest.fixture
+def setup(tmp_path: Path):
+    controller = MockPipelineController(config_path=tmp_path / "private" / "config.json")
+    with TestClient(create_app(controller), base_url="http://127.0.0.1:8000") as client:
+        yield client, controller
 
 
-def test_status_is_explicitly_mock_and_stopped():
-    with TestClient(create_app()) as client:
-        response = client.get('/api/status')
-        assert response.status_code == 200
-        state = response.json()
-        assert state['state'] == 'stopped'
-        assert state['output_connected'] is False
-        assert state['mode'] == 'mock'
-        assert all(detector['state'] == 'unavailable' for detector in state['detectors'].values())
+def test_initial_mock_state(setup):
+    client, _ = setup
+    state = client.get("/api/state").json()
+    assert state["simulated"] is True
+    assert state["output_connected"] is False
+    assert state["output_state"] == "stopped"
+    assert len(state["enabled"]) == 13
+    assert all(v == "unavailable" for v in state["detector_health"].values())
+
+
+def test_panic_persists_until_resume(setup):
+    client, _ = setup
+    assert client.post("/api/panic").json()["panic"] is True
+    assert client.get("/api/state").json()["panic"] is True
+    assert client.post("/api/resume").json()["panic"] is False
+
+
+def test_config_is_atomic_and_persists_keywords(setup):
+    client, controller = setup
+    good = {"enabled": ["two_fa", "email", "keyword"], "keywords": ["FAKE_DEMO_STREET"]}
+    assert client.put("/api/config", json=good).status_code == 200
+    assert controller._config_path.is_file()
+    assert client.put("/api/config", json={"enabled": ["2fa"], "keywords": []}).status_code == 422
+    assert client.get("/api/state").json()["enabled"] == good["enabled"]
+    assert client.put("/api/config", json={"enabled": ["email"], "keywords": [""]}).status_code == 422
+    assert client.get("/api/state").json()["keywords"] == good["keywords"]
+    # Restart: only keywords persist, categories return to all enabled.
+    restarted = MockPipelineController(controller._config_path)
+    assert restarted.get_state().keywords == good["keywords"]
+    assert len(restarted.get_state().enabled) == 13
+
+
+def test_irl_rejected_and_desktop_accepted(setup):
+    client, _ = setup
+    assert client.put("/api/mode", json={"mode": "irl"}).status_code == 409
+    assert client.put("/api/mode", json={"mode": "desktop"}).status_code == 200
+
+
+def test_log_incremental_and_merged(setup):
+    client, controller = setup
+    controller.events.record("screen", "email", timestamp=100.0)
+    controller.events.record("screen", "email", timestamp=100.2)
+    body = client.get("/api/log?after=0").json()
+    assert len(body["events"]) == 1
+    assert body["events"][0]["count"] == 2
+    last = body["last"]
+    assert client.get(f"/api/log?after={last}").json()["events"] == []
+    controller.events.record("webcam", "mail_label", timestamp=101.0)
+    assert len(client.get(f"/api/log?after={last}").json()["events"]) == 1
+
+
+def test_untrusted_origin_and_host_rejected(setup):
+    client, _ = setup
+    assert client.post("/api/panic", headers={"Origin": "https://attacker.example"}).status_code == 403
+    assert client.get("/api/state", headers={"Host": "attacker.example"}).status_code == 403
+    assert client.get("/api/state", headers={"Origin": "http://127.0.0.1:9000"}).status_code == 403
+
+
+def test_docs_and_health(setup):
+    client, _ = setup
+    assert client.get("/").status_code == 200
+    assert client.get("/docs").status_code == 200
+    assert client.get("/api/health").json()["ok"] is True

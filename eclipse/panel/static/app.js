@@ -1,0 +1,223 @@
+'use strict';
+
+const TEXT = [
+  ['two_fa','2FA verification codes'], ['email','Email addresses'],
+  ['phone','Phone numbers'], ['api_key','API keys & tokens'],
+  ['card','Payment card candidates'], ['keyword','Custom keywords']
+];
+const VISUAL = [
+  ['street_sign','Street signs'], ['house_number','House numbers'],
+  ['licence_plate','Licence plates'], ['mail_label','Mail & package labels'],
+  ['window_view','Views through windows'], ['map','Open maps'],
+  ['storefront','Storefront names']
+];
+const CATEGORY_NAMES = Object.fromEntries([...TEXT,...VISUAL]);
+const $ = (id) => document.getElementById(id);
+let serverState = null;
+let draftEnabled = new Set();
+let draftKeywords = [];
+let configDirty = false;
+let keywordDirty = false;
+let connected = false;
+let lastSeq = 0;
+let eventMap = new Map();
+let requestPending = false;
+let revealTimeouts = new Map();
+
+async function api(path, options={}) {
+  const response = await fetch(path, {
+    credentials:'same-origin', cache:'no-store',
+    headers:{'Accept':'application/json', ...(options.body?{'Content-Type':'application/json'}:{}), ...(options.headers||{})},
+    ...options
+  });
+  if (!response.ok) {
+    let detail='Request failed ('+response.status+')';
+    try { const data=await response.json(); if (typeof data.detail === 'string') detail=data.detail; } catch (_) {}
+    throw Error(detail);
+  }
+  return response.json();
+}
+function notice(message, info=false) {
+  const n=$('notice'); n.textContent=message;n.className='notice'+(info?' info':'');
+}
+function clearNotice() { $('notice').classList.add('hidden'); }
+function setConnection(value) {
+  connected=value;
+  $('connection').textContent=value?'● Local service connected':'● Control service disconnected';
+  $('connection').className='connection '+(value?'good':'bad');
+  if (!value) {
+    $('status-heading').textContent='Status unavailable';
+    $('status-description').textContent='Cannot verify protection state. Do not assume the stream is safe.';
+    $('safety-label').textContent='UNVERIFIED';
+    $('status-orb').className='status-orb black';
+    $('panic-button').disabled=true;$('resume-button').disabled=true;
+    $('save-settings').disabled=true;$('save-keywords').disabled=true;
+    $('add-keyword').disabled=true;
+    $('settings-status').textContent='Disconnected';
+  }
+}
+function renderState(state) {
+  serverState=state;setConnection(true);
+  const mock=Boolean(state.simulated);
+  $('mock-warning').classList.toggle('hidden',!mock);
+  $('mode-chip').textContent=state.mode==='irl'?'IRL mode':'Desktop mode';
+  $('output-chip').textContent=state.output_connected?'Virtual camera connected':'Virtual camera disconnected';
+  $('metric-output').textContent=state.output_connected?'Connected':'Offline';
+  $('metric-held').textContent=String(state.held_frames ?? '—');
+  const detectorStates=Object.values(state.detector_health || {});
+  const ready=detectorStates.filter(s=>s==='ready').length;
+  const degraded=detectorStates.filter(s=>s==='degraded').length;
+  $('metric-detectors').textContent=`${ready}/${detectorStates.length} ready`;
+  $('metric-detector-sub').textContent=degraded?`${degraded} degraded`: 'Availability from pipeline';
+  $('irl-label').textContent=state.irl_available?'Available':'Unavailable';
+  let label,description, safety,orb='status-orb';
+  if(mock){label='Demo / simulation only';description='The API is running, but no video is being captured or protected.';safety='NOT ACTIVE';}
+  else if(state.panic && state.output_state==='black'){label='Emergency blackout';description='The pipeline reports black output. Resume is required to continue.';safety='BLACKOUT';orb+=' black';}
+  else if(state.panic){label='Blackout requested';description='Black output is not yet confirmed. Verify OBS output.';safety='UNVERIFIED';orb+=' black';}
+  else if(state.output_state==='protected' && state.output_connected && degraded===0){label='Protected output active';description='The pipeline reports protected frames reaching the output.';safety='PROTECTED';orb+=' protected';}
+  else if(state.output_state==='covered'){label='Fallback cover active';description='Processing is degraded or delayed. The pipeline reports covered output.';safety='COVERED';orb+=' black';}
+  else {label='Protection not verified';description=state.message || 'Capture or protected output is not available.';safety='UNVERIFIED';}
+  $('status-heading').textContent=label;$('status-description').textContent=description;
+  $('safety-label').textContent=safety;$('status-orb').className=orb;
+  $('panic-button').disabled=requestPending || !connected || Boolean(state.panic);
+  $('resume-button').disabled=requestPending || !connected || !state.panic;
+  $('panic-hint').textContent=mock?'Mock controls only — no real OBS output exists.':state.panic?'Blackout stays active until explicit resume.':'Use panic to request immediate black output.';
+  // Preserve any user edits while polling; an unchanged draft follows authoritative state.
+  if(!configDirty) draftEnabled=new Set(state.enabled);
+  if(!keywordDirty) draftKeywords=[...state.keywords];
+  renderCategories(state);renderKeywords();
+}
+function renderCategories(state) {
+  for(const [container,items] of [['text-categories',TEXT],['visual-categories',VISUAL]]) {
+    const parent=$(container);
+    parent.replaceChildren();
+    for(const [id,label] of items) {
+      const health=state.detector_health?.[id] || 'unavailable';
+      const row=document.createElement('label');row.className='category-row';
+      const info=document.createElement('div');
+      const name=document.createElement('div');name.className='category-name';name.textContent=label;
+      const sub=document.createElement('div');sub.className='category-sub';
+      sub.textContent=health==='ready'?'Available':health==='degraded'?'Degraded — fallback may be active':'Detector unavailable';
+      info.append(name,sub);
+      const toggle=document.createElement('span');toggle.className='switch';
+      const input=document.createElement('input');input.type='checkbox';input.checked=draftEnabled.has(id);
+      input.disabled=!connected || requestPending;input.setAttribute('aria-label',`Enable ${label}`);
+      input.addEventListener('change',()=>{
+        if(input.checked)draftEnabled.add(id);else draftEnabled.delete(id);
+        configDirty=true;updateSaveControls();
+      });
+      const track=document.createElement('span');track.className='switch-track';toggle.append(input,track);
+      row.append(info,toggle);parent.append(row);
+    }
+  }
+  $('category-count').textContent=`${draftEnabled.size} / ${TEXT.length+VISUAL.length} ENABLED`;
+  updateSaveControls();
+}
+function renderKeywords(){
+  const parent=$('keyword-list');parent.replaceChildren();
+  if(draftKeywords.length===0){const empty=document.createElement('div');empty.className='empty';empty.textContent='No keywords configured';parent.append(empty);}
+  for(const [index,keyword] of draftKeywords.entries()){
+    const item=document.createElement('div');item.className='keyword-item';
+    const val=document.createElement('span');val.className='keyword-value';val.textContent='•'.repeat(Math.min(keyword.length,18));
+    const reveal=document.createElement('button');reveal.className='tiny-button';reveal.type='button';reveal.textContent='Hold to reveal';
+    reveal.setAttribute('aria-label','Hold to reveal keyword');
+    const show=()=>{val.textContent=keyword;val.classList.add('revealed');};
+    const hide=()=>{val.textContent='•'.repeat(Math.min(keyword.length,18));val.classList.remove('revealed');};
+    reveal.addEventListener('pointerdown',show);reveal.addEventListener('pointerup',hide);
+    reveal.addEventListener('pointerleave',hide);reveal.addEventListener('pointercancel',hide);
+    reveal.addEventListener('keydown',e=>{if(e.key===' '||e.key==='Enter')show();});
+    reveal.addEventListener('keyup',hide);reveal.addEventListener('blur',hide);
+    const remove=document.createElement('button');remove.className='tiny-button';remove.textContent='Remove';remove.type='button';
+    remove.setAttribute('aria-label','Remove keyword');remove.disabled=!connected||requestPending;
+    remove.addEventListener('click',()=>{draftKeywords.splice(index,1);keywordDirty=true;renderKeywords();updateSaveControls();});
+    item.append(val,reveal,remove);parent.append(item);
+  }
+  updateSaveControls();
+}
+function updateSaveControls(){
+  $('save-settings').disabled=!connected||requestPending||!configDirty;
+  $('save-keywords').disabled=!connected||requestPending||!keywordDirty;
+  $('add-keyword').disabled=!connected||requestPending;
+  $('settings-status').textContent=configDirty?'Unsaved category changes':'Category settings up to date';
+  $('category-count').textContent=`${draftEnabled.size} / ${TEXT.length+VISUAL.length} ENABLED`;
+}
+async function saveConfig(kind){
+  if(!serverState || requestPending)return;
+  requestPending=true;updateSaveControls();
+  try{
+    // Always send full lists, preserving the other unsaved section as draft.
+    const state=await api('/api/config',{method:'PUT',body:JSON.stringify({enabled:[...draftEnabled],keywords:[...draftKeywords]})});
+    configDirty=false;keywordDirty=false;clearNotice();renderState(state);
+    notice(kind==='keywords'?'Private keywords saved.':'Detection configuration saved.',true);
+  }catch(e){notice('Could not save configuration: '+e.message);}
+  finally{requestPending=false;updateSaveControls();}
+}
+async function sendSafety(route){
+  if(requestPending)return;
+  requestPending=true;$('panic-button').disabled=true;$('resume-button').disabled=true;
+  try{
+    const state=await api(route,{method:'POST'});clearNotice();renderState(state);
+    if(state.simulated)notice('Mock action applied. No real stream or OBS output was changed.',true);
+    else if(route.endsWith('panic') && state.output_state!=='black')notice('Blackout requested, but black output has not been confirmed.');
+  }catch(e){notice('Unable to confirm pipeline action: '+e.message);await refreshState();}
+  finally{requestPending=false;if(serverState)renderState(serverState);}
+}
+function renderEvents(){
+  const parent=$('event-list');parent.replaceChildren();
+  $('events-count').textContent=`${eventMap.size} EVENTS`;
+  if(eventMap.size===0){const el=document.createElement('div');el.className='empty';el.textContent='No detection events reported.';parent.append(el);return;}
+  for(const event of [...eventMap.values()].sort((a,b)=>b.seq-a.seq).slice(0,60)){
+    const row=document.createElement('div');row.className='event-row';
+    const icon=document.createElement('span');icon.className='event-icon';icon.textContent='◇';
+    const copy=document.createElement('div');copy.className='event-copy';
+    const name=document.createElement('div');name.className='event-name';name.textContent=CATEGORY_NAMES[event.category] || 'Privacy detection';
+    const meta=document.createElement('div');meta.className='event-meta';meta.textContent=`${event.source} · ${new Date(event.time*1000).toLocaleTimeString()}`;
+    copy.append(name,meta);
+    const count=document.createElement('span');count.className='event-count';count.textContent=`×${event.count}`;
+    row.append(icon,copy,count);parent.append(row);
+  }
+}
+async function refreshState(){
+  try{const state=await api('/api/state');renderState(state);}
+  catch(e){setConnection(false);notice('Cannot reach the local Eclipse server. Current protection status is unknown.');}
+}
+async function refreshEvents(){
+  if(!connected)return;
+  try {
+    const data=await api(`/api/log?after=${lastSeq}`);
+    for(const event of data.events){
+      // Updates to merged events arrive with a new seq. They replace the previous
+      // entry for the same source/category, rather than filling the UI with duplicates.
+      const key=event.source+':'+event.category;
+      const old=eventMap.get(key);
+      if(!old || old.seq<event.seq)eventMap.set(key,event);
+    }
+    lastSeq=data.last;
+    // Keep a bounded browser-side summary.
+    if(eventMap.size>80)eventMap=new Map([...eventMap.entries()].sort((a,b)=>b[1].seq-a[1].seq).slice(0,80));
+    renderEvents();
+  } catch(e) {notice('Activity log temporarily unavailable: '+e.message);}
+}
+$('categories-form').addEventListener('submit',e=>{e.preventDefault();saveConfig('categories');});
+$('keyword-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  const input=$('keyword-input'),keyword=input.value;
+  if(!keyword.trim()||keyword.length>120||/[\x00-\x1f]/.test(keyword)){notice('Enter 1–120 printable characters.');return;}
+  if(draftKeywords.some(k=>k.toLocaleLowerCase()===keyword.toLocaleLowerCase())){notice('That keyword is already in your list.');return;}
+  if(draftKeywords.length>=100){notice('Maximum 100 keywords.');return;}
+  draftKeywords.push(keyword);input.value='';keywordDirty=true;renderKeywords();clearNotice();
+});
+$('save-keywords').addEventListener('click',()=>saveConfig('keywords'));
+$('panic-button').addEventListener('click',()=>sendSafety('/api/panic'));
+$('resume-button').addEventListener('click',()=>sendSafety('/api/resume'));
+refreshState().then(refreshEvents);
+setInterval(refreshState,1000);
+setInterval(refreshEvents,500);
+
+// Lightweight anchor navigation; the panel stays a single-page control surface.
+for (const link of document.querySelectorAll('.side-nav .nav-item')) {
+  link.addEventListener('click', () => {
+    for (const item of document.querySelectorAll('.side-nav .nav-item')) item.classList.remove('active');
+    link.classList.add('active');
+  });
+}

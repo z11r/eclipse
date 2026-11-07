@@ -1,14 +1,50 @@
-from fastapi import APIRouter, Request
-from .schemas import HealthResponse, PipelineStatus
+"""The six routes in Max's handoff, plus /api/health and GET /."""
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import HTMLResponse, FileResponse
+from pathlib import Path
+from .schemas import CatchLog, HealthResponse, ModeConfig, PanelConfig, PanelState
 
-router = APIRouter(prefix="/api", tags=["panel"])
-
-
-@router.get("/health", response_model=HealthResponse)
-def health(request: Request) -> HealthResponse:
-    return HealthResponse(pipeline_mode=request.app.state.controller.get_status().mode)
+router = APIRouter(tags=["panel"])
 
 
-@router.get("/status", response_model=PipelineStatus)
-def status(request: Request) -> PipelineStatus:
-    return request.app.state.controller.get_status()
+_INDEX = Path(__file__).parent / "templates" / "index.html"
+
+
+@router.get("/", response_class=HTMLResponse)
+def index():
+    return FileResponse(_INDEX, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/health", response_model=HealthResponse)
+def health():
+    return HealthResponse()
+
+
+@router.get("/api/state", response_model=PanelState)
+def state(request: Request):
+    return request.app.state.controller.get_state()
+
+
+@router.put("/api/config", response_model=PanelState)
+def configure(config: PanelConfig, request: Request):
+    return request.app.state.controller.set_config(config)
+
+
+@router.get("/api/log", response_model=CatchLog)
+def log(request: Request, after: int = Query(default=0, ge=0)):
+    return request.app.state.controller.get_events(after)
+
+
+@router.post("/api/panic", response_model=PanelState)
+def panic(request: Request):
+    return request.app.state.controller.panic()
+
+
+@router.post("/api/resume", response_model=PanelState)
+def resume(request: Request):
+    return request.app.state.controller.resume()
+
+
+@router.put("/api/mode", response_model=PanelState)
+def mode(config: ModeConfig, request: Request):
+    return request.app.state.controller.set_mode(config)
