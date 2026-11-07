@@ -1,16 +1,19 @@
 """Wires the pipeline. Run with: python -m eclipse.main
 
 Every frame goes through the text layer and the compositor before the delay buffer
-hands it to the output, so there is no way to send an unscanned frame.
+hands it to the output, so there is no way to send an unscanned frame. The panel and
+the panic key drive the same running pipeline, through one controller.
 """
 
 from __future__ import annotations
 
 import argparse
 import resource
+import signal
 import threading
 import time
 from collections import deque
+from typing import Callable
 
 import cv2
 
@@ -20,6 +23,9 @@ from eclipse.capture.screen import ScreenCapture
 from eclipse.compositor.compositor import PADDING, Compositor
 from eclipse.compositor.delay import DelayedPipeline
 from eclipse.output.virtual_cam import DiscardingCam, VirtualCam
+from eclipse.panel.app import PANEL_HOST, PANEL_PORT, start_panel
+from eclipse.panel.controller import LivePipelineController
+from eclipse.panel.hotkey import PANIC_KEYS, PanicHotkey
 from eclipse.platform import (
     AppleVisionReader,
     screen_capture_allowed,
@@ -36,12 +42,18 @@ class StatsLog:
     """Writes pipeline numbers to a file every few seconds. Never any screen text."""
 
     def __init__(
-        self, path: str, pipeline: DelayedPipeline, parts: dict, every: float = 2.0
+        self,
+        path: str,
+        pipeline: DelayedPipeline,
+        parts: dict,
+        every: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._path = path
         self._pipeline = pipeline
         self._parts = parts  # name -> source, detector or sink, each with its own stats
         self._every = every
+        self._clock = clock
         self._done = threading.Event()
         self._thread = threading.Thread(target=self._run, name="eclipse-stats", daemon=True)
 
@@ -65,6 +77,7 @@ class StatsLog:
                 numbers[f"{stage}.{name}"] = value
         usage = resource.getrusage(resource.RUSAGE_SELF)
         numbers["process.cpu_seconds"] = usage.ru_utime + usage.ru_stime
+        numbers["clock.seconds"] = self._clock()
         return numbers
 
     def _run(self) -> None:
@@ -83,18 +96,20 @@ class StatsLog:
         present = _drain(stats.present_intervals)
         ages = _drain(stats.scan_ages)
         slack = _drain(stats.slack)
+        # What really passed. A log line can run late, and a rate must not pretend it didn't.
+        elapsed = max(change["clock.seconds"], 1e-9)
 
         def count(name: str) -> int:
             return round(change.get(name, 0))
 
         def fps(name: str) -> float:
-            return change.get(name, 0) / self._every
+            return change.get(name, 0) / elapsed
 
         def ms(name: str, frames: float) -> float:
             return change.get(name, 0) / max(frames, 1) * 1000
 
         def busy(*names: str) -> float:
-            return sum(change.get(name, 0) for name in names) / self._every
+            return sum(change.get(name, 0) for name in names) / elapsed
 
         captured = count("pipeline.captured")
         scanned = count("pipeline.scanned")
@@ -103,9 +118,15 @@ class StatsLog:
         reads = count("detect.reads")
         scans = count("detect.full_scans") + count("detect.partial_scans")
         detect_ms = ms("pipeline.detect_seconds", scanned)
+        copy_ms = ms("detect.copy_seconds", scanned)
         diff_ms = ms("detect.diff_seconds", scanned)
         ocr_ms = ms("detect.scan_seconds", scanned)
         rules_ms = ms("detect.find_seconds", scanned)
+        track_ms = ms("detect.track_seconds", scanned)
+        known_ms = copy_ms + diff_ms + ocr_ms + rules_ms + track_ms
+        age = -1.0
+        if stats.last_presented_at is not None:
+            age = (now["clock.seconds"] - stats.last_presented_at) * 1000
         return (
             f"{time.strftime('%H:%M:%S')} "
             f"capture {fps('pipeline.captured'):.1f}fps fresh {fps('pipeline.fresh'):.1f}fps "
@@ -115,6 +136,17 @@ class StatsLog:
             f"skipped {count('pipeline.skipped')} id-gaps {count('pipeline.id_gaps')} "
             f"held {count('pipeline.held')} backlog {now['pipeline.backlog']} "
             f"last-id {now['pipeline.last_sent_id']} | "
+            f"tries {count('pipeline.capture_attempts')} admitted {count('pipeline.admitted')} "
+            f"no-room {count('pipeline.capture_skips')} refused {count('pipeline.discarded')} "
+            f"in-flight {now['pipeline.in_flight_frames']} "
+            f"{now['pipeline.in_flight_bytes'] / 1024**2:.0f}MB | "
+            f"results read {count('pipeline.rendered_scanned')} "
+            f"cached {count('pipeline.rendered_cached')} "
+            f"held {count('pipeline.rendered_held')} "
+            f"blackout {count('pipeline.rendered_blackout')} | "
+            f"camera-sends {count('pipeline.sends')} black {count('pipeline.black_sends')} "
+            f"new-pictures {count('pipeline.distinct_presented')} "
+            f"protected-age-ms {age:.0f} frozen-max-ms {stats.max_frozen_seconds * 1000:.0f} | "
             f"present-ms p50 {_percentile(present, 0.5):.1f} p95 {_percentile(present, 0.95):.1f} "
             f"max {_percentile(present, 1):.1f} | "
             f"queue-ms p50 {_percentile(ages, 0.5):.1f} p95 {_percentile(ages, 0.95):.1f} "
@@ -122,8 +154,9 @@ class StatsLog:
             f"capture-ms read {ms('pipeline.grab_seconds', captured):.1f} "
             f"grab {ms('capture.grab_seconds', captured):.1f} "
             f"convert {ms('capture.convert_seconds', captured):.1f} | "
-            f"detect-ms total {detect_ms:.1f} diff {diff_ms:.1f} ocr {ocr_ms:.1f} "
-            f"rules {rules_ms:.1f} other {detect_ms - diff_ms - ocr_ms - rules_ms:.1f} | "
+            f"detect-ms total {detect_ms:.1f} copy {copy_ms:.1f} diff {diff_ms:.1f} "
+            f"ocr {ocr_ms:.1f} rules {rules_ms:.1f} track {track_ms:.1f} "
+            f"other {detect_ms - known_ms:.1f} | "
             f"read-ahead jobs {count('read.jobs')} hits {count('read.hits')} "
             f"misses {count('read.misses')} failed {count('read.failed_reads')} "
             f"shed {count('read.shed')} cancelled {count('read.cancelled')} "
@@ -175,8 +208,46 @@ def screen_source(capture: str, max_width: int, retina: bool, fps: int):
     return PreferredCapture(ScreenCaptureKitCapture(max_width, retina, fps), polling)
 
 
-def p95(values: list[float]) -> float:
-    return sorted(values)[int(len(values) * 0.95)]
+def _stop_on_sigterm() -> Callable[[], None]:
+    """Treat a polite kill like Ctrl+C, so it ends in black too. Returns how to undo it."""
+
+    def interrupt(signum, stack) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, interrupt)
+    except ValueError:  # only the main thread can set signals
+        return lambda: None
+    return lambda: signal.signal(signal.SIGTERM, previous)
+
+
+def start_controls(controller: LivePipelineController, panel: bool, hotkey: bool):
+    """Start the panel and the panic key. The stream runs without them, but says so."""
+    server = None
+    if panel:
+        server = start_panel(controller)
+        if server is None:
+            print(f"Panel unavailable: {PANEL_HOST}:{PANEL_PORT} didn't start")
+        else:
+            print(f"Panel at http://{PANEL_HOST}:{PANEL_PORT}")
+    keys = None
+    if hotkey:
+        keys = PanicHotkey(controller.panic)
+        if keys.start():
+            print(f"Panic key: {PANIC_KEYS}")
+        else:
+            print(
+                "Panic key unavailable. On macOS, allow Input Monitoring in System Settings "
+                "> Privacy & Security. The panel's panic button still works."
+            )
+    return server, keys
+
+
+def stop_controls(server, keys) -> None:
+    if keys is not None:
+        keys.stop()
+    if server is not None:
+        server.should_exit = True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -213,6 +284,12 @@ def main(argv: list[str] | None = None) -> int:
         "--no-output", action="store_true", help="measure every stage but send frames nowhere"
     )
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument(
+        "--no-panel", action="store_true", help="no local control panel, as with --max-frames"
+    )
+    parser.add_argument(
+        "--no-hotkey", action="store_true", help="no panic key, as with --max-frames"
+    )
     args = parser.parse_args(argv)
     cv2.setNumThreads(2)  # leave the cores to OBS
 
@@ -249,11 +326,19 @@ def main(argv: list[str] | None = None) -> int:
     pipeline = DelayedPipeline(
         source, sink, detect, compositor, args.delay, args.fps, args.max_frames
     )
+    controller = LivePipelineController(pipeline, getattr(detect, "configure", None))
+    measuring = args.max_frames is not None  # a bounded run is a measurement, not a stream
+    server, keys = start_controls(
+        controller, not (args.no_panel or measuring), not (args.no_hotkey or measuring)
+    )
+    allow_sigterm = _stop_on_sigterm()
     parts = {"capture": source, "detect": detect, "output": sink, "read": read_ahead}
     try:
         with StatsLog(args.log, pipeline, parts):
             stats = pipeline.run()
     finally:
+        allow_sigterm()
+        stop_controls(server, keys)
         if read_ahead is not None:
             read_ahead.close()
     if stats.latencies:
@@ -266,10 +351,15 @@ def main(argv: list[str] | None = None) -> int:
             f"{compositor.held_frames} held"
         )
         print(
-            f"Capture to output p95 {p95(stats.latencies):.0f} ms, longest backlog "
+            f"Capture to output p95 {stats.latency.percentile(0.95):.0f} ms, longest backlog "
             f"{stats.max_backlog} frames, average scan "
             f"{stats.scan_seconds / max(stats.scanned, 1) * 1000:.0f} ms"
         )
+    if stats.shown and not stats.final_black_sent:
+        print("Warning: the last frame sent was not confirmed black. Check OBS.")
+        return 1
+    if stats.stalled_workers:
+        return 1
     return 0
 
 

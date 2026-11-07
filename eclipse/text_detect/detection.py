@@ -29,6 +29,9 @@ _SCROLL_MAX_SHIFT = 240  # most rows one frame can scroll
 _SCROLL_TOLERANCE = 40  # blurred pixels this close count as the same text
 _SCROLL_MAX_MISMATCH = 0.03  # past this share, it isn't a clean scroll
 _SCROLL_EDGE = 16  # OCR boxes can sit this far outside the text they cover
+_NOISE_FLOOR = 8  # a pixel this close to where it came from hasn't changed
+_WHOLE_PIXEL = 0.05  # a shift this close to a whole number lands text on the same pixels
+_SCROLL_RECHECK = 30  # frames of fractional scrolling between reads of the whole view
 _UNREAD_READ_AT = 96  # rows of incoming text to collect before reading them
 _UNREAD_KEEP = 24  # rows left black after a read, as the last line may be cut off
 
@@ -281,6 +284,42 @@ def _part_of_a_pixel(now_rows, before_rows) -> float:
     return float(np.clip((slope * (before_rows - now_rows)).sum() / steepness, -0.5, 0.5))
 
 
+def _strongest(difference: np.ndarray) -> np.ndarray:
+    """The largest change in any colour, so text that differs only in hue still counts."""
+    blue, green, red = cv2.split(difference)
+    return cv2.max(cv2.max(blue, green), red)
+
+
+def _unexplained(
+    now: np.ndarray, previous: np.ndarray, first_row: int, left: int, right: int, fraction: float
+) -> np.ndarray:
+    """Pixels the scroll doesn't account for.
+
+    now is the new image's overlap with the old one, which starts at first_row of
+    previous, between columns left and right.
+
+    This is the check that clears pixels, so nothing here is softened or thinned. A
+    scroll by whole pixels must reproduce each pixel, so any real difference counts.
+    After a fractional scroll each pixel is a mix of neighbouring rows, so it only has
+    to fall between them: new text still stands out, unless it is drawn over something
+    of the same brightness, which the scroll recheck is there to catch.
+    """
+    height = now.shape[0]
+    if abs(fraction) < _WHOLE_PIXEL:
+        before = previous[first_row:first_row + height, left:right]
+        return _strongest(cv2.absdiff(now, before)) > _NOISE_FLOOR
+    # One row more on each side, as the rows at the edge mix with rows past it.
+    start = max(first_row - 1, 0)
+    around = previous[start:first_row + height + 1, left:right]
+    rows = np.ones((3, 1), np.uint8)
+    skip = first_row - start
+    darkest = cv2.erode(around, rows)[skip:skip + height]
+    brightest = cv2.dilate(around, rows)[skip:skip + height]
+    too_dark = cv2.subtract(darkest, now)
+    too_bright = cv2.subtract(now, brightest)
+    return cv2.max(_strongest(too_dark), _strongest(too_bright)) > _NOISE_FLOOR
+
+
 def _text_hash(text: str) -> int:
     """Tells text apart across reads, so tracks never have to keep the text itself."""
     return hash(''.join(text.split()).lower())
@@ -299,7 +338,7 @@ class Detector:
             'frames': 0, 'full_scans': 0, 'partial_scans': 0, 'scan_seconds': 0.0,
             'scanned_share': 0.0, 'diff_seconds': 0.0, 'find_seconds': 0.0,
             'det_seconds': 0.0, 'rec_seconds': 0.0, 'reads': 0, 'lines': 0, 'scrolls': 0,
-            'checks': 0,
+            'checks': 0, 'copy_seconds': 0.0, 'track_seconds': 0.0, 'cached_frames': 0,
         }
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
@@ -318,9 +357,18 @@ class Detector:
         self._tracks = CoverTracks(pixel_scale)
         self._shape = None
         self._lock = threading.RLock()
+        self._cancelled = threading.Event()
+        self.reused_read = False  # whether the last frame needed no OCR
+        self._keywords = ()
+        self._enabled = frozenset()
         self.configure(keywords, enabled)
 
     def configure(self, keywords=(), enabled=None):
+        """Change what counts as sensitive, all at once. A bad setting changes nothing.
+
+        Covers in categories that stay on are kept. Dropping them would leave a known
+        secret relying on one new read to be found again.
+        """
         words = tuple(keywords)
         categories = CATEGORIES if enabled is None else frozenset(enabled)
 
@@ -330,10 +378,25 @@ class Detector:
         if not categories <= CATEGORIES:
             raise ValueError('unknown detection category')
 
+        for word in words:
+            _keyword_pattern(word)
+
         with self._lock:
+            still_on = categories & self._enabled
+            if not set(self._keywords) <= set(words):
+                still_on -= {'keyword'}  # a cover can't say which keyword it was for
             self._keywords = words
             self._enabled = categories
-            self.reset()
+            self._forget_scan()
+            self._tracks.keep_only(still_on)
+
+    def cancel(self):
+        """Stop for good at the next chance, for shutdown. Later scans fail, so stay safe.
+
+        A read already inside the OCR engine can't be stopped. Takes no lock, because
+        detect() holds it for the whole scan.
+        """
+        self._cancelled.set()
 
     def reset(self):
         """Forget everything, covers included, because old positions no longer apply.
@@ -351,6 +414,7 @@ class Detector:
         self._unread = {}  # one strip for each way rows can come in: 1 is down, -1 is up
         self._scrolled = False
         self._view = None  # top and bottom of the area scrolling now
+        self._fractional_frames = 0  # frames of this scroll that landed between pixels
 
     def _scroll_action(self, rect, image, changed, top, bottom, left, right) -> str:
         """What a scroll of the given area does to a piece of text or a cover."""
@@ -375,9 +439,10 @@ class Detector:
     def _follow_scroll(self, image, changed):
         """If the change is a clean vertical scroll, move known text along with it.
 
-        Returns what still needs reading: the rows newly on screen, plus anything
-        that doesn't match once the shift is taken into account. If this isn't a
-        clean scroll, returns the change untouched, so a wrong guess only costs time.
+        The tolerant comparisons here only propose a shift, and never clear a pixel.
+        Returns what still needs reading: the rows newly on screen, plus every pixel
+        the shift doesn't explain, however thin or faint. If this isn't a clean
+        scroll, returns the change untouched, so a wrong guess only costs time.
         """
         rows = np.flatnonzero(changed.any(axis=1))
         columns = np.flatnonzero(changed.any(axis=0))
@@ -418,11 +483,29 @@ class Detector:
         if mismatch.mean() > _SCROLL_MAX_MISMATCH:
             return changed
 
+        fraction = _part_of_a_pixel(
+            now_rows[now_start:now_start + length], before_rows[before_start:before_start + length]
+        )
+        first_row, old_row = top + now_start, top + before_start
+        if abs(fraction) >= _WHOLE_PIXEL:
+            # The row at the incoming edge is partly made of a row not seen yet, so it
+            # counts as incoming and stays covered until it can be read.
+            length -= 1
+            if shift > 0:
+                first_row, old_row = first_row + 1, old_row + 1
         remaining = np.zeros_like(changed)
-        # Half-pixel moves leave thin specks on text edges; real changes are thicker.
-        solid = cv2.erode(mismatch.astype(np.uint8), np.ones((3, 3), np.uint8))
-        solid = cv2.dilate(solid, np.ones((5, 5), np.uint8)) > 0
-        remaining[top + now_start:top + now_start + length, left:right] = solid
+        # A pixel that didn't change at all stays cleared, even if it doesn't match the
+        # shift: that is what still content beside a moving pane looks like.
+        remaining[first_row:first_row + length, left:right] = changed[
+            first_row:first_row + length, left:right
+        ] & _unexplained(
+            image[first_row:first_row + length, left:right],
+            self._previous,
+            old_row,
+            left,
+            right,
+            fraction,
+        )
         moved = []
         # Rows that look the same frame to frame don't count as changed, so this frame's
         # changed rows can fall short of the area's real edges. Remember the widest yet.
@@ -431,9 +514,12 @@ class Detector:
         else:
             top_of_view, bottom_of_view = top, bottom
         self._view = top_of_view, bottom_of_view
-        exact_shift = shift + _part_of_a_pixel(
-            now_rows[now_start:now_start + length], before_rows[before_start:before_start + length]
-        )
+        exact_shift = shift + fraction
+
+        if abs(fraction) >= _WHOLE_PIXEL:
+            self._fractional_frames += 1
+            if self._fractional_frames % _SCROLL_RECHECK == 0:
+                remaining[top_of_view:bottom_of_view, left:right] = True
 
         def action(rect) -> str:
             return self._scroll_action(
@@ -461,10 +547,10 @@ class Detector:
         self._regions = moved
         self.stats['scrolls'] += 1
         self._scrolled = True
-        self._collect_unread(shift, top, bottom, left, right, now_start, length, remaining)
+        self._collect_unread(shift, left, right, first_row, length, remaining)
         return remaining
 
-    def _collect_unread(self, shift, top, bottom, left, right, now_start, length, remaining):
+    def _collect_unread(self, shift, left, right, first, length, remaining):
         """Track rows new to the screen. They stay black until they can be read.
 
         A line coming onto the screen can't be read until enough of it shows, so
@@ -473,7 +559,6 @@ class Detector:
         unread, and a read replaces them with whatever it actually found.
         """
         top_of_view, bottom_of_view = self._view
-        first = top + now_start
         rows = (top_of_view, first) if shift > 0 else (first + length, bottom_of_view)
         incoming = (rows[0], rows[1], max(left - self._scroll_edge, 0), right + self._scroll_edge)
         direction = 1 if shift > 0 else -1
@@ -512,6 +597,7 @@ class Detector:
                 changed[top:bottom, left:right] = True
             self._unread = {}
             self._view = None
+            self._fractional_frames = 0
 
     def _changed_areas(self, image) -> list[tuple[int, int, int, int]]:
         """Areas to read again, each grown to hold whole pieces of known text."""
@@ -716,12 +802,16 @@ class Detector:
                     self._shape = frame.shape
 
                 # Save our own copy of this image.
+                copy_started = time.monotonic()
                 snapshot = np.array(frame, copy=True, order='C')
                 diff_started = time.monotonic()
+                self.stats['copy_seconds'] += diff_started - copy_started
                 self._scrolled = False
                 areas = self._changed_areas(snapshot)
                 self.stats['frames'] += 1
                 self.stats['diff_seconds'] += time.monotonic() - diff_started
+                self.reused_read = not areas
+                self.stats['cached_frames'] += self.reused_read
 
                 if not areas and not self._scrolled:
                     return list(self._boxes)
@@ -747,6 +837,8 @@ class Detector:
                 ]
 
                 for top, bottom, left, right in areas:
+                    if self._cancelled.is_set():
+                        raise RuntimeError('detection cancelled')
                     regions.extend(self._read(snapshot[top:bottom, left:right], top, left))
 
                 height, width = snapshot.shape[:2]
@@ -761,7 +853,8 @@ class Detector:
 
                 find_started = time.monotonic()
                 found = self._find_areas(regions)
-                self.stats['find_seconds'] += time.monotonic() - find_started
+                track_started = time.monotonic()
+                self.stats['find_seconds'] += track_started - find_started
 
                 self._tracks.update(snapshot, [
                     Sighting(
@@ -786,6 +879,7 @@ class Detector:
                 for top, bottom, left, right in self._unread.values():
                     boxes.add((left, top, min(right, width) - left, bottom - top, 'unread'))
 
+                self.stats['track_seconds'] += time.monotonic() - track_started
                 # Save results only after the whole scan succeeds.
                 self._boxes = tuple(sorted(boxes))
                 self._regions = regions

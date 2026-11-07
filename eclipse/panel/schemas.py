@@ -1,7 +1,7 @@
 """HTTP schemas for the local Eclipse panel.
 
-These mirror Max's proposed handoff contract, without claiming the mock
-controls a real OBS pipeline. Shared types.py additions await team approval.
+These mirror Max's proposed handoff contract. `simulated` says whether a real
+pipeline is behind them. Shared types.py additions await team approval.
 """
 from enum import Enum
 from typing import Literal
@@ -56,7 +56,8 @@ class DetectorHealth(str, Enum):
 
 
 class PanelState(BaseModel):
-    panic: bool = False
+    panic: bool = False  # a blackout has been requested
+    blackout_confirmed: bool = False  # a black frame has gone out since it was requested
     mode: Mode = "desktop"
     irl_available: bool = False
     enabled: list[Category] = Field(default_factory=lambda: list(ALL_CATEGORIES))
@@ -64,7 +65,10 @@ class PanelState(BaseModel):
     held_frames: int = 0
     detector_health: dict[str, DetectorHealth] = Field(default_factory=dict)
     output_connected: bool = False
-    output_state: Literal["stopped", "protected", "covered", "black", "error"] = "stopped"
+    # unverified: frames are flowing, but no real detector is behind them.
+    output_state: Literal[
+        "stopped", "protected", "covered", "black", "error", "unverified"
+    ] = "stopped"
     simulated: bool = True
     message: str = "Mock only: no capture or OBS output is running."
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -57,6 +58,8 @@ class _NoCamera:
 class VirtualCam:
     """Opens on the first frame. Call send() with already-redacted images only."""
 
+    checks_before_send = True  # send() takes a last check, for callers that want one
+
     def __init__(self, fps: int = 30) -> None:
         self._fps = fps
         self._interval = 1 / fps
@@ -79,7 +82,12 @@ class VirtualCam:
         if self._camera is not None:
             self._camera.close()
 
-    def send(self, image: np.ndarray) -> None:
+    def send(self, image: np.ndarray, may_send: Callable[[], bool] | None = None) -> bool:
+        """Send one frame, and return True if black went out in its place.
+
+        Fitting and waiting for the tick both take time, and a panic can arrive during
+        either. So may_send is asked as the very last step before the frame leaves.
+        """
         if self._camera is None:
             self._camera = self._open_camera()
             print(f"Sending {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} to {self._camera.device}")
@@ -90,11 +98,13 @@ class VirtualCam:
             self.stats["fits"] += 1
         fitted = time.monotonic()
         self._wait_for_tick(fitted)
+        blacked = may_send is not None and not may_send()
         sending = time.monotonic()
-        self._camera.send(self._last_fitted)
+        self._camera.send(np.zeros_like(self._last_fitted) if blacked else self._last_fitted)
         self.stats["fit_seconds"] += fitted - started
         self.stats["send_seconds"] += time.monotonic() - sending
         self.stats["sends"] += 1
+        return blacked
 
     def _open_camera(self):
         return pyvirtualcam.Camera(

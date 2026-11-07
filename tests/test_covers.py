@@ -606,3 +606,55 @@ def test_two_secrets_on_screen_move_independently_of_each_other():
         found = {d.category: d for d in run.secrets()}
         assert found["email"].y == 20 + 6 * LINE_PITCH - offset
         assert found["api_key"].y == 20 + 8 * LINE_PITCH - offset
+
+
+def test_a_settings_change_keeps_the_covers_of_categories_that_stay_on():
+    run = Run()
+    run.at(0)
+    run.reader.blind.add(FAKE_EMAIL)  # from here on OCR can't find it
+    run.detect.configure(keywords=("an unrelated new word",))
+    output = run.at(0)
+    assert "email" in {d.category for d in run.secrets()}
+    assert shown_secret_pixels(run.scene, 0, output) == 0
+
+
+def test_turning_a_category_off_ends_its_covers_and_only_those():
+    run = Run()
+    run.at(0)
+    assert {"email", "phone"} <= {d.category for d in run.secrets()}
+    run.detect.configure(enabled=("phone",))
+    run.at(0)
+    assert {d.category for d in run.secrets()} == {"phone"}
+
+
+def test_removing_a_keyword_ends_keyword_covers_as_they_can_no_longer_be_told_apart():
+    scene = ScrollScene(secrets={6: "fake street name"}, side_secrets={})
+    run = Run(scene, keywords=("fake street name", "another fake word"))
+    run.at(0)
+    assert {d.category for d in run.secrets()} == {"keyword"}
+    run.detect.configure(keywords=("another fake word",))
+    run.at(0)
+    assert run.secrets() == []
+
+
+def test_adding_a_keyword_keeps_the_keyword_covers_already_in_place():
+    scene = ScrollScene(secrets={6: "fake street name"}, side_secrets={})
+    run = Run(scene, keywords=("fake street name",))
+    run.at(0)
+    run.reader.blind.add("fake street name")
+    run.detect.configure(keywords=("fake street name", "another fake word"))
+    run.at(0)
+    assert {d.category for d in run.secrets()} == {"keyword"}
+
+
+def test_a_bad_setting_changes_nothing():
+    run = Run()
+    run.at(0)
+    detector = run.detect._detector
+    with pytest.raises(ValueError):
+        detector.configure(keywords=("fine", 7))
+    with pytest.raises(ValueError):
+        detector.configure(enabled={"not_a_category"})
+    assert detector._keywords == ()
+    assert "email" in {d.category for d in run.secrets()}
+    assert shown_secret_pixels(run.scene, 0, run.at(0)) == 0

@@ -83,7 +83,7 @@ function renderState(state) {
   $('metric-detectors').textContent=`${ready}/${detectorStates.length} ready`;
   const unavailable=detectorStates.filter(s=>s==='unavailable').length;
   $('metric-detector-sub').textContent=[degraded?`${degraded} degraded`:null,unavailable?`${unavailable} unavailable`:null].filter(Boolean).join(' · ') || 'All detectors available';
-  $('irl-label').textContent=state.irl_available?'Available':'Unavailable';
+  $('irl-label').textContent=state.irl_available?'Available':'Planned';
   let label,description, safety,orb='status-orb';
   if(mock){label='Demo / simulation only';description='The API is running, but no video is being captured or protected.';safety='NOT ACTIVE';}
   else if(state.panic && state.output_state==='black'){label='Emergency blackout';description='The pipeline reports black output. Resume is required to continue.';safety='BLACKOUT';orb+=' black';}

@@ -145,6 +145,20 @@ class ScrollScene:
     def line_at(self, code: int) -> Line | None:
         return self._by_colour.get(code)
 
+    def overlay(self, text: str, x: int, y: int, width: int) -> Line:
+        """A line that isn't on the page, for draw_overlay() to put on screen.
+
+        Use it for things that come and go on their own, such as a notification.
+        """
+        colour = (200, 90, 200 + len(self._by_colour) % 50)
+        line = Line(text, x, y, _ends_on_a_block(width), LINE_HEIGHT, colour)
+        self._by_colour[(colour[0] << 16) | (colour[1] << 8) | colour[2]] = line
+        self.secrets.add(text)
+        return line
+
+    def draw_overlay(self, image: np.ndarray, line: Line) -> None:
+        self._draw(image, line, line.x)
+
     def secret_boxes(self, offset: int) -> dict[str, tuple[int, int, int, int]]:
         """Each visible secret's left, top, right, bottom on screen, cut at the edges."""
         found = {}
