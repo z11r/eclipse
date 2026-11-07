@@ -1,8 +1,9 @@
 """Compositor: the last stop before output, and where fail closed is enforced.
 
-Every frame goes through process(). It either returns a frame with that frame's
-detections hidden, or, if anything went wrong, the last safe frame. The raw frame
-is never returned unless its scan finished cleanly.
+Every frame goes through render(). It either returns a frame with that frame's
+detections hidden, or, if anything went wrong, the last safe frame, still labelled as
+the frame it came from. The raw frame is never returned unless its scan finished
+cleanly.
 
 The compositor keeps no boxes between frames. A screen position goes stale as soon
 as anything moves, and holding old ones paints trails behind moving text. A detector
@@ -14,11 +15,12 @@ Use one Compositor per source, since boxes are in that source's pixels.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable
 
 import numpy as np
 
-from eclipse.types import Detection, Frame
+from eclipse.types import Detection, Frame, Rendered
 
 Detector = Callable[[Frame], list[Detection]]
 
@@ -30,18 +32,29 @@ class Compositor:
     def __init__(self, padding: int = PADDING) -> None:
         self._padding = padding
         self._boxes: list[tuple[int, int, int, int]] = []  # this frame's boxes
-        self._last_safe: np.ndarray | None = None
+        self._last_safe: Rendered | None = None
         self.held_frames = 0
 
     def process(self, frame: Frame, detect: Detector) -> np.ndarray:
         """Scan a frame and return what is safe to send."""
+        return self.render(frame, detect).image
+
+    def render(self, frame: Frame, detect: Detector, generation: int = 0) -> Rendered:
+        """Scan a frame and return what is safe to send, labelled with what it shows."""
         try:
             self._boxes = self._checked(frame, detect(frame))
-            output = self._redact(frame)
+            image = self._redact(frame)
         except Exception as error:
-            return self._hold(frame, error)
-        self._last_safe = output
-        return output
+            return self._hold(frame, error, generation)
+        state = "cached" if getattr(detect, "reused_read", False) else "scanned"
+        self._last_safe = Rendered(
+            image, state, frame.source, frame.frame_id, frame.ts, generation
+        )
+        return self._last_safe
+
+    def forget(self) -> None:
+        """Stop holding the last safe image, as it may no longer be safe to show."""
+        self._last_safe = None
 
     def _checked(
         self, frame: Frame, detections: list[Detection]
@@ -86,11 +99,11 @@ class Compositor:
             output[top:bottom, left:right] = FILL
         return output
 
-    def _hold(self, frame: Frame, error: Exception) -> np.ndarray:
+    def _hold(self, frame: Frame, error: Exception, generation: int) -> Rendered:
         if self.held_frames == 0:
             # Type only: an error message could contain the secret itself.
             print(f"Scan failed ({type(error).__name__}), holding the last safe frame")
         self.held_frames += 1
         if self._last_safe is not None:
-            return self._last_safe
-        return np.zeros_like(frame.image)
+            return replace(self._last_safe, state="held")
+        return Rendered(np.zeros_like(frame.image), "blackout", None, -1, frame.ts, generation)

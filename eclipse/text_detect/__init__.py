@@ -28,6 +28,11 @@ class TextDetector:
         """Start work on a frame before its turn. False means it can't be read in time."""
         return self._read_ahead is None or self._read_ahead.prepare(frame)
 
+    @property
+    def reused_read(self) -> bool:
+        """Whether the last frame needed no OCR, as earlier reads still applied."""
+        return self._detector.reused_read
+
     def __call__(self, frame: Frame) -> list[Detection]:
         if frame.source != self._source:
             self._detector.reset()  # another source's positions mean nothing here

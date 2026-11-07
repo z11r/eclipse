@@ -357,6 +357,7 @@ class Detector:
         self._tracks = CoverTracks(pixel_scale)
         self._shape = None
         self._lock = threading.RLock()
+        self.reused_read = False  # whether the last frame needed no OCR
         self.configure(keywords, enabled)
 
     def configure(self, keywords=(), enabled=None):
@@ -784,6 +785,7 @@ class Detector:
                 areas = self._changed_areas(snapshot)
                 self.stats['frames'] += 1
                 self.stats['diff_seconds'] += time.monotonic() - diff_started
+                self.reused_read = not areas
 
                 if not areas and not self._scrolled:
                     return list(self._boxes)

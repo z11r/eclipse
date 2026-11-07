@@ -56,3 +56,30 @@ def test_a_readable_email_added_during_a_scroll_is_not_left_visible():
     assert calls, "the new text was never read"
     same = (output == now).all(axis=2)
     assert int((same & glyphs & output.any(axis=2)).sum()) == 0
+
+
+def test_the_evaluator_accounts_for_the_content_of_a_held_frame(tmp_path):
+    path = tmp_path / "held-content.avi"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 30, (240, 100))
+    assert writer.isOpened()
+    first = np.full((100, 240, 3), 30, np.uint8)
+    cv2.putText(first, "FAKE SECRET", (12, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
+    for image in (first, np.full_like(first, 30), np.full_like(first, 30)):
+        writer.write(image)
+    writer.release()
+    labels = {"secrets": [{
+        "id": "fake", "text": "FAKE SECRET", "category": "keyword",
+        "first_frame": 0, "last_frame": 0, "box": [0, 20, 220, 50], "move": [0, 0],
+    }]}
+    showing = []
+
+    def misses_it_then_fails(frame):
+        if frame.frame_id:
+            raise RuntimeError("injected failure")
+        return []
+
+    report = run_eval.evaluate(
+        str(path), labels, misses_it_then_fails,
+        on_frame=lambda raw, output: showing.append(bool(output.max() > 100)),
+    )
+    assert report["leaked_frames"] == sum(showing) == 3
