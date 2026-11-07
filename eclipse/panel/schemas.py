@@ -76,6 +76,7 @@ class PanelState(BaseModel):
 
 
 class CatchEvent(BaseModel):
+    incident_id: int = Field(ge=1)
     seq: int = Field(ge=1)
     time: float = Field(ge=0)
     source: Source
@@ -84,6 +85,7 @@ class CatchEvent(BaseModel):
 
 
 class CatchLog(BaseModel):
+    session_id: str
     events: list[CatchEvent]
     last: int = Field(ge=0)
 

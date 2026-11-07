@@ -31,8 +31,9 @@ def configure(config: PanelConfig, request: Request):
 
 
 @router.get("/api/log", response_model=CatchLog)
-def log(request: Request, after: int = Query(default=0, ge=0)):
-    return request.app.state.controller.get_events(after)
+def log(request: Request, after: int = Query(default=0, ge=0),
+        session_id: str | None = Query(default=None, max_length=64)):
+    return request.app.state.controller.get_events(after, session_id)
 
 
 @router.post("/api/panic", response_model=PanelState)

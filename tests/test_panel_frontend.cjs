@@ -13,6 +13,9 @@ function panel() {
   const state = {panic:false, simulated:false, output_state:'protected',
     output_connected:true, enabled:['email'], keywords:[], detector_health:{email:'ready'}};
   const context = vm.createContext({
+    URLSearchParams,
+    window:{location:{hash:'#token=test-launch-token',pathname:'/',search:''},
+      history:{replaceState(){}},sessionStorage:{setItem(){},getItem(){return null;}}},
     document:{getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id);},
       createElement:element},
     fetch(url){
@@ -80,4 +83,79 @@ test('late failure displays the error and preserves edits for retry',async()=>{
   assert.match(elements.get('settings-status').textContent,/not applied/);
   assert.equal(elements.get('save-settings').disabled,false);
   assert.equal(vm.runInContext('configDirty',context),true);
+});
+
+function logResponse(context, data) {
+  context.fetch=async()=>({ok:true,json:async()=>data});
+  return vm.runInContext('refreshEvents()',context);
+}
+const catchEvent=(id,seq,count=1)=>({incident_id:id,seq,count,time:seq,source:'screen',category:'email'});
+
+test('log updates use stable incident IDs despite skipped polls and duplicate responses',async()=>{
+  const {context}=panel();
+  await logResponse(context,{session_id:'one',last:1,events:[catchEvent(1,1)]});
+  const update={session_id:'one',last:8,events:[catchEvent(1,8,8),catchEvent(7,7)]};
+  await logResponse(context,update);
+  await logResponse(context,update);
+  assert.equal(vm.runInContext('eventRows.length',context),2);
+  assert.equal(vm.runInContext('eventRows.find(e=>e.incident_id===1).count',context),8);
+});
+
+test('backend restart clears stale rows and cursor even when new sequence is higher',async()=>{
+  const {context}=panel();
+  await logResponse(context,{session_id:'old',last:3,events:[catchEvent(1,3)]});
+  let requested;
+  context.fetch=async url=>{requested=url;return {ok:true,json:async()=>({session_id:'new',last:10,events:[catchEvent(2,10)]})};};
+  await vm.runInContext('refreshEvents()',context);
+  assert.match(requested,/session_id=old/);
+  assert.equal(vm.runInContext('eventRows.length',context),1);
+  assert.equal(vm.runInContext('eventRows[0].incident_id',context),2);
+  await logResponse(context,{session_id:'empty',last:0,events:[]});
+  assert.equal(vm.runInContext('eventRows.length',context),0);
+  assert.equal(vm.runInContext('lastSeq',context),0);
+  await logResponse(context,{session_id:'empty',last:1,events:[catchEvent(1,1)]});
+  assert.equal(vm.runInContext('eventRows.length',context),1);
+});
+
+test('log failure retains history and later polling resumes with the same cursor',async()=>{
+  const {context,elements}=panel();
+  await logResponse(context,{session_id:'one',last:4,events:[catchEvent(1,4)]});
+  context.fetch=async()=>{throw Error('offline');};
+  await vm.runInContext('refreshEvents()',context);
+  assert.equal(elements.get('log-connection').textContent,'Activity log unavailable');
+  assert.equal(vm.runInContext('eventRows.length',context),1);
+  assert.equal(vm.runInContext('lastSeq',context),4);
+  await logResponse(context,{session_id:'one',last:5,events:[catchEvent(1,5,2)]});
+  assert.equal(vm.runInContext('eventRows.length',context),1);
+  assert.equal(elements.get('log-connection').textContent,'Log connected');
+});
+
+test('API includes launch authorization even when custom headers are supplied',async()=>{
+  const {context}=panel();
+  let received;
+  context.fetch=async(url,options)=>{received=options;return {ok:true,json:async()=>({})};};
+  await vm.runInContext("api('/api/panic',{method:'POST',headers:{'X-Test':'yes'}})",context);
+  assert.equal(received.headers.Authorization,'Bearer test-launch-token');
+  assert.equal(received.headers['X-Test'],'yes');
+});
+
+test('launch token is removed from address and retained for refresh in this tab',()=>{
+  const {context}=panel();
+  const storage = new Map();
+  let cleaned;
+  context.window.sessionStorage={setItem:(key,value)=>storage.set(key,value),getItem:key=>storage.get(key)};
+  context.window.history.replaceState=(state,title,url)=>{cleaned=url;};
+  assert.equal(vm.runInContext('loadPanelToken()',context),'test-launch-token');
+  assert.equal(cleaned,'/');
+  context.window.location.hash='';
+  assert.equal(vm.runInContext('loadPanelToken()',context),'test-launch-token');
+});
+
+test('expired authorization disconnects controls and explains the new launch link',async()=>{
+  const {context,elements}=panel();
+  context.fetch=async()=>({status:401,ok:false});
+  await vm.runInContext('refreshState()',context);
+  assert.match(elements.get('notice').textContent,/current launch link/);
+  assert.equal(elements.get('resume-button').disabled,true);
+  assert.equal(elements.get('panic-button').disabled,true);
 });

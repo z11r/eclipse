@@ -1,5 +1,18 @@
 'use strict';
 
+// The terminal launch link carries a token in its fragment, never in a query.
+function loadPanelToken(){
+  const fragment=new URLSearchParams(window.location.hash.slice(1));
+  const launched=fragment.get('token');
+  if(launched){
+    window.history.replaceState(null,'',window.location.pathname+window.location.search);
+    try{window.sessionStorage.setItem('eclipse-panel-token',launched);}catch(_){}
+    return launched;
+  }
+  try{return window.sessionStorage.getItem('eclipse-panel-token') || '';}catch(_){return '';}
+}
+const panelToken=loadPanelToken();
+
 const TEXT = [
   ['two_fa','2FA verification codes'], ['email','Email addresses'],
   ['phone','Phone numbers'], ['api_key','API keys & tokens'],
@@ -20,6 +33,7 @@ let configDirty = false;
 let keywordDirty = false;
 let connected = false;
 let lastSeq = 0;
+let logSession = null;
 let eventRows = [];
 let logAvailable = true;
 let statePollInFlight = false;
@@ -31,10 +45,13 @@ let revealTimeouts = new Map();
 
 async function api(path, options={}) {
   const response = await fetch(path, {
+    ...options,
     credentials:'same-origin', cache:'no-store',
-    headers:{'Accept':'application/json', ...(options.body?{'Content-Type':'application/json'}:{}), ...(options.headers||{})},
-    ...options
+    headers:{'Accept':'application/json', ...(options.body?{'Content-Type':'application/json'}:{}), ...(options.headers||{}), 'Authorization':`Bearer ${panelToken}`}
   });
+  if(response.status===401){
+    throw Error('Panel authorization expired or missing. Open the current launch link from the Eclipse terminal.');
+  }
   if (!response.ok) {
     let detail='Request failed ('+response.status+')';
     try { const data=await response.json(); if (typeof data.detail === 'string') detail=data.detail; } catch (_) {}
@@ -209,24 +226,24 @@ async function refreshState(){
   if(statePollInFlight)return;
   statePollInFlight=true;
   try{const state=await api('/api/state');renderState(state);}
-  catch(e){setConnection(false);notice('Cannot reach the local Eclipse server. Current protection status is unknown.');}
+  catch(e){setConnection(false);notice(e.message || 'Cannot reach the local Eclipse server. Current protection status is unknown.');}
   finally{statePollInFlight=false;}
 }
 async function refreshEvents(){
   if(!connected||logPollInFlight)return;
   logPollInFlight=true;
   try {
-    const data=await api(`/api/log?after=${lastSeq}`);
+    const sessionQuery=logSession===null?'':`&session_id=${encodeURIComponent(logSession)}`;
+    const data=await api(`/api/log?after=${lastSeq}${sessionQuery}`);
+    if(data.session_id!==logSession){
+      eventRows=[];
+      lastSeq=0;
+      logSession=data.session_id;
+    }
     for(const event of data.events){
-      // The API issues a fresh seq when a rolling catch count changes.
-      // Merge only within the event's 2-second repeat window; a new catch
-      // after a quiet gap must remain a separate visible occurrence.
-      const oldIndex=eventRows.findIndex(old =>
-        old.source===event.source && old.category===event.category &&
-        old.seq<event.seq && event.time>=old.time && event.time-old.time<=2.0 &&
-        event.count>old.count);
-      if(oldIndex>=0)eventRows[oldIndex]=event;
-      else if(!eventRows.some(old=>old.seq===event.seq))eventRows.push(event);
+      const oldIndex=eventRows.findIndex(old=>old.incident_id===event.incident_id);
+      if(oldIndex<0)eventRows.push(event);
+      else if(event.seq>eventRows[oldIndex].seq)eventRows[oldIndex]=event;
     }
     lastSeq=Math.max(lastSeq,data.last);
     eventRows.sort((a,b)=>b.seq-a.seq);

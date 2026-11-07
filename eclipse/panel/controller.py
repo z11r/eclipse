@@ -75,7 +75,7 @@ class PipelineController(Protocol):
 
     def get_state(self) -> PanelState: ...
     def set_config(self, config: PanelConfig) -> PanelState: ...
-    def get_events(self, after: int = 0) -> CatchLog: ...
+    def get_events(self, after: int = 0, session_id: str | None = None) -> CatchLog: ...
     def panic(self) -> PanelState: ...
     def resume(self) -> PanelState: ...
     def set_mode(self, mode: ModeConfig) -> PanelState: ...
@@ -108,8 +108,8 @@ class MockPipelineController:
             self._state.keywords = list(config.keywords)
             return self._state.model_copy(deep=True)
 
-    def get_events(self, after: int = 0) -> CatchLog:
-        return self.events.since(after)
+    def get_events(self, after: int = 0, session_id: str | None = None) -> CatchLog:
+        return self.events.since(after, session_id)
 
     def panic(self) -> PanelState:
         with self._lock:
@@ -257,8 +257,8 @@ class LivePipelineController:
             raise HTTPException(status_code=503, detail=state.config_message)
         return state
 
-    def get_events(self, after: int = 0) -> CatchLog:
-        return self.events.since(after)
+    def get_events(self, after: int = 0, session_id: str | None = None) -> CatchLog:
+        return self.events.since(after, session_id)
 
     def panic(self) -> PanelState:
         self._gate.panic()

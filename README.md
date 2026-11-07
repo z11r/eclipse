@@ -32,7 +32,7 @@ python -m eclipse.main
 
 This uses RapidOCR at 60 fps with a 1-second delay. While it runs:
 
-- The control panel is at http://127.0.0.1:8000. Turn categories on or off, add keywords, see what was caught, and panic or resume.
+- Open the **Open authorized panel** link printed in the terminal. Turn categories on or off, add keywords, see what was caught, and panic or resume. Each launch generates a new private token; after restarting Eclipse, open the new link. The browser removes the token from the address bar and keeps it for refreshes in that tab. Do not share the launch link or include it in demo recordings. Opening the plain localhost URL in a new tab does not authorize controls.
 - Control+Option+B blacks out the output, including frames already waiting to go out. Resume from the panel.
 - Numbers (never screen text) go to `eclipse-run.log` every 2 seconds.
 - Ctrl+C stops it. The last frame sent is black.
