@@ -30,6 +30,22 @@ def use_full_screen_resolution() -> None:
         mss.darwin.IMAGE_OPTIONS = bounds_ignore_framing | should_be_opaque
 
 
+def camera_backend() -> int:
+    """The OpenCV camera driver to use.
+
+    On Windows this is Media Foundation. It takes a few seconds to open, but
+    DirectShow gets only black frames at 1 fps from cameras behind a vendor camera
+    service, such as Acer's.
+    """
+    import cv2
+
+    if IS_MAC:
+        return cv2.CAP_AVFOUNDATION
+    if sys.platform == "win32":
+        return cv2.CAP_MSMF
+    return cv2.CAP_ANY
+
+
 def screen_capture_allowed() -> bool:
     """Whether this process may record the screen.
 
@@ -44,10 +60,43 @@ def screen_capture_allowed() -> bool:
 
 def peak_memory_mb() -> float:
     """The most memory this process has used. macOS counts in bytes, Linux in kilobytes."""
-    import resource
+    if sys.platform == "win32":
+        return _windows_peak_memory() / 1024**2
+
+    import resource  # not on Windows
 
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak / 1024**2 if IS_MAC else peak / 1024
+
+
+def _windows_peak_memory() -> int:
+    """Peak working set in bytes, the Windows counterpart of ru_maxrss."""
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = Counters()
+    counters.cb = ctypes.sizeof(Counters)
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi = ctypes.WinDLL("psapi")
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    if not psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        raise ctypes.WinError()
+    return counters.PeakWorkingSetSize
 
 
 def keyboard_listening_allowed() -> bool:

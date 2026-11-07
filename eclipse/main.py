@@ -8,7 +8,6 @@ the panic key drive the same running pipeline, through one controller.
 from __future__ import annotations
 
 import argparse
-import resource
 import signal
 import threading
 import time
@@ -20,6 +19,7 @@ import cv2
 from eclipse.capture.pattern import TestPattern
 from eclipse.capture.preferred import PreferredCapture
 from eclipse.capture.screen import ScreenCapture
+from eclipse.capture.webcam import WebcamCapture
 from eclipse.compositor.compositor import PADDING, Compositor
 from eclipse.compositor.delay import DelayedPipeline
 from eclipse.output.virtual_cam import DiscardingCam, VirtualCam
@@ -75,8 +75,9 @@ class StatsLog:
         for stage, part in self._parts.items():
             for name, value in dict(getattr(part, "stats", {})).items():
                 numbers[f"{stage}.{name}"] = value
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        numbers["process.cpu_seconds"] = usage.ru_utime + usage.ru_stime
+        # User plus system CPU time for the whole process, on every OS.
+        # (resource.getrusage doesn't exist on Windows.)
+        numbers["process.cpu_seconds"] = time.process_time()
         numbers["clock.seconds"] = self._clock()
         return numbers
 
@@ -257,6 +258,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="send a moving pattern with a fake secret hidden by the compositor",
     )
+    parser.add_argument(
+        "--webcam",
+        type=int,
+        metavar="INDEX",
+        help="capture this camera instead of the screen (0 is usually the built-in one)",
+    )
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--delay", type=float, default=1.0, help="seconds behind live")
     parser.add_argument("--max-width", type=int, default=1920)
@@ -298,6 +305,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.test_pattern:
         source = TestPattern()
         detect = source.detect
+    elif args.webcam is not None:
+        source = WebcamCapture(args.webcam)
+        detect = TextDetector()
     else:
         if not screen_capture_allowed():
             print(

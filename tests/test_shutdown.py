@@ -1,5 +1,6 @@
 """However a run ends, the last thing sent is black, and nothing gets out afterwards."""
 
+import sys
 import threading
 import time
 
@@ -344,6 +345,10 @@ def test_the_real_camera_gets_the_final_black_before_it_closes(monkeypatch):
     assert any(kind == "picture" for kind, _ in log)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="on Windows os.kill(SIGTERM) ends the process at once, taking pytest with it",
+)
 def test_sigterm_is_treated_like_ctrl_c(monkeypatch):
     import os
     import signal
