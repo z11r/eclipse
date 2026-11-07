@@ -1,4 +1,4 @@
-# Python 3.11. See SPEC.md for why each of these is here.
+# Python 3.11.
 
 # Capture and video. The contrib build is required: plain opencv-python has no
 # CSRT or KCF tracker, and the track module needs them.
@@ -22,9 +22,6 @@ pynput==1.8.2
 # Control panel
 fastapi==0.162.0
 uvicorn==0.54.0
-
-# Rules
-PyYAML==6.0.3
 
 # Tests
 pytest==9.2.0

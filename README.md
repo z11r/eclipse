@@ -2,15 +2,13 @@
 
 Other tools catch your API key. Eclipse catches the things that let people find your house.
 
-Eclipse is a desktop app that sits between your screen and webcam and OBS. It hides anything that leaks your secrets or shows where you live before a frame goes out. Built for natHacks 2026 (Standard Division, Defense & Security). See [SPEC.md](SPEC.md) for the full plan.
+Eclipse is a desktop app that sits between your screen and OBS. It reads the screen, covers secrets with solid black boxes, and sends the result to OBS as a virtual camera, one second behind live. A frame that hasn't been scanned never goes out. Built for natHacks 2026 (Standard Division, Defense & Security).
 
-> **Status:** in development. The app does not run yet; this README covers setup only and will grow with the build.
+> **Status:** screen capture, the text layer, the control panel and the panic key run on macOS. The text layer covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. Webcam input, location clues and IRL mode aren't built yet, and the app doesn't start on Windows yet.
 
 ## Setup
 
 You need Python 3.11 and OBS 30 or later.
-
-macOS:
 
 ```bash
 python3.11 -m venv .venv
@@ -18,18 +16,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Windows:
-
-```powershell
-py -3.11 -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
 ### macOS, once per laptop
 
-1. In System Settings → Privacy & Security, allow Screen Recording, Camera and Accessibility for whatever runs Python (Terminal, iTerm or VS Code).
+1. In System Settings → Privacy & Security, allow Screen Recording for whatever runs Python (Terminal, iTerm or VS Code). Allow Input Monitoring too if you want the panic key.
 2. In OBS, start and stop the virtual camera once, and approve the camera extension when macOS asks.
+3. In OBS, set Settings → Video → Common FPS Values to 60, then add a Video Capture Device source and pick OBS Virtual Camera.
 
 ## Running
 
@@ -39,6 +30,25 @@ Run Eclipse as a module from the repo root:
 python -m eclipse.main
 ```
 
+This uses RapidOCR at 60 fps with a 1-second delay. While it runs:
+
+- The control panel is at http://127.0.0.1:8000. Turn categories on or off, add keywords, see what was caught, and panic or resume.
+- Control+Option+B blacks out the output, including frames already waiting to go out. Resume from the panel.
+- Numbers (never screen text) go to `eclipse-run.log` every 2 seconds.
+- Ctrl+C stops it. The last frame sent is black.
+
+Useful options:
+
+| Option | What it does |
+| --- | --- |
+| `--ocr apple` | Use Apple's built-in OCR. Much faster, but finds fewer secrets than RapidOCR. |
+| `--fps 30` | Capture and send at a different frame rate |
+| `--delay 2` | Seconds behind live |
+| `--test-pattern` | Send a moving pattern with a fake secret instead of your screen, to check OBS |
+| `--no-output` | Do all the work but send nothing, for timing runs |
+
+`python -m eclipse.main --help` lists the rest.
+
 Don't run `python eclipse/main.py`. That puts the package folder on Python's import path, where our `platform.py` hides the standard library module of the same name.
 
 Run the tests with:
@@ -47,12 +57,24 @@ Run the tests with:
 python -m pytest
 ```
 
+Measure leaks and latency on the test clips with:
+
+```bash
+python -m eval.run_eval
+```
+
+## How it works
+
+Capture, scanning and output run side by side. Each frame is read with OCR, checked against the rules, and covered before it reaches the delay buffer, and a gate checks every picture on its way out. Panic works at that gate, so it takes effect at once, however far behind the scanner is. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for each module, the other eval scripts and the known limits.
+
 ## Layout
 
 ```text
-eclipse/    the app: capture, text_detect, visual_detect, track, compositor, output, panel
-eval/       test clips, ground-truth labels and the eval harness
+eclipse/    the app: capture, text_detect, compositor, output, panel
+            (visual_detect and track are empty for now)
+eval/       test clips, ground-truth labels and the eval scripts
 tests/      unit tests
+docs/       architecture
 ```
 
 Test clips use planted fake secrets and clues only. Never commit a real secret or address, even for testing.
@@ -60,5 +82,9 @@ Test clips use planted fake secrets and clues only. Never commit a real secret o
 ## Credits
 
 - Secret rules are inspired by [gitleaks](https://github.com/gitleaks/gitleaks) patterns.
-- OCR by [RapidOCR](https://github.com/RapidAI/RapidOCR).
+- OCR by [RapidOCR](https://github.com/RapidAI/RapidOCR), and Apple's Vision framework through [PyObjC](https://github.com/ronaldoussoren/pyobjc).
+- Screen capture through ScreenCaptureKit (PyObjC) and [mss](https://github.com/BoboTiG/python-mss), image work with [OpenCV](https://opencv.org/).
 - Virtual camera output through [pyvirtualcam](https://github.com/letmaik/pyvirtualcam) and [OBS](https://obsproject.com/).
+- Control panel with [FastAPI](https://fastapi.tiangolo.com/) and [Uvicorn](https://www.uvicorn.org/), panic key with [pynput](https://github.com/moses-palmer/pynput).
+
+We used AI tools, including Claude Code and ChatGPT, during planning and development.
