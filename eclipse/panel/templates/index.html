@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b0a10" />
+  <title>Eclipse — Privacy Control</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#overview" aria-label="Eclipse overview">
+        <span class="brandmark" aria-hidden="true"><span class="brand-eclipse"></span></span>
+        <span class="brand-copy"><strong>ECLIPSE</strong><small>PRIVACY, REDEFINED.</small></span>
+      </a>
+      <div class="nav-section-label">WORKSPACE</div>
+      <nav class="side-nav" aria-label="Dashboard sections">
+        <a href="#overview" class="nav-item active"><span class="nav-symbol">◫</span> Overview <span class="nav-chevron">↗</span></a>
+        <a href="#protection" class="nav-item"><span class="nav-symbol">◇</span> Protection rules</a>
+        <a href="#activity" class="nav-item"><span class="nav-symbol">◷</span> Activity log</a>
+      </nav>
+      <div class="aside-spacer"></div>
+      <div class="sidebar-bottom">
+       
+      </div>
+    </aside>
+
+    <main class="main" id="overview">
+      <div class="topbar">
+        <div class="breadcrumb"><span>Workspace</span><span class="crumb-sep">/</span><strong>Overview</strong></div>
+        <div class="topbar-right"><span class="local-mark">◈ &nbsp; LOCAL CONTROL</span><div id="connection" class="connection" role="status">● Connecting</div></div>
+      </div>
+      <header class="page-header">
+        <div><div class="eyebrow">PROTECTION DASHBOARD <span class="small-line"></span> ECLIPSE</div><h1>Your privacy, <em>in focus.</em></h1><p class="intro">Quietly protecting what matters before it reaches your audience.</p></div>
+        <div class="date-label">DESKTOP / CONTROL CENTER <span>01</span></div>
+      </header>
+      <div id="notice" role="alert" class="notice hidden"></div>
+
+      <section class="hero" aria-label="Stream safety state">
+        <div class="hero-left"><div class="label">CURRENT PROTECTION STATE</div><div class="status-line"><span class="status-orb" id="status-orb"></span><h2 id="status-heading">Checking pipeline</h2></div><p id="status-description">Retrieving the current control state.</p><div class="hero-pills"><span class="pill" id="mode-chip">Desktop mode</span><span class="pill" id="output-chip">Output unknown</span></div></div>
+        <div class="hero-right"><div class="orbital" aria-hidden="true"><div class="orbital-ring one"></div><div class="orbital-ring two"></div><div class="orbital-core"><span class="orbital-cut"></span></div></div><div class="hero-note">SYSTEM VERIFICATION</div><strong id="safety-label">UNKNOWN</strong></div>
+      </section>
+      <div id="mock-warning" class="mock-warning hidden"><span class="warning-sign">!</span><strong>SIMULATION MODE</strong><span>These controls only affect the mock backend. No capture or OBS stream is currently protected.</span></div>
+
+      <section class="metrics" aria-label="System metrics">
+        <div class="metric"><div class="metric-title">Virtual camera <span class="metric-icon">▣</span></div><div id="metric-output" class="metric-value">—</div><div class="metric-sub">Connection to OBS</div></div>
+        <div class="metric"><div class="metric-title">Frames held <span class="metric-icon">◷</span></div><div id="metric-held" class="metric-value">—</div><div class="metric-sub">Protected processing queue</div></div>
+        <div class="metric"><div class="metric-title">Detector health <span class="metric-icon">✧</span></div><div id="metric-detectors" class="metric-value">—</div><div class="metric-sub" id="metric-detector-sub">Awaiting status</div></div>
+      </section>
+
+      <section class="content-grid">
+        <div class="primary-column">
+          <section class="panel emergency" aria-labelledby="emergency-title">
+            <div class="section-heading"><div><div class="label">INSTANT CONTROL</div><h3 id="emergency-title">Emergency blackout</h3></div><span class="section-icon warning-icon" aria-hidden="true">⊘</span></div>
+            <p>Override the stream output with a black frame. Protection remains in place until you explicitly resume.</p>
+            <div class="action-row"><button id="panic-button" class="button danger" disabled><span>■</span> Blackout stream</button><button id="resume-button" class="button outline" disabled><span>▷</span> Resume output</button></div>
+            <div class="help" id="panic-hint">Connecting to local control service…</div>
+          </section>
+          <section class="panel rules-panel" id="protection" aria-labelledby="rules-title">
+            <div class="section-heading"><div><div class="label">ACTIVE DEFENSE</div><h3 id="rules-title">Protection rules</h3></div><span class="tiny-tag" id="category-count">— ENABLED</span></div>
+            <p>Choose the categories Eclipse scans for. Apply changes when you're ready.</p>
+            <form id="categories-form"><div class="group-title">TEXT & SECRETS <span>01</span></div><div id="text-categories" class="category-list"></div><div class="group-title visual-title">VISUAL PRIVACY <span>02</span></div><div id="visual-categories" class="category-list"></div><div class="form-actions"><span id="settings-status" class="help" role="status">Loading configuration</span><button class="button primary" id="save-settings" type="submit" disabled>Apply changes <span>↗</span></button></div></form>
+          </section>
+        </div>
+        <div class="secondary-column">
+          <section class="panel keywords-panel" aria-labelledby="keywords-title"><div class="section-heading"><div><div class="label">PERSONAL PROTECTION</div><h3 id="keywords-title">Private keywords</h3></div><span class="section-icon">⌘</span></div><p>Protect personal names, places and phrases. Keywords are stored locally, outside the repository.</p><form id="keyword-form"><label class="input-label" for="keyword-input">NEW PRIVATE KEYWORD</label><div class="keyword-entry"><input id="keyword-input" type="password" autocomplete="off" maxlength="120" placeholder="Enter keyword"/><button type="submit" class="button outline" id="add-keyword" disabled>Add +</button></div></form><div id="keyword-list" class="keywords-list"><div class="empty">No keywords configured</div></div><div class="form-actions"><span class="help">Hidden until held to reveal</span><button id="save-keywords" class="button primary" disabled>Save list <span>↗</span></button></div></section>
+          <section class="panel mode-panel" aria-labelledby="mode-title"><div class="section-heading"><div><div class="label">INPUT ENVIRONMENT</div><h3 id="mode-title">Processing mode</h3></div><span class="section-icon">▤</span></div><div class="mode-row"><div class="mode-emblem">▣</div><div class="mode-info"><strong>Desktop mode</strong><p>Screen and webcam</p></div><span class="mode-active">SELECTED</span></div><div class="mode-row disabled"><div class="mode-emblem">◉</div><div class="mode-info"><strong>IRL streaming</strong><p>Moving camera or remote feed</p></div><span class="coming-soon" id="irl-label">Unavailable</span></div></section>
+          <section class="panel activity" id="activity" aria-labelledby="activity-title"><div class="section-heading"><div><div class="label">RECENT ACTIVITY</div><h3 id="activity-title">Privacy catches</h3></div><span id="events-count" class="tiny-tag">0 EVENTS</span></div><p>Only safe metadata is shown. Sensitive information never appears in this log.</p><div class="activity-table-head"><span>DETECTION</span><span>COUNT</span></div><div id="event-list" class="event-list"><div class="empty">No detection events reported.</div></div></section>
+        </div>
+      </section>
+      <footer><span>© Eclipse · Local privacy control</span><span>Designed for protection, not exposure. <span class="footer-star">✳</span></span></footer>
+    </main>
+  </div>
+</body>
+</html>
