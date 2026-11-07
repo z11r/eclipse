@@ -80,3 +80,28 @@ def test_short_keyword_matches_whole_words_only():
 def test_keyword_with_symbols_is_matched_literally():
     assert "keyword" in classify_text("user c++dev here", ["c++dev"])
     assert "keyword" not in classify_text("user cdev here", ["c++dev"])
+
+
+@pytest.mark.parametrize('text', [
+    'password=12345',
+    'PASSWORD = "a"',
+    'DB_PASSWORD=abc',
+    'pwd: x',
+])
+def test_short_labeled_passwords_are_secrets(text):
+    assert 'api_key' in classify_text(text)
+
+
+@pytest.mark.parametrize('text', ['password=', 'password=""', 'pwd: ', 'password strength is low'])
+def test_empty_or_unassigned_passwords_are_not_secrets(text):
+    assert 'api_key' not in classify_text(text)
+
+
+@pytest.mark.parametrize('text', ['Yourcode:482619', 'Yourcode:918273', 'Securitycode:1234'])
+def test_code_hints_survive_dropped_spaces(text):
+    assert '2fa' in classify_text(text)
+
+
+@pytest.mark.parametrize('text', ['Server runs on port 8080', 'Year: 2026', 'barcode:482619'])
+def test_code_hint_fix_does_not_treat_every_number_as_a_code(text):
+    assert '2fa' not in classify_text(text)
