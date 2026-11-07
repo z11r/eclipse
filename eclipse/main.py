@@ -42,12 +42,18 @@ class StatsLog:
     """Writes pipeline numbers to a file every few seconds. Never any screen text."""
 
     def __init__(
-        self, path: str, pipeline: DelayedPipeline, parts: dict, every: float = 2.0
+        self,
+        path: str,
+        pipeline: DelayedPipeline,
+        parts: dict,
+        every: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._path = path
         self._pipeline = pipeline
         self._parts = parts  # name -> source, detector or sink, each with its own stats
         self._every = every
+        self._clock = clock
         self._done = threading.Event()
         self._thread = threading.Thread(target=self._run, name="eclipse-stats", daemon=True)
 
@@ -71,6 +77,7 @@ class StatsLog:
                 numbers[f"{stage}.{name}"] = value
         usage = resource.getrusage(resource.RUSAGE_SELF)
         numbers["process.cpu_seconds"] = usage.ru_utime + usage.ru_stime
+        numbers["clock.seconds"] = self._clock()
         return numbers
 
     def _run(self) -> None:
@@ -89,18 +96,20 @@ class StatsLog:
         present = _drain(stats.present_intervals)
         ages = _drain(stats.scan_ages)
         slack = _drain(stats.slack)
+        # What really passed. A log line can run late, and a rate must not pretend it didn't.
+        elapsed = max(change["clock.seconds"], 1e-9)
 
         def count(name: str) -> int:
             return round(change.get(name, 0))
 
         def fps(name: str) -> float:
-            return change.get(name, 0) / self._every
+            return change.get(name, 0) / elapsed
 
         def ms(name: str, frames: float) -> float:
             return change.get(name, 0) / max(frames, 1) * 1000
 
         def busy(*names: str) -> float:
-            return sum(change.get(name, 0) for name in names) / self._every
+            return sum(change.get(name, 0) for name in names) / elapsed
 
         captured = count("pipeline.captured")
         scanned = count("pipeline.scanned")
@@ -109,9 +118,15 @@ class StatsLog:
         reads = count("detect.reads")
         scans = count("detect.full_scans") + count("detect.partial_scans")
         detect_ms = ms("pipeline.detect_seconds", scanned)
+        copy_ms = ms("detect.copy_seconds", scanned)
         diff_ms = ms("detect.diff_seconds", scanned)
         ocr_ms = ms("detect.scan_seconds", scanned)
         rules_ms = ms("detect.find_seconds", scanned)
+        track_ms = ms("detect.track_seconds", scanned)
+        known_ms = copy_ms + diff_ms + ocr_ms + rules_ms + track_ms
+        age = -1.0
+        if stats.last_presented_at is not None:
+            age = (now["clock.seconds"] - stats.last_presented_at) * 1000
         return (
             f"{time.strftime('%H:%M:%S')} "
             f"capture {fps('pipeline.captured'):.1f}fps fresh {fps('pipeline.fresh'):.1f}fps "
@@ -121,6 +136,17 @@ class StatsLog:
             f"skipped {count('pipeline.skipped')} id-gaps {count('pipeline.id_gaps')} "
             f"held {count('pipeline.held')} backlog {now['pipeline.backlog']} "
             f"last-id {now['pipeline.last_sent_id']} | "
+            f"tries {count('pipeline.capture_attempts')} admitted {count('pipeline.admitted')} "
+            f"no-room {count('pipeline.capture_skips')} refused {count('pipeline.discarded')} "
+            f"in-flight {now['pipeline.in_flight_frames']} "
+            f"{now['pipeline.in_flight_bytes'] / 1024**2:.0f}MB | "
+            f"results read {count('pipeline.rendered_scanned')} "
+            f"cached {count('pipeline.rendered_cached')} "
+            f"held {count('pipeline.rendered_held')} "
+            f"blackout {count('pipeline.rendered_blackout')} | "
+            f"camera-sends {count('pipeline.sends')} black {count('pipeline.black_sends')} "
+            f"new-pictures {count('pipeline.distinct_presented')} "
+            f"protected-age-ms {age:.0f} frozen-max-ms {stats.max_frozen_seconds * 1000:.0f} | "
             f"present-ms p50 {_percentile(present, 0.5):.1f} p95 {_percentile(present, 0.95):.1f} "
             f"max {_percentile(present, 1):.1f} | "
             f"queue-ms p50 {_percentile(ages, 0.5):.1f} p95 {_percentile(ages, 0.95):.1f} "
@@ -128,8 +154,9 @@ class StatsLog:
             f"capture-ms read {ms('pipeline.grab_seconds', captured):.1f} "
             f"grab {ms('capture.grab_seconds', captured):.1f} "
             f"convert {ms('capture.convert_seconds', captured):.1f} | "
-            f"detect-ms total {detect_ms:.1f} diff {diff_ms:.1f} ocr {ocr_ms:.1f} "
-            f"rules {rules_ms:.1f} other {detect_ms - diff_ms - ocr_ms - rules_ms:.1f} | "
+            f"detect-ms total {detect_ms:.1f} copy {copy_ms:.1f} diff {diff_ms:.1f} "
+            f"ocr {ocr_ms:.1f} rules {rules_ms:.1f} track {track_ms:.1f} "
+            f"other {detect_ms - known_ms:.1f} | "
             f"read-ahead jobs {count('read.jobs')} hits {count('read.hits')} "
             f"misses {count('read.misses')} failed {count('read.failed_reads')} "
             f"shed {count('read.shed')} cancelled {count('read.cancelled')} "
@@ -179,10 +206,6 @@ def screen_source(capture: str, max_width: int, retina: bool, fps: int):
     from eclipse.capture.sck import ScreenCaptureKitCapture
 
     return PreferredCapture(ScreenCaptureKitCapture(max_width, retina, fps), polling)
-
-
-def p95(values: list[float]) -> float:
-    return sorted(values)[int(len(values) * 0.95)]
 
 
 def _stop_on_sigterm() -> Callable[[], None]:
@@ -328,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{compositor.held_frames} held"
         )
         print(
-            f"Capture to output p95 {p95(stats.latencies):.0f} ms, longest backlog "
+            f"Capture to output p95 {stats.latency.percentile(0.95):.0f} ms, longest backlog "
             f"{stats.max_backlog} frames, average scan "
             f"{stats.scan_seconds / max(stats.scanned, 1) * 1000:.0f} ms"
         )

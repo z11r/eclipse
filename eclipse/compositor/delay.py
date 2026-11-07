@@ -32,6 +32,7 @@ import numpy as np
 
 from eclipse.compositor.compositor import Compositor, Detector
 from eclipse.compositor.gate import OutputGate
+from eclipse.telemetry import Distribution
 from eclipse.types import Detection, Frame, Rendered
 
 
@@ -103,7 +104,8 @@ class PipelineStats:
     peak_in_flight_bytes: int = 0
     grab_seconds: float = 0.0
     scan_seconds: float = 0.0
-    latencies: list[float] = field(default_factory=list)  # capture to output, in ms
+    latencies: deque = field(default_factory=_samples)  # recent capture to output, in ms
+    latency: Distribution = field(default_factory=Distribution)  # all of them, in fixed memory
     capture_seconds: float = 0.0
     fresh: int = 0  # captured frames whose pixels differ from the frame before
     fresh_shown: int = 0  # sent frames that showed the viewer something new
@@ -121,10 +123,16 @@ class PipelineStats:
     rendered_cached: int = 0  # results that reused earlier reads
     rendered_held: int = 0  # results that fell back on an older safe image
     rendered_blackout: int = 0  # results with nothing safe to show
+    sends: int = 0  # every picture handed to the output, repeats and black included
+    black_sends: int = 0  # the ones that were black
+    distinct_presented: int = 0  # how many different source frames viewers have seen
     invalidated: int = 0  # results or frames thrown out by a panic or stricter settings
+    frozen_seconds: float = 0.0  # how long the picture has shown the same source frame
+    max_frozen_seconds: float = 0.0
     event_errors: int = 0  # catches that couldn't be reported to the panel
     final_black_sent: bool = False
     stalled_workers: tuple[str, ...] = ()
+    last_presented_at: float | None = None  # when a new source frame last went out
 
 
 class PolicyChange:
@@ -219,7 +227,6 @@ class DelayedPipeline:
         self._black: np.ndarray | None = None
         self._sent_any = False
         self._presented_id: int | None = None
-        self._last_presented: float | None = None
 
     @property
     def on_found(self):
@@ -489,12 +496,14 @@ class DelayedPipeline:
         else:
             blacked = may_send is not None and not may_send()
             self._sink.send(self._black_for(image.shape) if blacked else image)
+        self.stats.sends += 1
         self._sent_any = True
         return blacked
 
     def _send_black(self, shape: tuple[int, ...] | None = None) -> None:
         ticket = self.gate.black_ticket()
         self._submit(self._black_for(shape or self._frame_shape or _NO_FRAME_YET))
+        self.stats.black_sends += 1
         self.last_output = "black"
         self.gate.confirm_black(ticket)
 
@@ -511,6 +520,7 @@ class DelayedPipeline:
             return self.gate.allows(rendered)
 
         if self._submit(rendered.image, may_send):
+            self.stats.black_sends += 1
             self.last_output = "black"
             self.gate.confirm_black(ticket)
             return
@@ -534,14 +544,21 @@ class DelayedPipeline:
 
     def _note_presented(self, rendered: Rendered) -> None:
         """Track what viewers really see. A held image is still the old frame."""
-        if rendered.state == "blackout" or rendered.source_frame_id == self._presented_id:
-            return
-        self._presented_id = rendered.source_frame_id
+        stats = self.stats
         now = time.monotonic()
-        if self._last_presented is not None:
-            self.stats.present_intervals.append((now - self._last_presented) * 1000)
-        self._last_presented = now
-        self.stats.latencies.append((now - rendered.ts) * 1000)
+        if rendered.state != "blackout" and rendered.source_frame_id != self._presented_id:
+            self._presented_id = rendered.source_frame_id
+            stats.distinct_presented += 1
+            if stats.last_presented_at is not None:
+                stats.present_intervals.append((now - stats.last_presented_at) * 1000)
+            stats.last_presented_at = now
+            stats.frozen_seconds = 0.0
+            latency = (now - rendered.ts) * 1000
+            stats.latencies.append(latency)
+            stats.latency.add(latency)
+        elif stats.last_presented_at is not None:
+            stats.frozen_seconds = now - stats.last_presented_at
+            stats.max_frozen_seconds = max(stats.max_frozen_seconds, stats.frozen_seconds)
 
     def _tick(self, current: _SafeFrame | None) -> _SafeFrame | None:
         """Send one picture, and return the frame to compare the next one with."""

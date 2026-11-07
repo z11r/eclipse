@@ -338,7 +338,7 @@ class Detector:
             'frames': 0, 'full_scans': 0, 'partial_scans': 0, 'scan_seconds': 0.0,
             'scanned_share': 0.0, 'diff_seconds': 0.0, 'find_seconds': 0.0,
             'det_seconds': 0.0, 'rec_seconds': 0.0, 'reads': 0, 'lines': 0, 'scrolls': 0,
-            'checks': 0,
+            'checks': 0, 'copy_seconds': 0.0, 'track_seconds': 0.0, 'cached_frames': 0,
         }
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
@@ -802,13 +802,16 @@ class Detector:
                     self._shape = frame.shape
 
                 # Save our own copy of this image.
+                copy_started = time.monotonic()
                 snapshot = np.array(frame, copy=True, order='C')
                 diff_started = time.monotonic()
+                self.stats['copy_seconds'] += diff_started - copy_started
                 self._scrolled = False
                 areas = self._changed_areas(snapshot)
                 self.stats['frames'] += 1
                 self.stats['diff_seconds'] += time.monotonic() - diff_started
                 self.reused_read = not areas
+                self.stats['cached_frames'] += self.reused_read
 
                 if not areas and not self._scrolled:
                     return list(self._boxes)
@@ -850,7 +853,8 @@ class Detector:
 
                 find_started = time.monotonic()
                 found = self._find_areas(regions)
-                self.stats['find_seconds'] += time.monotonic() - find_started
+                track_started = time.monotonic()
+                self.stats['find_seconds'] += track_started - find_started
 
                 self._tracks.update(snapshot, [
                     Sighting(
@@ -875,6 +879,7 @@ class Detector:
                 for top, bottom, left, right in self._unread.values():
                     boxes.add((left, top, min(right, width) - left, bottom - top, 'unread'))
 
+                self.stats['track_seconds'] += time.monotonic() - track_started
                 # Save results only after the whole scan succeeds.
                 self._boxes = tuple(sorted(boxes))
                 self._regions = regions
