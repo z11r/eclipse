@@ -41,6 +41,14 @@ python -m eclipse.main
 
 Don't run `python eclipse/main.py`. That puts the package folder on Python's import path, where our `platform.py` hides the standard library module of the same name.
 
+To debug with the same input every time, play a recorded clip through the live pipeline instead of the screen. It plays at the clip's own speed and stops when the clip ends:
+
+```bash
+python -m eclipse.main --clip eval/clips/planted_secrets.mp4
+```
+
+Add `--loop` to replay it, and `--clip-source webcam` or `--clip-source irl` to tag its frames as that source.
+
 Run the tests with:
 
 ```bash

@@ -12,10 +12,12 @@ import signal
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Callable
 
 import cv2
 
+from eclipse.capture.clip import LiveClip
 from eclipse.capture.pattern import TestPattern
 from eclipse.capture.preferred import PreferredCapture
 from eclipse.capture.screen import ScreenCapture
@@ -267,6 +269,18 @@ def main(argv: list[str] | None = None) -> int:
         metavar="INDEX",
         help="capture this camera instead of the screen (0 is usually the built-in one)",
     )
+    parser.add_argument(
+        "--clip",
+        metavar="PATH",
+        help="play a recorded video through the live pipeline instead of the screen",
+    )
+    parser.add_argument(
+        "--clip-source",
+        choices=["screen", "webcam", "irl"],
+        default="screen",
+        help="what the clip stands in for, as tagged on its frames",
+    )
+    parser.add_argument("--loop", action="store_true", help="replay the clip when it ends")
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--delay", type=float, default=1.0, help="seconds behind live")
     parser.add_argument("--max-width", type=int, default=1920)
@@ -301,6 +315,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-hotkey", action="store_true", help="no panic key, as with --max-frames"
     )
     args = parser.parse_args(argv)
+    chosen = [args.test_pattern, args.webcam is not None, args.clip is not None]
+    if sum(chosen) > 1:
+        parser.error("pick one of --test-pattern, --webcam and --clip")
+    if args.loop and args.clip is None:
+        parser.error("--loop only works with --clip")
     cv2.setNumThreads(2)  # leave the cores to OBS
 
     padding = PADDING
@@ -311,6 +330,14 @@ def main(argv: list[str] | None = None) -> int:
     elif args.webcam is not None:
         source = WebcamCapture(args.webcam)
         detect = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR)
+    elif args.clip is not None:
+        if not Path(args.clip).is_file():
+            print(f"No clip at {args.clip}")
+            return 1
+        source = LiveClip(args.clip, args.clip_source, args.loop)
+        # A webcam recording carries sensor noise, so it needs the webcam's noise floor.
+        noise = WEBCAM_NOISE_FLOOR if args.clip_source == "webcam" else 0
+        detect = TextDetector(noise_floor=noise)
     else:
         if not screen_capture_allowed():
             print(
