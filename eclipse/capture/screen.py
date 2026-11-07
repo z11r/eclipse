@@ -30,13 +30,16 @@ def to_bgr(raw: np.ndarray, max_width: int) -> np.ndarray:
 
 
 class ScreenCapture:
-    def __init__(self, monitor: int = 1, max_width: int = 1920, retina: bool = False) -> None:
+    def __init__(
+        self, monitor: int = 1, max_width: int = 1920, retina: bool = False, first_id: int = 0
+    ) -> None:
         self._monitor = monitor
         self._max_width = max_width
         self._retina = retina
-        self.stats = {"grab_seconds": 0.0, "resize_seconds": 0.0}
-        self._next_id = 0
+        self.stats = {"grab_seconds": 0.0, "convert_seconds": 0.0}
+        self._next_id = first_id
         self._mss = None
+        self._announced = False
 
     def __enter__(self) -> "ScreenCapture":
         if self._retina:
@@ -53,8 +56,9 @@ class ScreenCapture:
         grabbed = time.monotonic()
         frame = Frame(to_bgr(raw, self._max_width), ts, "screen", self._next_id)
         self.stats["grab_seconds"] += grabbed - ts
-        self.stats["resize_seconds"] += time.monotonic() - grabbed
-        if self._next_id == 0:
+        self.stats["convert_seconds"] += time.monotonic() - grabbed
+        if not self._announced:
+            self._announced = True
             height, width = frame.image.shape[:2]
             print(f"Capturing {raw.shape[1]}x{raw.shape[0]}, scanning {width}x{height}")
         self._next_id += 1

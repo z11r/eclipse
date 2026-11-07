@@ -3,6 +3,7 @@
 Images must be uint8 BGR arrays. Boxes are (x, y, width, height, category).
 If detection fails, the pipeline must black out the frame."""
 
+import functools
 import math
 import re
 import threading
@@ -138,7 +139,7 @@ def _standard_characters(text: str) -> tuple[str, list[int] | None]:
     return ''.join(converted), origins
 
 
-def find_matches(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
+def _match_text(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
     """Return (category, start, end) for each sensitive part of the text."""
     text, origins = _standard_characters(text)
     matches = []
@@ -172,6 +173,56 @@ def find_matches(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int
             add('keyword', _keyword_pattern(word))
 
     return matches
+
+
+@functools.lru_cache(maxsize=16384)
+def _remembered_matches(text: str, keywords: tuple[str, ...]) -> tuple:
+    return tuple(_match_text(text, keywords))
+
+
+def find_matches(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
+    """Return (category, start, end) for each sensitive part of the text.
+
+    Answers are remembered. A frame re-checks every word on screen, nearly all of them
+    unchanged, and checking them afresh took 2 ms a frame. The answer depends only on
+    the text and the keywords, so a remembered one is always the same answer.
+    """
+    return list(_remembered_matches(text, tuple(keywords)))
+
+
+def _row_means(gray) -> np.ndarray:
+    """Each row's mean, exactly as gray.mean(axis=1) gives it, in a tenth of the time."""
+    # The sums are whole numbers well under 2**53, so float64 holds them exactly, and
+    # dividing exact sums gives the same values numpy's mean does.
+    return cv2.reduce(gray, 1, cv2.REDUCE_SUM, dtype=cv2.CV_64F)[:, 0] / gray.shape[1]
+
+
+def _shift_differences(now_rows, before_rows, limit: int, block: int = 128) -> np.ndarray:
+    """Mean absolute difference of two row profiles at every shift from -limit to limit.
+
+    Entry i is shift i - limit, where now[j] lines up with before[j - shift]. One pass
+    over all shifts in place of a Python call per shift: 1.2 ms rather than 1.9 ms.
+    """
+    height = len(now_rows)
+    padded = np.zeros(height + 2 * limit)
+    padded[limit : limit + height] = before_rows
+    # Row r of these windows lines before up with now at shift limit - r.
+    windows = np.lib.stride_tricks.sliding_window_view(padded, height)[::-1]
+    totals = np.empty(2 * limit + 1)
+    for first in range(0, 2 * limit + 1, block):
+        totals[first : first + block] = np.abs(windows[first : first + block] - now_rows).sum(
+            axis=1
+        )
+    # Padding compared now against 0, adding |now| for rows with nothing to compare.
+    # Take those back out.
+    ahead = np.concatenate(([0.0], np.cumsum(np.abs(now_rows))))
+    shifts = np.arange(-limit, limit + 1)
+    outside = np.where(
+        shifts > 0,
+        ahead[np.clip(shifts, 0, height)],
+        ahead[height] - ahead[np.clip(height + shifts, 0, height)],
+    )
+    return (totals - outside) / np.maximum(height - np.abs(shifts), 1)
 
 
 def classify_text(text: str, keywords: Iterable[str] = ()) -> set[str]:
@@ -343,16 +394,13 @@ class Detector:
 
         now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
         before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
-        now_rows = now.mean(axis=1)
-        before_rows = before.mean(axis=1)
+        now_rows = _row_means(now)
+        before_rows = _row_means(before)
         limit = min(self._scroll_max_shift, height // 2)
+        differences = _shift_differences(now_rows, before_rows, limit)
 
         def difference(shift: int) -> float:
-            start = max(shift, 0), max(-shift, 0)
-            length = height - abs(shift)
-            return float(np.abs(
-                now_rows[start[0]:start[0] + length] - before_rows[start[1]:start[1] + length]
-            ).mean())
+            return float(differences[shift + limit])
 
         shift = min((s for s in range(-limit, limit + 1) if s), key=difference)
 
@@ -362,9 +410,9 @@ class Detector:
         length = height - abs(shift)
         now_start, before_start = max(shift, 0), max(-shift, 0)
         # Half-pixel moves redraw text edges, so compare softened images.
-        mismatch = np.abs(
-            cv2.blur(now[now_start:now_start + length], (3, 3)).astype(np.int16)
-            - cv2.blur(before[before_start:before_start + length], (3, 3)).astype(np.int16)
+        mismatch = cv2.absdiff(  # |a - b| of uint8 fits uint8, so this is exact
+            cv2.blur(now[now_start:now_start + length], (3, 3)),
+            cv2.blur(before[before_start:before_start + length], (3, 3)),
         ) > _SCROLL_TOLERANCE
 
         if mismatch.mean() > _SCROLL_MAX_MISMATCH:
@@ -531,7 +579,8 @@ class Detector:
 
     def _read(self, image, top: int, left: int) -> list[tuple]:
         """Read one area and return text regions in full-frame coordinates."""
-        results, timings = self._reader(image)
+        read_area = getattr(self._reader, 'read_area', None)
+        results, timings = read_area(image, top, left) if read_area else self._reader(image)
         self.stats['reads'] += 1
         self.stats['lines'] += len(results or [])
         if isinstance(timings, (list, tuple)) and len(timings) == 3:

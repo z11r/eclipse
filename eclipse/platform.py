@@ -10,6 +10,17 @@ import sys
 IS_MAC = sys.platform == "darwin"
 
 
+def screen_capture_kit_available() -> bool:
+    """Whether the streaming capture backend can be used on this machine."""
+    if not IS_MAC:
+        return False
+    try:
+        import ScreenCaptureKit  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def use_full_screen_resolution() -> None:
     """Capture every pixel. By default mss halves a Retina screen, which blurs text."""
     if IS_MAC:
@@ -40,6 +51,9 @@ class AppleVisionReader:
     worked out from a line's character count. It needs Retina-scale frames: on
     low-resolution frames it misses most small text. Any Vision failure raises, so
     it counts as a failed scan.
+
+    Vision allows one read at a time per process, however many threads ask. Reading
+    faster takes more processes: see eclipse/text_detect/read_ahead.py.
     """
 
     FAST = 1  # VNRequestTextRecognitionLevelFast
@@ -50,38 +64,48 @@ class AppleVisionReader:
 
     def __call__(self, image) -> tuple[list, None]:
         import cv2
+
+        return self.read_bgra(cv2.cvtColor(image, cv2.COLOR_BGR2BGRA))
+
+    def read_bgra(self, pixels) -> tuple[list, None]:
+        """Read a BGRA image. A pixel buffer reads a full frame in 58 ms, a CGImage in 88."""
+        import numpy as np
         import objc
         import Quartz
         import Vision
-        from Foundation import NSData
+        from Foundation import NSArray, NSString
 
-        height, width = image.shape[:2]
+        height, width = pixels.shape[:2]
         with objc.autorelease_pool():
-            # Hand Vision the pixels directly. Encoding a Retina frame costs 17 ms.
-            pixels = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
-            data = NSData.dataWithBytes_length_(pixels.tobytes(), pixels.size)
-            picture = Quartz.CGImageCreate(
-                width,
-                height,
-                8,
-                32,
-                width * 4,
-                Quartz.CGColorSpaceCreateDeviceRGB(),
-                Quartz.kCGBitmapByteOrder32Little | Quartz.kCGImageAlphaNoneSkipFirst,
-                Quartz.CGDataProviderCreateWithCFData(data),
-                None,
-                False,
-                Quartz.kCGRenderingIntentDefault,
+            status, buffer = Quartz.CVPixelBufferCreate(
+                None, width, height, Quartz.kCVPixelFormatType_32BGRA, None, None
             )
-            if picture is None:
+            if status != 0:
                 raise RuntimeError("Apple OCR couldn't read the frame")
+            Quartz.CVPixelBufferLockBaseAddress(buffer, 0)
+            try:
+                stride = Quartz.CVPixelBufferGetBytesPerRow(buffer)
+                memory = Quartz.CVPixelBufferGetBaseAddress(buffer).as_buffer(stride * height)
+                target = np.ndarray((height, width, 4), np.uint8, memory, strides=(stride, 4, 1))
+                target[:] = pixels
+            finally:
+                Quartz.CVPixelBufferUnlockBaseAddress(buffer, 0)
             request = Vision.VNRecognizeTextRequest.alloc().init()
             request.setRecognitionLevel_(self.FAST)
             request.setUsesLanguageCorrection_(False)  # it would "fix" random keys
             request.setMinimumTextHeight_(0.0)  # the default skips small text
-            request.setRecognitionLanguages_(["en-US"])
-            handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(picture, None)
-            succeeded, error = handler.performRequests_error_([request], None)
+            # Nothing Python-backed may reach Vision, not even a str inside an NSArray. It
+            # releases these on its own queues, and doing that while the interpreter shuts
+            # down crashes the process, including at the end of a normal run.
+            request.setRecognitionLanguages_(
+                NSArray.arrayWithObject_(NSString.stringWithString_("en-US"))
+            )
+            handler = Vision.VNImageRequestHandler.alloc().initWithCVPixelBuffer_options_(
+                buffer, None
+            )
+            succeeded, error = handler.performRequests_error_(
+                NSArray.arrayWithObject_(request), None
+            )
             if not succeeded or error is not None:
                 raise RuntimeError("Apple OCR failed")
 

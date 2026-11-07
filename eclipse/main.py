@@ -10,16 +10,23 @@ import argparse
 import resource
 import threading
 import time
+from collections import deque
 
 import cv2
 
 from eclipse.capture.pattern import TestPattern
+from eclipse.capture.preferred import PreferredCapture
 from eclipse.capture.screen import ScreenCapture
 from eclipse.compositor.compositor import PADDING, Compositor
 from eclipse.compositor.delay import DelayedPipeline
-from eclipse.output.virtual_cam import VirtualCam
-from eclipse.platform import AppleVisionReader, screen_capture_allowed
+from eclipse.output.virtual_cam import DiscardingCam, VirtualCam
+from eclipse.platform import (
+    AppleVisionReader,
+    screen_capture_allowed,
+    screen_capture_kit_available,
+)
 from eclipse.text_detect import TextDetector
+from eclipse.text_detect.read_ahead import OcrPool, ReadAhead, ReadError
 
 
 RETINA_MAX_WIDTH = 6016  # wide enough never to shrink a built-in or Studio Display
@@ -29,11 +36,11 @@ class StatsLog:
     """Writes pipeline numbers to a file every few seconds. Never any screen text."""
 
     def __init__(
-        self, path: str, pipeline: DelayedPipeline, parts: tuple, every: float = 2.0
+        self, path: str, pipeline: DelayedPipeline, parts: dict, every: float = 2.0
     ) -> None:
         self._path = path
         self._pipeline = pipeline
-        self._parts = parts  # source, detector and sink, each with its own stats
+        self._parts = parts  # name -> source, detector or sink, each with its own stats
         self._every = every
         self._done = threading.Event()
         self._thread = threading.Thread(target=self._run, name="eclipse-stats", daemon=True)
@@ -47,15 +54,17 @@ class StatsLog:
         self._thread.join(timeout=5)
 
     def _snapshot(self) -> dict:
+        # Each name carries its stage, so two stages can't overwrite each other's.
         numbers = {
-            name: value
+            f"pipeline.{name}": value
             for name, value in vars(self._pipeline.stats).items()
             if isinstance(value, (int, float))
         }
-        for part in self._parts:
-            numbers.update(getattr(part, "stats", {}))
+        for stage, part in self._parts.items():
+            for name, value in dict(getattr(part, "stats", {})).items():
+                numbers[f"{stage}.{name}"] = value
         usage = resource.getrusage(resource.RUSAGE_SELF)
-        numbers["cpu_seconds"] = usage.ru_utime + usage.ru_stime
+        numbers["process.cpu_seconds"] = usage.ru_utime + usage.ru_stime
         return numbers
 
     def _run(self) -> None:
@@ -70,31 +79,100 @@ class StatsLog:
 
     def _line(self, before: dict, now: dict) -> str:
         change = {name: now[name] - before.get(name, 0) for name in now}
+        stats = self._pipeline.stats
+        present = _drain(stats.present_intervals)
+        ages = _drain(stats.scan_ages)
+        slack = _drain(stats.slack)
 
-        def ms(name: str, count: float) -> float:
-            return change.get(name, 0) / max(count, 1) * 1000
+        def count(name: str) -> int:
+            return round(change.get(name, 0))
 
-        scans = change.get("full_scans", 0) + change.get("partial_scans", 0)
-        reads = change.get("reads", 0)
+        def fps(name: str) -> float:
+            return change.get(name, 0) / self._every
+
+        def ms(name: str, frames: float) -> float:
+            return change.get(name, 0) / max(frames, 1) * 1000
+
+        def busy(*names: str) -> float:
+            return sum(change.get(name, 0) for name in names) / self._every
+
+        captured = count("pipeline.captured")
+        scanned = count("pipeline.scanned")
+        sends = count("output.sends")
+        fits = count("output.fits")
+        reads = count("detect.reads")
+        scans = count("detect.full_scans") + count("detect.partial_scans")
+        detect_ms = ms("pipeline.detect_seconds", scanned)
+        diff_ms = ms("detect.diff_seconds", scanned)
+        ocr_ms = ms("detect.scan_seconds", scanned)
+        rules_ms = ms("detect.find_seconds", scanned)
         return (
             f"{time.strftime('%H:%M:%S')} "
-            f"capture {change['captured'] / self._every:.1f}fps "
-            f"sent {change['shown'] / self._every:.1f}fps "
-            f"dropped {change['dropped']} skipped {change['skipped']} "
-            f"repeats {change['repeated']} backlog {now['backlog']} | "
-            f"grab {ms('grab_seconds', change['captured']):.0f} "
-            f"resize {ms('resize_seconds', change['captured']):.0f} "
-            f"diff {ms('diff_seconds', change.get('frames', 0)):.1f} | "
-            f"scans full {change.get('full_scans', 0)} partial {change.get('partial_scans', 0)} "
-            f"scrolls {change.get('scrolls', 0)} "
-            f"avg {ms('scan_seconds', scans):.0f} area {change.get('scanned_share', 0) / max(scans, 1):.0%} "
-            f"lines/scan {change.get('lines', 0) / max(reads, 1):.0f} "
-            f"det {ms('det_seconds', reads):.0f} rec {ms('rec_seconds', reads):.0f} "
-            f"rules {ms('find_seconds', scans):.1f} busy {change.get('scan_seconds', 0) / self._every:.0%} | "
-            f"fit {ms('fit_seconds', change.get('fits', 0)):.1f} "
-            f"send {ms('send_seconds', change.get('sends', 0)):.1f} "
-            f"cores {change['cpu_seconds'] / self._every:.1f}"
+            f"capture {fps('pipeline.captured'):.1f}fps fresh {fps('pipeline.fresh'):.1f}fps "
+            f"sent {fps('pipeline.shown'):.1f}fps fresh-sent {fps('pipeline.fresh_shown'):.1f}fps | "
+            f"repeats {count('pipeline.repeated')} dropped {count('pipeline.dropped')} "
+            f"(shed on arrival {count('pipeline.shed')}) "
+            f"skipped {count('pipeline.skipped')} id-gaps {count('pipeline.id_gaps')} "
+            f"held {count('pipeline.held')} backlog {now['pipeline.backlog']} "
+            f"last-id {now['pipeline.last_sent_id']} | "
+            f"present-ms p50 {_percentile(present, 0.5):.1f} p95 {_percentile(present, 0.95):.1f} "
+            f"max {_percentile(present, 1):.1f} | "
+            f"queue-ms p50 {_percentile(ages, 0.5):.1f} p95 {_percentile(ages, 0.95):.1f} "
+            f"slack-min {min(slack, default=0):.0f} | "
+            f"capture-ms read {ms('pipeline.grab_seconds', captured):.1f} "
+            f"grab {ms('capture.grab_seconds', captured):.1f} "
+            f"convert {ms('capture.convert_seconds', captured):.1f} | "
+            f"detect-ms total {detect_ms:.1f} diff {diff_ms:.1f} ocr {ocr_ms:.1f} "
+            f"rules {rules_ms:.1f} other {detect_ms - diff_ms - ocr_ms - rules_ms:.1f} | "
+            f"read-ahead jobs {count('read.jobs')} hits {count('read.hits')} "
+            f"misses {count('read.misses')} failed {count('read.failed_reads')} "
+            f"shed {count('read.shed')} cancelled {count('read.cancelled')} "
+            f"prepare-ms {ms('read.prepare_seconds', captured):.1f} "
+            f"work-ms {ms('read.work_seconds', count('read.jobs')):.1f} "
+            f"wait-ms {ms('read.wait_seconds', count('read.jobs')):.1f} | "
+            f"composite-ms {ms('pipeline.composite_seconds', scanned):.1f} | "
+            f"output-ms fit {ms('output.fit_seconds', fits):.1f} "
+            f"send {ms('output.send_seconds', sends):.1f} late {count('output.late_ticks')} | "
+            f"scans full {count('detect.full_scans')} partial {count('detect.partial_scans')} "
+            f"scrolls {count('detect.scrolls')} "
+            f"area {change.get('detect.scanned_share', 0) / max(scans, 1):.0%} "
+            f"ms/read {ms('detect.scan_seconds', reads):.0f} "
+            f"lines/read {count('detect.lines') / max(reads, 1):.0f} "
+            f"det {ms('detect.det_seconds', reads):.0f} rec {ms('detect.rec_seconds', reads):.0f} | "
+            f"busy capture {busy('capture.grab_seconds', 'capture.convert_seconds'):.0%} "
+            f"scan {busy('pipeline.scan_seconds'):.0%} "
+            f"output {busy('output.fit_seconds', 'output.send_seconds'):.0%} "
+            f"workers {busy('read.work_seconds'):.1f} "
+            f"cores {busy('process.cpu_seconds'):.1f}"
         )
+
+
+def _drain(samples: deque) -> list[float]:
+    """Take everything recorded since the last log line."""
+    taken = []
+    while samples:
+        taken.append(samples.popleft())
+    return taken
+
+
+def _percentile(values: list[float], share: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(int(len(ordered) * share), len(ordered) - 1)]
+
+
+def screen_source(capture: str, max_width: int, retina: bool, fps: int):
+    """The screen backend to use, with polling kept as the fallback."""
+
+    def polling(first_id: int = 0) -> ScreenCapture:
+        return ScreenCapture(max_width=max_width, retina=retina, first_id=first_id)
+
+    if capture == "mss" or not screen_capture_kit_available():
+        return polling()
+    from eclipse.capture.sck import ScreenCaptureKitCapture
+
+    return PreferredCapture(ScreenCaptureKitCapture(max_width, retina, fps), polling)
 
 
 def p95(values: list[float]) -> float:
@@ -108,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="send a moving pattern with a fake secret hidden by the compositor",
     )
-    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--delay", type=float, default=1.0, help="seconds behind live")
     parser.add_argument("--max-width", type=int, default=1920)
     parser.add_argument("--retina", action="store_true", help="capture every Retina pixel")
@@ -118,12 +196,28 @@ def main(argv: list[str] | None = None) -> int:
         default="rapid",
         help="apple is much faster on macOS, finds fewer secrets, and scans Retina frames",
     )
+    parser.add_argument(
+        "--capture",
+        choices=["auto", "mss"],
+        default="auto",
+        help="auto uses ScreenCaptureKit where it works; mss always polls",
+    )
+    parser.add_argument(
+        "--ocr-workers",
+        type=int,
+        default=4,
+        help="processes reading Apple OCR ahead of the scan; 0 reads one area at a time",
+    )
     parser.add_argument("--log", default="eclipse-run.log", help="file for live stats")
+    parser.add_argument(
+        "--no-output", action="store_true", help="measure every stage but send frames nowhere"
+    )
     parser.add_argument("--max-frames", type=int, default=None)
     args = parser.parse_args(argv)
     cv2.setNumThreads(2)  # leave the cores to OBS
 
     padding = PADDING
+    read_ahead = None
     if args.test_pattern:
         source = TestPattern()
         detect = source.detect
@@ -137,25 +231,39 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if args.ocr == "apple":
             # Apple's OCR needs every pixel, and all distances double with them.
-            source = ScreenCapture(max_width=RETINA_MAX_WIDTH, retina=True)
-            detect = TextDetector(reader=AppleVisionReader(), pixel_scale=2)
+            source = screen_source(args.capture, RETINA_MAX_WIDTH, True, args.fps)
+            reader = AppleVisionReader()
+            if args.ocr_workers > 0:
+                try:
+                    reader = read_ahead = ReadAhead(OcrPool(args.ocr_workers))
+                except ReadError:
+                    print("OCR workers didn't start, so reading one area at a time")
+            detect = TextDetector(reader=reader, pixel_scale=2)
             padding = PADDING * 2
         else:
-            source = ScreenCapture(max_width=args.max_width, retina=args.retina)
+            source = screen_source(args.capture, args.max_width, args.retina, args.fps)
             detect = TextDetector()
 
     compositor = Compositor(padding=padding)
-    sink = VirtualCam(fps=args.fps)
+    sink = (DiscardingCam if args.no_output else VirtualCam)(fps=args.fps)
     pipeline = DelayedPipeline(
         source, sink, detect, compositor, args.delay, args.fps, args.max_frames
     )
-    with StatsLog(args.log, pipeline, (source, detect, sink)):
-        stats = pipeline.run()
+    parts = {"capture": source, "detect": detect, "output": sink, "read": read_ahead}
+    try:
+        with StatsLog(args.log, pipeline, parts):
+            stats = pipeline.run()
+    finally:
+        if read_ahead is not None:
+            read_ahead.close()
     if stats.latencies:
         print(
-            f"Captured {stats.captured / stats.capture_seconds:.1f} fps, "
-            f"sent {stats.shown / stats.capture_seconds:.1f} new frames per second, "
-            f"{stats.dropped} dropped, {stats.skipped} skipped, {compositor.held_frames} held"
+            f"Captured {stats.captured / stats.capture_seconds:.1f} fps "
+            f"({stats.fresh / stats.capture_seconds:.1f} fresh), "
+            f"sent {stats.shown / stats.capture_seconds:.1f} new frames per second "
+            f"({stats.fresh_shown / stats.capture_seconds:.1f} fresh), "
+            f"{stats.repeated} repeats, {stats.dropped} dropped, {stats.skipped} skipped, "
+            f"{compositor.held_frames} held"
         )
         print(
             f"Capture to output p95 {p95(stats.latencies):.0f} ms, longest backlog "

@@ -18,15 +18,22 @@ class TextDetector:
     def __init__(self, keywords: Iterable[str] = (), reader=None, pixel_scale: int = 1) -> None:
         self._detector = Detector(keywords=keywords, reader=reader, pixel_scale=pixel_scale)
         self._source = None
+        self._read_ahead = reader if hasattr(reader, "prepare") else None
 
     @property
     def stats(self) -> dict:
         return self._detector.stats
 
+    def prepare(self, frame: Frame) -> bool:
+        """Start work on a frame before its turn. False means it can't be read in time."""
+        return self._read_ahead is None or self._read_ahead.prepare(frame)
+
     def __call__(self, frame: Frame) -> list[Detection]:
         if frame.source != self._source:
             self._detector.reset()  # another source's positions mean nothing here
             self._source = frame.source
+        if self._read_ahead is not None:
+            self._read_ahead.begin_frame(frame.frame_id)
         return [
             Detection(
                 x,
