@@ -19,6 +19,22 @@ def use_full_screen_resolution() -> None:
         mss.darwin.IMAGE_OPTIONS = bounds_ignore_framing | should_be_opaque
 
 
+def camera_backend() -> int:
+    """The OpenCV camera driver to use.
+
+    On Windows this is Media Foundation. It takes a few seconds to open, but
+    DirectShow gets only black frames at 1 fps from cameras behind a vendor camera
+    service, such as Acer's.
+    """
+    import cv2
+
+    if IS_MAC:
+        return cv2.CAP_AVFOUNDATION
+    if sys.platform == "win32":
+        return cv2.CAP_MSMF
+    return cv2.CAP_ANY
+
+
 def screen_capture_allowed() -> bool:
     """Whether this process may record the screen.
 
