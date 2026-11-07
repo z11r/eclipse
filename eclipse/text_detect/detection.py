@@ -358,9 +358,16 @@ class Detector:
         self._shape = None
         self._lock = threading.RLock()
         self.reused_read = False  # whether the last frame needed no OCR
+        self._keywords = ()
+        self._enabled = frozenset()
         self.configure(keywords, enabled)
 
     def configure(self, keywords=(), enabled=None):
+        """Change what counts as sensitive, all at once. A bad setting changes nothing.
+
+        Covers in categories that stay on are kept. Dropping them would leave a known
+        secret relying on one new read to be found again.
+        """
         words = tuple(keywords)
         categories = CATEGORIES if enabled is None else frozenset(enabled)
 
@@ -370,10 +377,17 @@ class Detector:
         if not categories <= CATEGORIES:
             raise ValueError('unknown detection category')
 
+        for word in words:
+            _keyword_pattern(word)
+
         with self._lock:
+            still_on = categories & self._enabled
+            if not set(self._keywords) <= set(words):
+                still_on -= {'keyword'}  # a cover can't say which keyword it was for
             self._keywords = words
             self._enabled = categories
-            self.reset()
+            self._forget_scan()
+            self._tracks.keep_only(still_on)
 
     def reset(self):
         """Forget everything, covers included, because old positions no longer apply.

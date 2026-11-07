@@ -8,7 +8,8 @@ trail, and a read that misses it doesn't end it. Only these things do:
 - its pixels changed, and reads of the new pixels found nothing there
 - it left the frame or the scrolling area
 - the same text turned up somewhere else, and its old place no longer shows it
-- the detector was reset, when the frame size, source or settings change
+- the detector was reset, when the frame size or source changes
+- its category was turned off
 
 Time alone never ends a track. Tracks keep a hash of the text, never the text.
 """
@@ -114,6 +115,11 @@ class CoverTracks:
     def clear(self) -> None:
         self._tracks: list[_Track] = []
         self._now = 0
+
+    def keep_only(self, categories: Iterable[str]) -> None:
+        """Drop every cover outside these categories, for when settings change."""
+        wanted = set(categories)
+        self._tracks = [track for track in self._tracks if track.category in wanted]
 
     def places(self) -> list[Rect]:
         """Where each cover is now, so a read of nearby text can take it in whole."""

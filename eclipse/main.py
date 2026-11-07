@@ -1,7 +1,8 @@
 """Wires the pipeline. Run with: python -m eclipse.main
 
 Every frame goes through the text layer and the compositor before the delay buffer
-hands it to the output, so there is no way to send an unscanned frame.
+hands it to the output, so there is no way to send an unscanned frame. The panel and
+the panic key drive the same running pipeline, through one controller.
 """
 
 from __future__ import annotations
@@ -20,6 +21,9 @@ from eclipse.capture.screen import ScreenCapture
 from eclipse.compositor.compositor import PADDING, Compositor
 from eclipse.compositor.delay import DelayedPipeline
 from eclipse.output.virtual_cam import DiscardingCam, VirtualCam
+from eclipse.panel.app import PANEL_HOST, PANEL_PORT, start_panel
+from eclipse.panel.controller import LivePipelineController
+from eclipse.panel.hotkey import PANIC_KEYS, PanicHotkey
 from eclipse.platform import (
     AppleVisionReader,
     screen_capture_allowed,
@@ -179,6 +183,35 @@ def p95(values: list[float]) -> float:
     return sorted(values)[int(len(values) * 0.95)]
 
 
+def start_controls(controller: LivePipelineController, panel: bool, hotkey: bool):
+    """Start the panel and the panic key. The stream runs without them, but says so."""
+    server = None
+    if panel:
+        server = start_panel(controller)
+        if server is None:
+            print(f"Panel unavailable: {PANEL_HOST}:{PANEL_PORT} didn't start")
+        else:
+            print(f"Panel at http://{PANEL_HOST}:{PANEL_PORT}")
+    keys = None
+    if hotkey:
+        keys = PanicHotkey(controller.panic)
+        if keys.start():
+            print(f"Panic key: {PANIC_KEYS}")
+        else:
+            print(
+                "Panic key unavailable. On macOS, allow Input Monitoring in System Settings "
+                "> Privacy & Security. The panel's panic button still works."
+            )
+    return server, keys
+
+
+def stop_controls(server, keys) -> None:
+    if keys is not None:
+        keys.stop()
+    if server is not None:
+        server.should_exit = True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="eclipse")
     parser.add_argument(
@@ -213,6 +246,12 @@ def main(argv: list[str] | None = None) -> int:
         "--no-output", action="store_true", help="measure every stage but send frames nowhere"
     )
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument(
+        "--no-panel", action="store_true", help="no local control panel, as with --max-frames"
+    )
+    parser.add_argument(
+        "--no-hotkey", action="store_true", help="no panic key, as with --max-frames"
+    )
     args = parser.parse_args(argv)
     cv2.setNumThreads(2)  # leave the cores to OBS
 
@@ -249,11 +288,17 @@ def main(argv: list[str] | None = None) -> int:
     pipeline = DelayedPipeline(
         source, sink, detect, compositor, args.delay, args.fps, args.max_frames
     )
+    controller = LivePipelineController(pipeline, getattr(detect, "configure", None))
+    measuring = args.max_frames is not None  # a bounded run is a measurement, not a stream
+    server, keys = start_controls(
+        controller, not (args.no_panel or measuring), not (args.no_hotkey or measuring)
+    )
     parts = {"capture": source, "detect": detect, "output": sink, "read": read_ahead}
     try:
         with StatsLog(args.log, pipeline, parts):
             stats = pipeline.run()
     finally:
+        stop_controls(server, keys)
         if read_ahead is not None:
             read_ahead.close()
     if stats.latencies:
