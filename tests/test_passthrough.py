@@ -4,6 +4,7 @@ import pytest
 from eclipse import main as app
 from eclipse.capture.pattern import TestPattern
 from eclipse.capture.screen import to_bgr
+from eclipse.compositor.compositor import Compositor
 from eclipse.output.virtual_cam import OUTPUT_HEIGHT, OUTPUT_WIDTH, fit
 
 
@@ -66,7 +67,7 @@ def test_pattern_frames_follow_the_contract():
 
 def test_run_stops_at_max_frames():
     sink = FakeSink()
-    latencies = app.run(TestPattern(320, 240), sink, max_frames=5)
+    latencies = app.run(TestPattern(320, 240), sink, lambda f: [], Compositor(), max_frames=5)
     assert len(sink.images) == 5
     assert len(latencies) == 5
 

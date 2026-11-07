@@ -1,8 +1,8 @@
 """Wires the pipeline. Run with: python -m eclipse.main --test-pattern
 
-There is no detection yet, so real screen output is unscanned. That breaks the
-fail-closed rule, so it needs --unsafe-passthrough. Remove that flag once the
-compositor sits between capture and output.
+Every frame goes through the compositor, so there is one path to the output. The
+text layer isn't built yet, so real screen output is still unscanned and needs
+--unsafe-passthrough. Remove that flag once text_detect is wired in.
 """
 
 from __future__ import annotations
@@ -12,20 +12,27 @@ import time
 
 from eclipse.capture.pattern import TestPattern
 from eclipse.capture.screen import ScreenCapture
+from eclipse.compositor.compositor import Compositor, Detector
 from eclipse.output.virtual_cam import VirtualCam
 from eclipse.platform import screen_capture_allowed
 
 
-def run(source, sink, max_frames: int | None = None) -> list[float]:
-    """Move frames from source to sink. Returns capture-to-send times in ms."""
+def run(
+    source,
+    sink,
+    detect: Detector,
+    compositor: Compositor,
+    max_frames: int | None = None,
+) -> list[float]:
+    """Move frames from source to sink. Returns capture-to-output times in ms."""
     latencies: list[float] = []
     with source, sink:
         try:
             while max_frames is None or len(latencies) < max_frames:
                 frame = source.read()
-                send_started = time.monotonic()
-                sink.send(frame.image)
-                latencies.append((send_started - frame.ts) * 1000)
+                output = compositor.process(frame, detect)
+                latencies.append((time.monotonic() - frame.ts) * 1000)
+                sink.send(output)
         except KeyboardInterrupt:
             pass
     return latencies
@@ -37,7 +44,11 @@ def p95(values: list[float]) -> float:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="eclipse")
-    parser.add_argument("--test-pattern", action="store_true", help="send a moving pattern")
+    parser.add_argument(
+        "--test-pattern",
+        action="store_true",
+        help="send a moving pattern with a fake secret hidden by the compositor",
+    )
     parser.add_argument(
         "--unsafe-passthrough",
         action="store_true",
@@ -50,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.test_pattern:
         source = TestPattern()
+        detect = source.detect
     elif args.unsafe_passthrough:
         if not screen_capture_allowed():
             print(
@@ -60,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("WARNING: output is NOT redacted. Do not stream this.")
         source = ScreenCapture(max_width=args.max_width)
+        detect = lambda frame: []
     else:
         print(
             "Detection isn't built yet, so Eclipse won't send your real screen by default.\n"
@@ -67,9 +80,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    latencies = run(source, VirtualCam(fps=args.fps), args.max_frames)
+    compositor = Compositor()
+    latencies = run(source, VirtualCam(fps=args.fps), detect, compositor, args.max_frames)
     if latencies:
-        print(f"{len(latencies)} frames, capture to send p95 {p95(latencies):.1f} ms")
+        print(
+            f"{len(latencies)} frames, capture to output p95 {p95(latencies):.1f} ms, "
+            f"{compositor.held_frames} held"
+        )
     return 0
 
 
