@@ -8,14 +8,15 @@
     --line: #4A5C6A;
     --softline: rgba(155, 168, 171, .18);
     --text: #E3E9EA;
-    --muted: #9BA8AB;
+    --muted:  #aca08b;
     --faint: #8799A2;
     --violet: #8B5CF6;
     --violet-bright: #A78BFA;
     --plum: #425D77;
     --danger: #FB7185;
     --green: #34D399;
-    --cyan: #38BDF8
+    --cyan: #38BDF8;
+    --accents: #D4C4A8;
 }
 
 * {
@@ -28,7 +29,9 @@ html {
 
 body {
     margin: 0;
-    background: radial-gradient(ellipse at 75% -12%, rgba(78, 47, 104, .13), transparent 42%), var(--bg);
+    /* background: radial-gradient(ellipse at 75% -12%, rgba(53, 47, 104, 0.13), transparent 42%), var(--bg); */
+    background: #2A7B9B;
+    background: linear-gradient(90deg,rgba(42, 123, 155, 1) 0%, rgba(87, 199, 133, 1) 50%, rgba(237, 221, 83, 1) 100%);
     color: var(--text);
     font-family: 'Inter', 'Commissioner', ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 14px;
@@ -361,7 +364,8 @@ h1 em {
 .date-label {
     font-size: 10px;
     letter-spacing: .1em;
-    color: #77707f;
+    /* color: #77707f; */
+    color: var(--accents);
     white-space: nowrap
 }
 
@@ -379,10 +383,18 @@ h1 em {
     justify-content: space-between;
     min-height: 210px;
     padding: 30px 37px;
-    border: 1px solid #4e395e;
+    border: 1px solid #5b5d76;
     border-radius: 17px;
-    background: radial-gradient(ellipse at 84% 42%, #3e2552 0%, transparent 44%), linear-gradient(112deg, #251b2f, #19151f 70%);
-    box-shadow: inset 0 1px #ffffff0d, 0 20px 50px #00000024
+    /* background: radial-gradient(ellipse at 84% 42%, #3e2552 0%, transparent 44%), linear-gradient(112deg, #251b2f, #19151f 70%);
+    box-shadow: inset 0 1px #ffffff0d, 0 20px 50px #00000024 */
+    background: rgba(77, 77, 77, 0.411);
+    backdrop-filter: blur(15px) saturate(180%) brightness(1.1);
+    -webkit-backdrop-filter: blur(15px) saturate(180%) brightness(1.1);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    box-shadow:
+        inset 0 1.5px 0 rgba(255, 255, 255, 0.25),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.15),
+        0 8px 32px rgba(0, 0, 0, 0.3);
 }
 
 .hero:after {
@@ -567,7 +579,15 @@ h1 em {
 }
 
 .metric {
-    background: linear-gradient(145deg, #1d1a24, #18161d);
+    /* background: linear-gradient(145deg, #1d1a24, #18161d); */
+    background: rgba(77, 77, 77, 0.411);
+    backdrop-filter: blur(15px) saturate(180%) brightness(1.1);
+    -webkit-backdrop-filter: blur(15px) saturate(180%) brightness(1.1);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    box-shadow:
+        inset 0 1.5px 0 rgba(255, 255, 255, 0.25),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.15),
+        0 8px 32px rgba(0, 0, 0, 0.3);
     border: 1px solid #332d39;
     border-radius: 13px;
     padding: 18px 20px;
@@ -1217,12 +1237,34 @@ footer {
 
 /* ECLIPSE — Ocean Slate theme (palette supplied by user) */
 body {
-    background: radial-gradient(ellipse at 75% -12%, rgba(56, 189, 248, .075), transparent 44%), #06141B;
+    /* background: radial-gradient(ellipse at 75% -12%, rgba(56, 189, 248, .075), transparent 44%), #06141B; */
+    background: #020024;
+    background: linear-gradient(0deg, rgb(11, 20, 27) 0%, rgb(19, 39, 54) 35%, rgb(24, 75, 116) 100%);
 }
 
 .sidebar {
-    background: linear-gradient(165deg, #11212D, #091A24 75%);
-    border-right-color: rgba(155, 168, 171, .16);
+    /* background: linear-gradient(165deg, #11212D, #091A24 75%); */
+    background: rgba(88, 88, 95, 0.411);
+    backdrop-filter: blur(10px) saturate(180%) brightness(0.9);
+    -webkit-backdrop-filter: blur(15px) saturate(180%) brightness(0.9);
+    border: 1px solid rgba(143, 143, 146, 0.15);
+    box-shadow:
+        /* inset 0 1.5px 0 rgba(255, 255, 255, 0.25), */
+        /* inset 0 -1px 0 rgba(0, 0, 0, 0.15), */
+        0 3px 8px rgba(0, 0, 0, 0.3);
+    
+    /* border: 1px solid, rgb(183, 183, 183); */
+    border-radius: 8px;
+    /* border-right-color: rgba(155, 168, 171, .16); */
+}
+
+.sidebar::before{
+    background: linear-gradient(
+        0deg,
+        rgba(143, 142, 142, 0.1) 0%,
+        rgba(255, 255, 255, 0.02) 50%,
+        rgba(149, 149, 149, 0.05) 100%
+    );
 }
 
 .brandmark {
@@ -1293,18 +1335,18 @@ body {
 }
 
 .eyebrow,
-.hero .label {
-    color: #A3D6EE;
+.hero .label { 
+    color: #D4C4A8;
 }
 
 h1 em {
-    color: #B6DEEF;
+    color:  var(--accents);
 }
 
 .date-label span {
     color: #9BC9DB;
 }
-
+/* 
 .hero {
     background: radial-gradient(ellipse at 86% 42%, rgba(56, 189, 248, .16), transparent 47%), linear-gradient(112deg, #243D4C, #11212D 74%);
     border-color: #4A5C6A;
@@ -1313,7 +1355,7 @@ h1 em {
 
 .hero:after {
     background: linear-gradient(115deg, rgba(255, 255, 255, .035), transparent 40%);
-}
+} */
 
 .hero p,
 .hero-note {
@@ -1353,10 +1395,10 @@ h1 em {
     color: #E1C6AD;
 }
 
-.metric {
+/* .metric {
     background: linear-gradient(145deg, #253745, #1A303E);
     border-color: rgba(155, 168, 171, .22);
-}
+} */
 
 .metric-icon {
     background: rgba(56, 189, 248, .10);
