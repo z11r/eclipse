@@ -155,10 +155,13 @@ class LivePipelineController:
         self._configure = configure
         self._apply_wait = apply_wait
         self._store = KeywordStore(config_path)
-        self._change_lock = Lock()  # one settings change at a time; panic never takes this
+        self._change_lock = RLock()  # one settings change at a time; panic never takes this
         self._lock = Lock()
         self._enabled = list(ALL_CATEGORIES)
         self._keywords = self._store.load()
+        self._pending_config = None
+        self._config_status = "applied"
+        self._config_message = "Settings applied."
         self._caught: set[str] = set()
         self.events = EventHistory()
         pipeline.on_found = self.note_detections
@@ -173,10 +176,14 @@ class LivePipelineController:
         self._caught = found
 
     def get_state(self) -> PanelState:
+        self._settle_config()
         with self._lock:
+            status, message = self._config_status, self._config_message
             enabled, keywords = list(self._enabled), list(self._keywords)
         pipeline = self._pipeline
         return PanelState(
+            config_status=status,
+            config_message=message,
             panic=self._gate.panicked,
             blackout_confirmed=self._gate.black_confirmed,
             mode="desktop",
@@ -191,27 +198,64 @@ class LivePipelineController:
             message=self._message(),
         )
 
+    def _settle_config(self) -> None:
+        """Publish only acknowledged settings; polling also observes late outcomes."""
+        with self._change_lock:
+            pending = self._pending_config
+            if pending is None:
+                return
+            change, config, staged = pending
+            if not change.wait(0):
+                return
+            self._pending_config = None
+            if change.error is not None:
+                self._store.discard(staged)
+                with self._lock:
+                    self._config_status = "failed"
+                    self._config_message = "Settings were not applied. Previous settings remain active."
+                return
+            # The detector acknowledged these settings, even if persistence fails.
+            with self._lock:
+                self._enabled = list(config.enabled)
+                self._keywords = list(config.keywords)
+                self._config_status = "applied"
+                self._config_message = "Settings applied and keywords saved."
+            try:
+                self._store.commit(staged)
+            except HTTPException:
+                self._store.discard(staged)
+                with self._lock:
+                    self._config_status = "failed"
+                    self._config_message = "Settings applied, but keywords could not be saved. Retry saving."
+
     def set_config(self, config: PanelConfig) -> PanelState:
         with self._change_lock:
+            self._settle_config()
+            if self._pending_config is not None:
+                raise HTTPException(status_code=409, detail="A settings change is still pending")
             if self._configure is None:
                 raise HTTPException(status_code=409, detail="This run has no configurable detector")
             with self._lock:
                 stricter = self._is_stricter(config)
-            staged = self._store.stage(config.keywords)
+            try:
+                staged = self._store.stage(config.keywords)
+            except HTTPException:
+                with self._lock:
+                    self._config_status = "failed"
+                    self._config_message = "Settings were not applied because keywords could not be saved."
+                raise
             words, enabled = tuple(config.keywords), tuple(config.enabled)
             change = self._pipeline.change_policy(lambda: self._configure(words, enabled), stricter)
-            if change.wait(self._apply_wait) and change.error is not None:
-                self._store.discard(staged)
-                raise HTTPException(
-                    status_code=503,
-                    detail="Settings were not applied. The previous detector settings stay on, "
-                           "and any cover already in place stays until a change succeeds.",
-                )
+            self._pending_config = (change, config.model_copy(deep=True), staged)
             with self._lock:
-                self._enabled = list(config.enabled)
-                self._keywords = list(config.keywords)
-            self._store.commit(staged)
-            return self.get_state()
+                self._config_status = "pending"
+                self._config_message = "Waiting for the detector to apply settings."
+        # No controller lock is held while OCR finishes; panic stays responsive.
+        change.wait(self._apply_wait)
+        state = self.get_state()
+        if state.config_status == "failed":
+            raise HTTPException(status_code=503, detail=state.config_message)
+        return state
 
     def get_events(self, after: int = 0) -> CatchLog:
         return self.events.since(after)

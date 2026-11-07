@@ -62,6 +62,8 @@ class PanelState(BaseModel):
     irl_available: bool = False
     enabled: list[Category] = Field(default_factory=lambda: list(ALL_CATEGORIES))
     keywords: list[str] = Field(default_factory=list)
+    config_status: Literal["applied", "pending", "failed"] = "applied"
+    config_message: str = "Settings applied."
     held_frames: int = 0
     detector_health: dict[str, DetectorHealth] = Field(default_factory=dict)
     output_connected: bool = False
