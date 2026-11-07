@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from eclipse.text_detect.covers import MOVE, REREAD, STAY, CoverTracks, Sighting
+from eclipse.text_detect.luhn import passes_luhn
 
 Box = tuple[int, int, int, int, str]
 CATEGORIES = frozenset({'email', 'phone', '2fa', 'api_key', 'card', 'keyword'})
@@ -53,7 +54,12 @@ _PHONE = re.compile(
 # A bare 6-8 digit number can be a code. 4-5 digits are too common (ports, years),
 # so they only count next to a word like "code".
 _CODE_ALONE = re.compile(r'(?<![\w.:/\-])(?:\d{6,8}|\d{3}[ \-]\d{3})(?![\w.:/\-])')
-_CODE_HINT = re.compile(r'\b(?:code|otp|verification|verify|2fa|passcode|pin)\b', re.I)
+# OCR can join a label into "Yourcode" or "Securitycode".
+_CODE_HINT = re.compile(
+    r'\b(?:code|otp|verification|verify|2fa|passcode|pin)\b'
+    r'|\b(?:your|security|login|verification)\s*(?:code|otp|pin|passcode)\b',
+    re.I,
+)
 _CODE = re.compile(r'(?<!\w)\d(?:[ \-]?\d){3,7}(?!\w)')
 _CARD = re.compile(r'(?<!\d)(?:\d[ \-]?){12,18}\d(?!\d)')
 _KEYS = [
@@ -68,8 +74,14 @@ _KEYS = [
     re.compile(
         r'(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]*'
         r'(?:api[_ -]?key|access[_ -]?key|access[_ -]?token|token|secret(?:[_ -]?key)?'
-        r'|private[_ -]?key|passw(?:or)?d|pwd|authorization)'
+        r'|private[_ -]?key|authorization)'
         r'\b\s*[=:]\s*[\"\x27]?(?:Bearer\s+)?[^\s\"\x27,;]{6,}',
+        re.I,
+    ),
+    # An explicit password assignment is sensitive even when its value is short.
+    re.compile(
+        r'(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]*(?:passw(?:or)?d|pwd)\b'
+        r'[ \t]*[=:][ \t]*["\x27]?[^\s"\x27,;]+',
         re.I,
     ),
     re.compile(r'\bBearer\s+[A-Za-z0-9._~+/=\-]{12,}', re.I),
@@ -89,21 +101,9 @@ _SHORT_KEYWORD = 4  # below this many characters, match whole words only
 
 
 def luhn_valid(value: str) -> bool:
-    digits = [int(c) for c in value if c.isascii() and c.isdigit()]
-
-    if not 13 <= len(digits) <= 19 or len(set(digits)) == 1:
-        return False
-
-    total = 0
-
-    for index, digit in enumerate(reversed(digits)):
-        if index % 2:
-            digit *= 2
-            if digit > 9:
-                digit -= 9
-        total += digit
-
-    return total % 10 == 0
+    """Check card digits, rejecting numbers made from one repeated digit."""
+    digits = ''.join(c for c in value if c.isascii() and c.isdigit())
+    return len(set(digits)) > 1 and passes_luhn(digits)
 
 
 def _keyword_pattern(word: str) -> re.Pattern:
@@ -184,19 +184,12 @@ def _remembered_matches(text: str, keywords: tuple[str, ...]) -> tuple:
 
 
 def find_matches(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
-    """Return (category, start, end) for each sensitive part of the text.
-
-    Answers are remembered. A frame re-checks every word on screen, nearly all of them
-    unchanged, and checking them afresh took 2 ms a frame. The answer depends only on
-    the text and the keywords, so a remembered one is always the same answer.
-    """
+    """Return sensitive text positions, reusing matches for the same text and keywords."""
     return list(_remembered_matches(text, tuple(keywords)))
 
 
 def _row_means(gray) -> np.ndarray:
-    """Each row's mean, exactly as gray.mean(axis=1) gives it, in a tenth of the time."""
-    # The sums are whole numbers well under 2**53, so float64 holds them exactly, and
-    # dividing exact sums gives the same values numpy's mean does.
+    """Calculate each row's mean using OpenCV's faster sum operation."""
     return cv2.reduce(gray, 1, cv2.REDUCE_SUM, dtype=cv2.CV_64F)[:, 0] / gray.shape[1]
 
 
@@ -326,12 +319,11 @@ def _text_hash(text: str) -> int:
 
 
 class Detector:
-    """Read text from images and find sensitive information.
+    """Read changed areas and keep known secrets covered between scans.
 
-    Use one detector per screen or camera. Only rows that changed are read
-    again, and text read earlier is kept until its pixels change. A secret's cover
-    lives in CoverTracks, so one read missing it doesn't uncover it. Each result is
-    everything to cover in that frame. Changing settings clears saved results."""
+    Use one detector per screen or camera. CoverTracks keeps covers when OCR
+    misses a known secret. Each result includes all covers for the frame.
+    """
 
     def __init__(self, keywords=(), enabled=None, padding=0, reader=None, pixel_scale=1):
         self.stats = {
@@ -547,10 +539,10 @@ class Detector:
         self._regions = moved
         self.stats['scrolls'] += 1
         self._scrolled = True
-        self._collect_unread(shift, left, right, first_row, length, remaining)
+        self._collect_unread(shift, left, right, first_row, length, remaining, image)
         return remaining
 
-    def _collect_unread(self, shift, left, right, first, length, remaining):
+    def _collect_unread(self, shift, left, right, first, length, remaining, image):
         """Track rows new to the screen. They stay black until they can be read.
 
         A line coming onto the screen can't be read until enough of it shows, so
@@ -579,6 +571,13 @@ class Detector:
                 incoming = _join(incoming, moved)
             else:
                 strips[way] = moved  # a reversal left these rows at the other edge
+
+        pixels = image[incoming[0]:incoming[1], incoming[2]:incoming[3]]
+        # A solid-color strip cannot contain readable text. Window drags often
+        # expose just blank desktop; don't draw a safety bar over those pixels.
+        if pixels.size and np.all(pixels == pixels[0, 0]):
+            self._unread = strips
+            return
 
         if incoming[1] - incoming[0] >= self._unread_read_at:
             remaining[incoming[0]:incoming[1], incoming[2]:incoming[3]] = True
