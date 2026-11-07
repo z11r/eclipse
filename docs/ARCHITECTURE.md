@@ -16,7 +16,7 @@ Every frame is scanned by the text layer and drawn by the compositor before the 
 
 | Module | What it does |
 | --- | --- |
-| `capture/` | On macOS, `sck.py` uses ScreenCaptureKit, which hands over each new picture and sends nothing while the screen is still. If it can't start or stops mid-run, `preferred.py` falls back to polling with `mss` (`screen.py`). `clip.py` reads a recorded clip, and `pattern.py` draws a moving test pattern with a fake secret. |
+| `capture/` | On macOS, `sck.py` uses ScreenCaptureKit, which hands over each new picture and sends nothing while the screen is still. If it can't start or stops mid-run, `preferred.py` falls back to polling with `mss` (`screen.py`). `webcam.py` reads a camera through OpenCV (`--webcam INDEX`) and always uses RapidOCR. Pick the real camera, not OBS Virtual Camera, or the output loops back in. If the camera stops sending frames, the run stops. `clip.py` reads a recorded clip, and `pattern.py` draws a moving test pattern with a fake secret. |
 | `text_detect/` | Reads text with OCR and finds secrets in it. See [Text layer](#text-layer). |
 | `compositor/compositor.py` | Draws a solid black box over each detection, padded by at least 10 px. If the scan failed, it returns the last safe frame instead. It keeps no boxes between frames: the text layer reports everything to cover on every frame. |
 | `compositor/delay.py` | Runs capture, scanning and output side by side. Output sends each frame `--delay` seconds (1.0 by default) after capture, so a slow scan uses up some of the delay instead of freezing the picture. A frame that can't be scanned in time is dropped. |
@@ -24,7 +24,7 @@ Every frame is scanned by the text layer and drawn by the compositor before the 
 | `output/virtual_cam.py` | Fits each frame to the camera size and sends it to OBS Virtual Camera through `pyvirtualcam`. |
 | `panel/` | A local page at http://127.0.0.1:8000 with category toggles, a keyword list, a catch log, and panic and resume buttons. Keywords are saved in `~/.eclipse/config.json`. The catch log records categories and times only, never screen text. `hotkey.py` adds a global panic key, Control+Option+B on a Mac. |
 | `types.py` | `Frame`, `Detection` and `Rendered`, the shared contract between modules. |
-| `platform.py` | The only module that checks which OS it is on: permission checks, ScreenCaptureKit and Retina settings, and Apple's OCR. |
+| `platform.py` | The only module that checks which OS it is on: permission checks, ScreenCaptureKit and Retina settings, the camera driver (Media Foundation on Windows), peak memory, and Apple's OCR. |
 | `main.py` | Wires the pipeline and writes numbers to `eclipse-run.log` every 2 seconds. Never screen text. |
 
 ## Text layer
@@ -45,10 +45,9 @@ There are two OCR engines:
 
 ## Not built yet
 
-- Webcam and IRL feed input
+- IRL feed input
 - The visual layer for location clues: `visual_detect/` is empty
 - The IRL tracker: `track/` is empty
-- Running on Windows: `main.py` imports `resource`, which only exists on macOS and Linux
 
 ## Known limits
 
