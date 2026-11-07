@@ -58,6 +58,57 @@ def test_a_readable_email_added_during_a_scroll_is_not_left_visible():
     assert int((same & glyphs & output.any(axis=2)).sum()) == 0
 
 
+class TimedSource:
+    def __init__(self):
+        self.next_id = 0
+        self.times = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def read(self):
+        now = time.monotonic()
+        self.times.append(now)
+        frame = Frame(np.full((60, 80, 3), 150, np.uint8), now, "screen", self.next_id)
+        self.next_id += 1
+        return frame
+
+
+class ClosingSink:
+    def __init__(self):
+        self.images = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+    def send(self, image):
+        self.images.append(image.copy())
+        time.sleep(0.002)
+
+
+def under_memory_pressure():
+    source, sink = TimedSource(), ClosingSink()
+    pipeline = DelayedPipeline(
+        source, sink, lambda frame: [], Compositor(), delay=0.08, fps=50, max_frames=30,
+        max_buffer_bytes=60 * 80 * 3 * 2,
+    )
+    return source, sink, pipeline.run()
+
+
+def test_buffer_pressure_keeps_capture_pacing():
+    source, _, stats = under_memory_pressure()
+    assert stats.over_limit > 0
+    # 30 grabs at 50 Hz span 0.58 s, and this allows 80 ms of scheduling tolerance.
+    assert source.times[-1] - source.times[0] >= 0.50
+
+
 def test_the_evaluator_accounts_for_the_content_of_a_held_frame(tmp_path):
     path = tmp_path / "held-content.avi"
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 30, (240, 100))

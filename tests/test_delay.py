@@ -218,8 +218,10 @@ def test_buffer_never_holds_more_than_the_limit_allows():
         time.sleep(0.02)
         return finds_secret(frame)
 
+    # A full buffer now waits instead of racing through frames, so sixty of them take
+    # as long as the delay lets them. A shorter delay keeps this test quick.
     pipeline = DelayedPipeline(
-        StampedSource(), Sink(), slow, Compositor(padding=0), 1.0, 500, 60,
+        StampedSource(), Sink(), slow, Compositor(padding=0), 0.1, 500, 60,
         max_buffer_bytes=frame_bytes * 5,
     )
     stats = pipeline.run()

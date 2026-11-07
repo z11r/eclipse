@@ -36,10 +36,16 @@ _FRESH_ROW_STEP = 8  # compare every 8th row to tell a new picture from a repeat
 _SHED_AT_WAIT = 0.5
 _SCAN_SMOOTHING = 0.1  # weight of the newest scan in the running estimate of scan time
 _SAMPLES_KEPT = 4096  # timing samples held until the stats log collects them
+_LONGEST_IDLE = 0.01  # seconds the output waits between looks while it has nothing to send
 
 
 def _samples() -> deque:
     return deque(maxlen=_SAMPLES_KEPT)
+
+
+class _Queued(NamedTuple):
+    frame: Frame
+    fresh: bool  # its pixels differ from the frame captured before it
 
 
 class _SafeFrame(NamedTuple):
@@ -47,6 +53,7 @@ class _SafeFrame(NamedTuple):
     image: np.ndarray
     frame_id: int
     fresh: bool  # its pixels differ from the frame captured before it
+    size: int  # bytes counted against the buffer for this frame
 
 
 class _BufferLimit:
@@ -67,15 +74,22 @@ def _buffer_limit(delay: float, fps: int, max_bytes: int) -> _BufferLimit:
 
 @dataclass
 class PipelineStats:
-    captured: int = 0
+    captured: int = 0  # frames read from the source
+    capture_attempts: int = 0  # capture ticks, whether or not they read a frame
+    capture_skips: int = 0  # ticks that read nothing, as there was no room for a frame
+    admitted: int = 0  # frames that joined the queue
+    discarded: int = 0  # frames read but refused, for a source that can't skip a read
     scanned: int = 0
-    dropped: int = 0  # never scanned in time, so never shown
+    dropped: int = 0  # read but never scanned in time, so never shown
     shown: int = 0  # distinct frames actually sent to the output
     skipped: int = 0  # scanned, but a newer frame was sent in the same tick
     repeated: int = 0  # output ticks that had no new frame
     max_backlog: int = 0
-    over_limit: int = 0  # dropped because the buffer hit its memory limit
+    over_limit: int = 0  # capture ticks lost to the memory limit
     backlog: int = 0
+    in_flight_frames: int = 0  # queued, being scanned, or waiting to go out
+    in_flight_bytes: int = 0
+    peak_in_flight_bytes: int = 0
     grab_seconds: float = 0.0
     scan_seconds: float = 0.0
     latencies: list[float] = field(default_factory=list)  # capture to output, in ms
@@ -114,7 +128,7 @@ class DelayedPipeline:
         self._interval = 1 / fps
         self._max_buffered = _buffer_limit(delay, fps, max_buffer_bytes)
         self._max_frames = max_frames
-        self._waiting: deque = deque()
+        self._waiting: deque[_Queued] = deque()
         self._safe: deque[_SafeFrame] = deque()
         self._last_rows: np.ndarray | None = None
         self._last_presented: float | None = None
@@ -127,41 +141,34 @@ class DelayedPipeline:
         self._error: BaseException | None = None
         self.stats = PipelineStats()
 
+    def _room_for_a_frame(self) -> bool:
+        with self._lock:
+            return self.stats.in_flight_frames < self._max_buffered.frames
+
+    def _pace(self, next_grab: float) -> float:
+        next_grab = max(next_grab + self._interval, time.monotonic())
+        self._stop.wait(max(next_grab - time.monotonic(), 0))
+        return next_grab
+
     def _capture(self) -> None:
+        started = time.monotonic()
         try:
-            started = time.monotonic()
             with self._source:
                 next_grab = time.monotonic()
                 while not self._stop.is_set():
                     if self._max_frames is not None and self.stats.captured >= self._max_frames:
                         break
-                    grab_started = time.monotonic()
-                    frame = self._source.read()
-                    self.stats.grab_seconds += time.monotonic() - grab_started
-                    if frame is None:  # nothing new on screen yet
-                        continue
-                    fresh = self._is_fresh(frame)
-                    accepted = not self._scan_would_be_late() and self._prepare(frame)
-                    with self._frame_ready:
-                        self.stats.captured += 1
-                        self.stats.fresh += fresh
-                        self._max_buffered.note_frame(frame.image.nbytes)
-                        if not accepted:
-                            self.stats.dropped += 1  # no reader could reach it in time
-                            self.stats.shed += 1
-                        elif len(self._waiting) + len(self._safe) >= self._max_buffered.frames:
-                            self.stats.dropped += 1  # memory limit reached
+                    # A source that keeps its own time has to be read to stay current.
+                    paced = getattr(self._source, "paced", False)
+                    self.stats.capture_attempts += 1
+                    if paced or self._room_for_a_frame():
+                        self._grab()
+                    else:
+                        with self._lock:
+                            self.stats.capture_skips += 1
                             self.stats.over_limit += 1
-                        else:
-                            self._waiting.append((frame, fresh))
-                            self.stats.backlog = len(self._waiting)
-                            self.stats.max_backlog = max(
-                                self.stats.max_backlog, len(self._waiting)
-                            )
-                            self._frame_ready.notify()
-                    if not getattr(self._source, "paced", False):
-                        next_grab = max(next_grab + self._interval, time.monotonic())
-                        time.sleep(max(next_grab - time.monotonic(), 0))
+                    if not paced:
+                        next_grab = self._pace(next_grab)
         except BaseException as error:
             self._error = error
             self._stop.set()
@@ -169,7 +176,45 @@ class DelayedPipeline:
             self.stats.capture_seconds = time.monotonic() - started
             self._capture_done.set()
             with self._frame_ready:
-                self._frame_ready.notify()
+                self._frame_ready.notify_all()
+
+    def _grab(self) -> None:
+        grab_started = time.monotonic()
+        frame = self._source.read()
+        self.stats.grab_seconds += time.monotonic() - grab_started
+        if frame is None:  # nothing new on screen yet
+            return
+        fresh = self._is_fresh(frame)
+        size = frame.image.nbytes
+        # Room first, so no reading ahead starts on a frame that will be refused anyway.
+        room = self._room_for_a_frame()
+        shed = room and (self._scan_would_be_late() or not self._prepare(frame))
+        with self._frame_ready:
+            self.stats.captured += 1
+            self.stats.fresh += fresh
+            self._max_buffered.note_frame(size)
+            if not room or self.stats.in_flight_frames >= self._max_buffered.frames:
+                self.stats.dropped += 1
+                self.stats.discarded += 1
+                self.stats.over_limit += 1
+                return
+            if shed:
+                self.stats.dropped += 1  # no reader could reach it in time
+                self.stats.shed += 1
+                return
+            self._waiting.append(_Queued(frame, fresh))
+            self._note_in_flight(1, size)
+            self.stats.admitted += 1
+            self.stats.backlog = len(self._waiting)
+            self.stats.max_backlog = max(self.stats.max_backlog, len(self._waiting))
+            self._frame_ready.notify_all()
+
+    def _note_in_flight(self, frames: int, size: int) -> None:
+        """Call with the lock held."""
+        stats = self.stats
+        stats.in_flight_frames += frames
+        stats.in_flight_bytes += size
+        stats.peak_in_flight_bytes = max(stats.peak_in_flight_bytes, stats.in_flight_bytes)
 
     def _is_fresh(self, frame: Frame) -> bool:
         """Whether this frame's pixels differ from the last one's.
@@ -218,11 +263,14 @@ class DelayedPipeline:
                             return
                         self._frame_ready.wait(0.1)
                     frame, fresh = self._waiting.popleft()
+                size = frame.image.nbytes
 
                 # Already overdue, so skip to a newer one. Most scans are quick, so
                 # one slow scan doesn't mean the frames behind it will be late too.
                 if time.monotonic() > frame.ts + self._delay and self._waiting:
-                    self.stats.dropped += 1
+                    with self._lock:
+                        self.stats.dropped += 1
+                        self._note_in_flight(-1, -size)
                     continue
 
                 started = time.monotonic()
@@ -238,7 +286,7 @@ class DelayedPipeline:
                 )
                 self.stats.held = self._compositor.held_frames
                 with self._lock:
-                    self._safe.append(_SafeFrame(frame.ts, output, frame.frame_id, fresh))
+                    self._safe.append(_SafeFrame(frame.ts, output, frame.frame_id, fresh, size))
                 self.stats.slack.append((frame.ts + self._delay - time.monotonic()) * 1000)
         except BaseException as error:
             self._error = error
@@ -259,6 +307,7 @@ class DelayedPipeline:
                 if chosen is not None:
                     self.stats.skipped += 1
                 chosen = self._safe.popleft()
+                self._note_in_flight(-1, -chosen.size)
                 behind = sum(1 for safe in self._safe if safe.ts <= due)
                 if behind <= _MAX_BEHIND:
                     break
@@ -299,7 +348,8 @@ class DelayedPipeline:
                     is_new = latest is not current
                     current = latest
                     if current is None:
-                        time.sleep(self._interval / 2)
+                        # A stop can't wait out a long frame interval.
+                        self._stop.wait(min(self._interval / 2, _LONGEST_IDLE))
                     else:
                         self._sink.send(current)
                         if is_new:
