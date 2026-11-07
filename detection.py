@@ -6,6 +6,7 @@ If detection fails, the pipeline must black out the frame."""
 import math
 import re
 import threading
+import unicodedata
 from typing import Iterable
 
 Box = tuple[int, int, int, int, str]
@@ -56,6 +57,8 @@ def luhn_valid(value: str) -> bool:
 
 def classify_text(text: str, keywords: Iterable[str] = ()) -> set[str]:
     """Return the types of sensitive text found, without the secret text."""
+    # Convert alternate characters, such as full-width parentheses, to standard ones.
+    text = unicodedata.normalize('NFKC', text)
     found = set()
 
     if _EMAIL.search(text):
@@ -74,8 +77,18 @@ def classify_text(text: str, keywords: Iterable[str] = ()) -> set[str]:
         found.add('card')
 
     folded = text.casefold()
-    if any(word.strip() and word.strip().casefold() in folded for word in keywords):
-        found.add('keyword')
+    # OCR sometimes drops or adds spaces inside a phrase.
+    compact_text = ''.join(folded.split())
+
+    for word in keywords:
+        keyword = unicodedata.normalize('NFKC', word).strip().casefold()
+        compact_keyword = ''.join(keyword.split())
+
+        if compact_keyword and (
+            keyword in folded or compact_keyword in compact_text
+        ):
+            found.add('keyword')
+            break
 
     return found
 
