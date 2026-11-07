@@ -52,14 +52,22 @@ class Compositor:
             self._active[box] = max(expiry, self._active.get(box, expiry))
         self._active = {box: end for box, end in self._active.items() if end >= frame.ts}
 
+    def covered_areas(self, height: int, width: int) -> list[tuple[int, int, int, int]]:
+        """Each active box as left, top, right, bottom, padded and clipped to the frame."""
+        return [
+            (
+                max(x - self._padding, 0),
+                max(y - self._padding, 0),
+                min(x + w + self._padding, width),
+                min(y + h + self._padding, height),
+            )
+            for x, y, w, h in self._active
+        ]
+
     def _redact(self, frame: Frame) -> np.ndarray:
         output = frame.image.copy()
         height, width = output.shape[:2]
-        for x, y, w, h in self._active:
-            left = max(x - self._padding, 0)
-            top = max(y - self._padding, 0)
-            right = min(x + w + self._padding, width)
-            bottom = min(y + h + self._padding, height)
+        for left, top, right, bottom in self.covered_areas(height, width):
             region = output[top:bottom, left:right]
             if region.size:
                 # A solid fill, because blurred text can sometimes be recovered.
