@@ -48,6 +48,10 @@ class TextDetector:
             wanted = names & CATEGORIES
         self._detector.configure(keywords, wanted)
 
+    def cancel(self) -> None:
+        """Stop scanning at the next chance. A read inside the OCR engine runs to its end."""
+        self._detector.cancel()
+
     def __call__(self, frame: Frame) -> list[Detection]:
         if frame.source != self._source:
             self._detector.reset()  # another source's positions mean nothing here

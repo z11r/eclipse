@@ -13,6 +13,11 @@ frame that can't be scanned in time is dropped and the last safe frame stays up.
 Every picture passes the OutputGate on its way out. Nothing the gate turns down is
 ever sent: black goes out instead. Panic and new settings work through the gate, so
 they take effect at the output, however far behind the scanner is.
+
+Shutting down closes the gate first, and sends black while the output still works.
+Python can't stop a thread stuck inside a native OCR call. If a worker doesn't finish
+in time, it is left behind as a daemon, reported in stats.stalled_workers, and the
+closed gate stops anything it produces from ever going out.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ _FRESH_ROW_STEP = 8  # compare every 8th row to tell a new picture from a repeat
 _SHED_AT_WAIT = 0.5
 _SCAN_SMOOTHING = 0.1  # weight of the newest scan in the running estimate of scan time
 _SAMPLES_KEPT = 4096  # timing samples held until the stats log collects them
+_JOIN_SECONDS = 5.0  # how long shutdown waits for the workers
 _LONGEST_IDLE = 0.01  # seconds the output waits between looks while it has nothing to send
 _NO_FRAME_YET = (1080, 1920, 3)  # the shape of black if a panic beats the first frame
 
@@ -117,6 +123,8 @@ class PipelineStats:
     rendered_blackout: int = 0  # results with nothing safe to show
     invalidated: int = 0  # results or frames thrown out by a panic or stricter settings
     event_errors: int = 0  # catches that couldn't be reported to the panel
+    final_black_sent: bool = False
+    stalled_workers: tuple[str, ...] = ()
 
 
 class PolicyChange:
@@ -174,6 +182,7 @@ class DelayedPipeline:
         max_frames: int | None = None,
         max_buffer_bytes: int = MAX_BUFFER_BYTES,
         gate: OutputGate | None = None,
+        join_seconds: float = _JOIN_SECONDS,
     ) -> None:
         self.stats = PipelineStats()
         self.gate = gate if gate is not None else OutputGate()
@@ -190,6 +199,7 @@ class DelayedPipeline:
         self._interval = 1 / fps
         self._max_buffered = _buffer_limit(delay, fps, max_buffer_bytes)
         self._max_frames = max_frames
+        self._join_seconds = join_seconds
         self._waiting: deque[_Queued] = deque()
         self._safe: deque[_SafeFrame] = deque()
         self._last_rows: np.ndarray | None = None
@@ -372,9 +382,11 @@ class DelayedPipeline:
         while True:
             self._apply_pending_policy()
             with self._frame_ready:
+                if self._stop.is_set():
+                    return None
                 if self._waiting:
                     return self._waiting.popleft()
-                if self._capture_done.is_set() or self._stop.is_set():
+                if self._capture_done.is_set():
                     return None
                 self._frame_ready.wait(0.1)
 
@@ -423,6 +435,9 @@ class DelayedPipeline:
                 self.stats.held = self._compositor.held_frames
                 self._count_result(rendered)
                 with self._lock:
+                    if self._stop.is_set():
+                        self._note_in_flight(-1, -size)  # nobody is left to show it
+                        return
                     self._safe.append(_SafeFrame(frame.ts, rendered, fresh, size))
                 self.stats.slack.append((frame.ts + self._delay - time.monotonic()) * 1000)
         except BaseException as error:
@@ -545,6 +560,54 @@ class DelayedPipeline:
         with self._lock:
             return self._scan_done.is_set() and not self._safe
 
+    def _drop_queued(self) -> None:
+        """Call with the lock held. Work nobody will see is only in the way now."""
+        for frame, _ in self._waiting:
+            self.stats.dropped += 1
+            self._note_in_flight(-1, -frame.image.nbytes)
+        for safe in self._safe:
+            self._note_in_flight(-1, -safe.size)
+        self._waiting.clear()
+        self._safe.clear()
+
+    def _send_final_black(self) -> None:
+        """Leave black up, while the output still works. Never raises."""
+        if not self._sent_any and not self.gate.panicked:
+            return  # nothing was ever shown, so there is nothing to replace
+        try:
+            self._send_black()
+            self.stats.final_black_sent = True
+        except BaseException as error:
+            if self.output_error is None:
+                self.output_error = type(error).__name__
+            if self._error is None and not isinstance(error, KeyboardInterrupt):
+                self._error = error
+
+    def _shut_down(self) -> None:
+        self.gate.close()
+        self._stop.set()
+        with self._frame_ready:
+            self._drop_queued()
+            self._frame_ready.notify_all()
+        cancel = getattr(self._detect, "cancel", None)
+        if cancel is not None:
+            try:
+                cancel()
+            except Exception:
+                pass  # the closed gate protects the output either way
+        self._send_final_black()
+        give_up_at = time.monotonic() + self._join_seconds
+        for thread in self._threads:
+            thread.join(timeout=max(give_up_at - time.monotonic(), 0))
+        self.stats.stalled_workers = tuple(
+            thread.name for thread in self._threads if thread.is_alive()
+        )
+        if self.stats.stalled_workers:
+            names = ", ".join(self.stats.stalled_workers)
+            print(f"Still running after shutdown: {names}. Output stays closed to them.")
+        with self._lock:
+            self._drop_queued()  # anything a worker added on its way out
+
     def run(self) -> PipelineStats:
         self._threads = [
             threading.Thread(target=self._capture, name="eclipse-capture", daemon=True),
@@ -560,12 +623,12 @@ class DelayedPipeline:
                     current = self._tick(current)
             except KeyboardInterrupt:
                 pass
+            except BaseException as error:
+                self.output_error = type(error).__name__
+                if self._error is None:
+                    self._error = error
             finally:
-                self._stop.set()
-                with self._frame_ready:
-                    self._frame_ready.notify_all()
-                for thread in self._threads:
-                    thread.join(timeout=5)
+                self._shut_down()
         if self._error is not None:
             raise self._error
         return self.stats

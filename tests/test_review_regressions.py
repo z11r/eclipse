@@ -109,6 +109,12 @@ def test_buffer_pressure_keeps_capture_pacing():
     assert source.times[-1] - source.times[0] >= 0.50
 
 
+def test_orderly_shutdown_ends_on_a_black_frame():
+    _, sink, _ = under_memory_pressure()
+    assert not sink.images[-1].any()
+    assert sink.closed
+
+
 def test_the_evaluator_accounts_for_the_content_of_a_held_frame(tmp_path):
     path = tmp_path / "held-content.avi"
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 30, (240, 100))

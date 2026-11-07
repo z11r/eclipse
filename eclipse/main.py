@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import resource
+import signal
 import threading
 import time
 from collections import deque
+from typing import Callable
 
 import cv2
 
@@ -183,6 +185,19 @@ def p95(values: list[float]) -> float:
     return sorted(values)[int(len(values) * 0.95)]
 
 
+def _stop_on_sigterm() -> Callable[[], None]:
+    """Treat a polite kill like Ctrl+C, so it ends in black too. Returns how to undo it."""
+
+    def interrupt(signum, stack) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, interrupt)
+    except ValueError:  # only the main thread can set signals
+        return lambda: None
+    return lambda: signal.signal(signal.SIGTERM, previous)
+
+
 def start_controls(controller: LivePipelineController, panel: bool, hotkey: bool):
     """Start the panel and the panic key. The stream runs without them, but says so."""
     server = None
@@ -293,11 +308,13 @@ def main(argv: list[str] | None = None) -> int:
     server, keys = start_controls(
         controller, not (args.no_panel or measuring), not (args.no_hotkey or measuring)
     )
+    allow_sigterm = _stop_on_sigterm()
     parts = {"capture": source, "detect": detect, "output": sink, "read": read_ahead}
     try:
         with StatsLog(args.log, pipeline, parts):
             stats = pipeline.run()
     finally:
+        allow_sigterm()
         stop_controls(server, keys)
         if read_ahead is not None:
             read_ahead.close()
@@ -315,6 +332,11 @@ def main(argv: list[str] | None = None) -> int:
             f"{stats.max_backlog} frames, average scan "
             f"{stats.scan_seconds / max(stats.scanned, 1) * 1000:.0f} ms"
         )
+    if stats.shown and not stats.final_black_sent:
+        print("Warning: the last frame sent was not confirmed black. Check OBS.")
+        return 1
+    if stats.stalled_workers:
+        return 1
     return 0
 
 

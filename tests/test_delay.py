@@ -81,8 +81,9 @@ def test_every_frame_is_scanned_and_shown_when_scanning_keeps_up():
 
 def test_frames_stay_in_order():
     _, sink = run()
-    ids = [frame_id(image) for image in sink.images]
+    ids = [frame_id(image) for image in sink.images[:-1]]  # the last one is the final black
     assert ids == sorted(ids)
+    assert not sink.images[-1].any()
 
 
 def test_output_waits_for_the_delay():
@@ -191,7 +192,9 @@ def test_stops_cleanly_on_interrupt():
                 raise KeyboardInterrupt
 
     stats, sink = run(max_frames=None, sink=Interrupting())
-    assert len(sink.images) == 3
+    assert len(sink.images) == 4  # the three before the interrupt, then the final black
+    assert not sink.images[-1].any()
+    assert stats.final_black_sent
     assert stats.captured >= 3
 
 

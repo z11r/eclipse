@@ -357,6 +357,7 @@ class Detector:
         self._tracks = CoverTracks(pixel_scale)
         self._shape = None
         self._lock = threading.RLock()
+        self._cancelled = threading.Event()
         self.reused_read = False  # whether the last frame needed no OCR
         self._keywords = ()
         self._enabled = frozenset()
@@ -388,6 +389,14 @@ class Detector:
             self._enabled = categories
             self._forget_scan()
             self._tracks.keep_only(still_on)
+
+    def cancel(self):
+        """Stop for good at the next chance, for shutdown. Later scans fail, so stay safe.
+
+        A read already inside the OCR engine can't be stopped. Takes no lock, because
+        detect() holds it for the whole scan.
+        """
+        self._cancelled.set()
 
     def reset(self):
         """Forget everything, covers included, because old positions no longer apply.
@@ -825,6 +834,8 @@ class Detector:
                 ]
 
                 for top, bottom, left, right in areas:
+                    if self._cancelled.is_set():
+                        raise RuntimeError('detection cancelled')
                     regions.extend(self._read(snapshot[top:bottom, left:right], top, left))
 
                 height, width = snapshot.shape[:2]

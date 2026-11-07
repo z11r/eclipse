@@ -265,7 +265,7 @@ class LivePipelineController:
         if self._gate.panicked:
             return "covered"
         if not pipeline.running:
-            return "stopped"
+            return "black" if pipeline.stats.final_black_sent else "stopped"
         if pipeline.last_output in ("scanned", "cached"):
             return "protected" if self._configure is not None else "unverified"
         return "covered" if pipeline.last_output is not None else "stopped"
