@@ -53,7 +53,6 @@ class _Track:
     reads: list[Rect]  # oldest first, all moved along with the text
     pixels: np.ndarray  # greyscale, from when the text was last read
     pixels_at: tuple[int, float]  # left and top of where those pixels should be now
-    colors: np.ndarray  # original BGR pixels, for exact relocation checks
     clear_reads: int = 0  # reads in a row that found nothing on changed pixels
     unsure: bool = False  # its pixels changed and nothing has explained why
     check_at: int | None = None  # frame to read this place again, if it needs it
@@ -146,10 +145,7 @@ class CoverTracks:
             if todo == MOVE:
                 track.move(shift)
                 if not track.touches(top, bottom) and not self._unchanged(track, image):
-                    # A window drag can resemble a vertical scroll against blank space.
-                    # Don't discard a known secret if its pixels are still elsewhere.
-                    if not self._relocate(track, image):
-                        continue  # it really left the scrolling area
+                    continue  # it left the scrolling area
             elif todo == REREAD:
                 track.unsure = True
                 unsure.append(track.cover)
@@ -165,21 +161,6 @@ class CoverTracks:
         read is the areas OCR saw this frame, as top, bottom, left, right. A track
         counts as checked only if it lies wholly inside one of them.
         """
-        # A dragged window can move a known secret during a missed OCR read.
-        # Follow it only when the saved pixels have one exact match elsewhere.
-        for track in self._tracks:
-            identified = any(
-                sighting.category == track.category
-                and (
-                    sighting.text_hash == track.text_hash
-                    or _overlap(track.cover, sighting.rect) >= _MIN_OVERLAP
-                )
-                for sighting in sightings
-            )
-            if identified or self._unchanged(track, image):
-                continue
-            self._relocate(track, image)
-
         seen: dict[int, list[Sighting]] = {}
         spare = []
         for sighting in sightings:
@@ -217,42 +198,6 @@ class CoverTracks:
             )
         return found
 
-    def _relocate(self, track: _Track, image: np.ndarray) -> bool:
-        """Follow one exact copy of known text after a window moves."""
-        template = track.pixels
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        height, width = template.shape
-        if not template.size or height > gray.shape[0] or width > gray.shape[1]:
-            return False
-        if int(template.max()) - int(template.min()) <= _SAME_TOLERANCE:
-            return False  # blank patches cannot identify a secret
-
-        scores = cv2.matchTemplate(gray, template, cv2.TM_SQDIFF_NORMED)
-        candidates = scores <= 1e-5
-        count = int(np.count_nonzero(candidates))
-        if count == 0 or count > 64:
-            return False
-
-        matches = []
-        rows, columns = np.nonzero(candidates)
-        for top, left in zip(rows, columns):
-            if np.array_equal(image[top:top + height, left:left + width], track.colors):
-                matches.append((int(left), int(top)))
-                if len(matches) > 1:
-                    return False  # don't move a cover based on an ambiguous match
-        if not matches:
-            return False
-
-        left, top = matches[0]
-        dx, dy = left - track.pixels_at[0], top - track.pixels_at[1]
-        track.reads = [(x1 + dx, y1 + dy, x2 + dx, y2 + dy)
-                       for x1, y1, x2, y2 in track.reads]
-        track.pixels_at = left, float(top)
-        track.clear_reads = 0
-        track.unsure = False
-        track.check_at = self._now + 1
-        return True
-
     def _claim_by_text(
         self, sighting: Sighting, seen: dict[int, list[Sighting]], image: np.ndarray
     ) -> bool:
@@ -269,8 +214,8 @@ class CoverTracks:
         return False
 
     def _start(self, sighting: Sighting, image: np.ndarray) -> _Track:
-        pixels, place, colors = self._grab(sighting.rect, image)
-        return _Track(sighting.category, sighting.text_hash, [sighting.rect], pixels, place, colors)
+        pixels, place = self._grab(sighting.rect, image)
+        return _Track(sighting.category, sighting.text_hash, [sighting.rect], pixels, place)
 
     def _refresh(self, track: _Track, sightings: list[Sighting], image: np.ndarray) -> None:
         rect = _union(sighting.rect for sighting in sightings)
@@ -282,7 +227,7 @@ class CoverTracks:
         elif fresh or not _contains(track.cover, rect):
             track.reads = [*track.reads, rect][-_KEEP_READS:]
         if fresh:
-            track.pixels, track.pixels_at, track.colors = self._grab(rect, image)
+            track.pixels, track.pixels_at = self._grab(rect, image)
             if not same_text:
                 track.text_hash = sightings[0].text_hash
         track.clear_reads = 0
@@ -317,12 +262,11 @@ class CoverTracks:
         track.check_at = self._now + 1
         return True
 
-    def _grab(self, rect: Rect, image: np.ndarray) -> tuple[np.ndarray, tuple[int, float], np.ndarray]:
+    def _grab(self, rect: Rect, image: np.ndarray) -> tuple[np.ndarray, tuple[int, float]]:
         height, width = image.shape[:2]
         left, right = max(int(rect[0]), 0), min(int(rect[2]) + 1, width)
         top, bottom = max(int(rect[1]), 0), min(int(rect[3]) + 1, height)
-        colors = image[top:bottom, left:right].copy()
-        return cv2.cvtColor(colors, cv2.COLOR_BGR2GRAY), (left, top), colors
+        return cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY), (left, top)
 
     def _unchanged(self, track: _Track, image: np.ndarray) -> bool:
         """Whether the text's own pixels still show, wherever its place has moved to."""
