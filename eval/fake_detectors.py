@@ -39,7 +39,8 @@ def misses_one(labels: dict):
 def first_sighting_only(labels: dict):
     """Reports a secret once, then stops, like OCR that skips unchanged areas.
 
-    Should leak still secrets once their ttl_ms runs out.
+    The compositor keeps nothing between frames, so this should leak still secrets
+    from the next frame on.
     """
     seen: set[str] = set()
 

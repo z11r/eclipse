@@ -81,8 +81,9 @@ def test_every_frame_is_scanned_and_shown_when_scanning_keeps_up():
 
 def test_frames_stay_in_order():
     _, sink = run()
-    ids = [frame_id(image) for image in sink.images]
+    ids = [frame_id(image) for image in sink.images[:-1]]  # the last one is the final black
     assert ids == sorted(ids)
+    assert not sink.images[-1].any()
 
 
 def test_output_waits_for_the_delay():
@@ -191,7 +192,9 @@ def test_stops_cleanly_on_interrupt():
                 raise KeyboardInterrupt
 
     stats, sink = run(max_frames=None, sink=Interrupting())
-    assert len(sink.images) == 3
+    assert len(sink.images) == 4  # the three before the interrupt, then the final black
+    assert not sink.images[-1].any()
+    assert stats.final_black_sent
     assert stats.captured >= 3
 
 
@@ -218,8 +221,10 @@ def test_buffer_never_holds_more_than_the_limit_allows():
         time.sleep(0.02)
         return finds_secret(frame)
 
+    # A full buffer now waits instead of racing through frames, so sixty of them take
+    # as long as the delay lets them. A shorter delay keeps this test quick.
     pipeline = DelayedPipeline(
-        StampedSource(), Sink(), slow, Compositor(padding=0), 1.0, 500, 60,
+        StampedSource(), Sink(), slow, Compositor(padding=0), 0.1, 500, 60,
         max_buffer_bytes=frame_bytes * 5,
     )
     stats = pipeline.run()

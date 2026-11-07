@@ -10,6 +10,17 @@ import sys
 IS_MAC = sys.platform == "darwin"
 
 
+def screen_capture_kit_available() -> bool:
+    """Whether the streaming capture backend can be used on this machine."""
+    if not IS_MAC:
+        return False
+    try:
+        import ScreenCaptureKit  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def use_full_screen_resolution() -> None:
     """Capture every pixel. By default mss halves a Retina screen, which blurs text."""
     if IS_MAC:
@@ -47,6 +58,62 @@ def screen_capture_allowed() -> bool:
     return bool(graphics.CGPreflightScreenCaptureAccess())
 
 
+def peak_memory_mb() -> float:
+    """The most memory this process has used. macOS counts in bytes, Linux in kilobytes."""
+    if sys.platform == "win32":
+        return _windows_peak_memory() / 1024**2
+
+    import resource  # not on Windows
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / 1024**2 if IS_MAC else peak / 1024
+
+
+def _windows_peak_memory() -> int:
+    """Peak working set in bytes, the Windows counterpart of ru_maxrss."""
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = Counters()
+    counters.cb = ctypes.sizeof(Counters)
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi = ctypes.WinDLL("psapi")
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    if not psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        raise ctypes.WinError()
+    return counters.PeakWorkingSetSize
+
+
+def keyboard_listening_allowed() -> bool:
+    """Whether this process can see key presses in other apps.
+
+    Without permission, macOS delivers nothing and raises no error, so a hotkey would
+    look fine and do nothing.
+    """
+    if not IS_MAC:
+        return True
+    graphics = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+    graphics.CGPreflightListenEventAccess.restype = ctypes.c_bool
+    services = ctypes.CDLL(ctypes.util.find_library("ApplicationServices"))
+    services.AXIsProcessTrusted.restype = ctypes.c_bool
+    return bool(graphics.CGPreflightListenEventAccess() or services.AXIsProcessTrusted())
+
+
 class AppleVisionReader:
     """Apple's built-in OCR, as a reader for the text layer. macOS only.
 
@@ -56,6 +123,9 @@ class AppleVisionReader:
     worked out from a line's character count. It needs Retina-scale frames: on
     low-resolution frames it misses most small text. Any Vision failure raises, so
     it counts as a failed scan.
+
+    Vision allows one read at a time per process, however many threads ask. Reading
+    faster takes more processes: see eclipse/text_detect/read_ahead.py.
     """
 
     FAST = 1  # VNRequestTextRecognitionLevelFast
@@ -66,38 +136,48 @@ class AppleVisionReader:
 
     def __call__(self, image) -> tuple[list, None]:
         import cv2
+
+        return self.read_bgra(cv2.cvtColor(image, cv2.COLOR_BGR2BGRA))
+
+    def read_bgra(self, pixels) -> tuple[list, None]:
+        """Read a BGRA image. A pixel buffer reads a full frame in 58 ms, a CGImage in 88."""
+        import numpy as np
         import objc
         import Quartz
         import Vision
-        from Foundation import NSData
+        from Foundation import NSArray, NSString
 
-        height, width = image.shape[:2]
+        height, width = pixels.shape[:2]
         with objc.autorelease_pool():
-            # Hand Vision the pixels directly. Encoding a Retina frame costs 17 ms.
-            pixels = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
-            data = NSData.dataWithBytes_length_(pixels.tobytes(), pixels.size)
-            picture = Quartz.CGImageCreate(
-                width,
-                height,
-                8,
-                32,
-                width * 4,
-                Quartz.CGColorSpaceCreateDeviceRGB(),
-                Quartz.kCGBitmapByteOrder32Little | Quartz.kCGImageAlphaNoneSkipFirst,
-                Quartz.CGDataProviderCreateWithCFData(data),
-                None,
-                False,
-                Quartz.kCGRenderingIntentDefault,
+            status, buffer = Quartz.CVPixelBufferCreate(
+                None, width, height, Quartz.kCVPixelFormatType_32BGRA, None, None
             )
-            if picture is None:
+            if status != 0:
                 raise RuntimeError("Apple OCR couldn't read the frame")
+            Quartz.CVPixelBufferLockBaseAddress(buffer, 0)
+            try:
+                stride = Quartz.CVPixelBufferGetBytesPerRow(buffer)
+                memory = Quartz.CVPixelBufferGetBaseAddress(buffer).as_buffer(stride * height)
+                target = np.ndarray((height, width, 4), np.uint8, memory, strides=(stride, 4, 1))
+                target[:] = pixels
+            finally:
+                Quartz.CVPixelBufferUnlockBaseAddress(buffer, 0)
             request = Vision.VNRecognizeTextRequest.alloc().init()
             request.setRecognitionLevel_(self.FAST)
             request.setUsesLanguageCorrection_(False)  # it would "fix" random keys
             request.setMinimumTextHeight_(0.0)  # the default skips small text
-            request.setRecognitionLanguages_(["en-US"])
-            handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(picture, None)
-            succeeded, error = handler.performRequests_error_([request], None)
+            # Nothing Python-backed may reach Vision, not even a str inside an NSArray. It
+            # releases these on its own queues, and doing that while the interpreter shuts
+            # down crashes the process, including at the end of a normal run.
+            request.setRecognitionLanguages_(
+                NSArray.arrayWithObject_(NSString.stringWithString_("en-US"))
+            )
+            handler = Vision.VNImageRequestHandler.alloc().initWithCVPixelBuffer_options_(
+                buffer, None
+            )
+            succeeded, error = handler.performRequests_error_(
+                NSArray.arrayWithObject_(request), None
+            )
             if not succeeded or error is not None:
                 raise RuntimeError("Apple OCR failed")
 

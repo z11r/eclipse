@@ -55,6 +55,28 @@ def test_fit_adds_black_bars_instead_of_stretching():
     assert tuple(output[540, 960]) == (200, 200, 200)
 
 
+def test_fit_stays_cheap_when_opencv_has_only_one_thread():
+    # A resize that needs OpenCV's thread pool misses output ticks whenever another
+    # thread is using it, so its cost on one thread is the one that counts.
+    import time
+
+    import cv2
+
+    image = np.full((1964, 3024, 3), 90, dtype=np.uint8)
+    image[::3] = 220
+    threads = cv2.getNumThreads()
+    cv2.setNumThreads(1)
+    try:
+        times = []
+        for _ in range(5):
+            started = time.perf_counter()
+            fit(image, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+            times.append(time.perf_counter() - started)
+    finally:
+        cv2.setNumThreads(threads)
+    assert min(times) < 0.016
+
+
 def test_pattern_frames_follow_the_contract():
     source = TestPattern(width=320, height=240)
     first, second = source.read(), source.read()
@@ -84,7 +106,10 @@ def test_real_screen_always_goes_through_the_text_layer(monkeypatch):
         return detect
 
     monkeypatch.setattr(app, "screen_capture_allowed", lambda: True)
-    monkeypatch.setattr(app, "ScreenCapture", lambda max_width, retina: TestPattern(320, 240))
+    monkeypatch.setattr(app, "screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(
+        app, "ScreenCapture", lambda max_width, retina, first_id=0: TestPattern(320, 240)
+    )
     monkeypatch.setattr(app, "TextDetector", detector)
     monkeypatch.setattr(app, "VirtualCam", FakeSink)
     assert app.main(["--max-frames", "3", "--delay", "0.05"]) == 0
@@ -163,7 +188,7 @@ def test_apple_mode_scans_retina_frames_with_doubled_distances(monkeypatch):
             captured["padding"] = padding
             super().__init__(padding)
 
-    def screen(max_width, retina):
+    def screen(max_width, retina, first_id=0):
         captured.update(max_width=max_width, retina=retina)
         return TestPattern(320, 240)
 
@@ -172,12 +197,16 @@ def test_apple_mode_scans_retina_frames_with_doubled_distances(monkeypatch):
         return lambda frame: []
 
     monkeypatch.setattr(app, "screen_capture_allowed", lambda: True)
+    monkeypatch.setattr(app, "screen_capture_kit_available", lambda: False)
     monkeypatch.setattr(app, "ScreenCapture", screen)
     monkeypatch.setattr(app, "TextDetector", text_detector)
     monkeypatch.setattr(app, "AppleVisionReader", lambda: "apple reader")
     monkeypatch.setattr(app, "Compositor", RecordingCompositor)
     monkeypatch.setattr(app, "VirtualCam", FakeSink)
-    assert app.main(["--ocr", "apple", "--max-frames", "2", "--delay", "0.05"]) == 0
+    assert (
+        app.main(["--ocr", "apple", "--ocr-workers", "0", "--max-frames", "2", "--delay", "0.05"])
+        == 0
+    )
     assert captured["retina"] is True
     assert captured["max_width"] > 3024
     assert captured["padding"] == app.PADDING * 2
@@ -192,7 +221,10 @@ def test_rapid_is_still_the_default(monkeypatch):
         return lambda frame: []
 
     monkeypatch.setattr(app, "screen_capture_allowed", lambda: True)
-    monkeypatch.setattr(app, "ScreenCapture", lambda max_width, retina: TestPattern(320, 240))
+    monkeypatch.setattr(app, "screen_capture_kit_available", lambda: False)
+    monkeypatch.setattr(
+        app, "ScreenCapture", lambda max_width, retina, first_id=0: TestPattern(320, 240)
+    )
     monkeypatch.setattr(app, "TextDetector", text_detector)
     monkeypatch.setattr(app, "VirtualCam", FakeSink)
     assert app.main(["--max-frames", "2", "--delay", "0.05"]) == 0

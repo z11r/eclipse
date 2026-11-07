@@ -58,3 +58,26 @@ class Detection:
     confidence: float  # 0 to 1
     ttl_ms: int  # how long the blur holds after the clue was last seen
     frame_id: int  # the frame this box was found in
+
+
+# scanned: OCR read this frame. cached: nothing needed reading, so earlier reads were
+# reused. held: this frame's scan failed, so an older safe image stayed up. blackout:
+# there was nothing safe to show.
+OutputState = Literal["scanned", "cached", "held", "blackout"]
+
+
+@dataclass(frozen=True, eq=False)
+class Rendered:
+    """One image ready for output, and what it really shows.
+
+    Internal to the compositor, the delay buffer and the eval. A held image keeps the
+    identity of the frame it came from, so what it shows can always be traced. Like a
+    Detection, this must never carry screen text.
+    """
+
+    image: np.ndarray  # BGR, uint8, shape (height, width, 3)
+    state: OutputState
+    source: Source | None  # where the pixels came from; None for a blackout
+    source_frame_id: int  # the frame the pixels came from; -1 for a blackout
+    ts: float  # when those pixels were captured, on the clock of Frame.ts
+    generation: int = 0  # the policy they were checked under

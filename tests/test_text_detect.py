@@ -157,8 +157,20 @@ def test_secret_that_leaves_the_screen_is_dropped():
     image = page()
     assert boxes(detect, image)
     reader.lines = []
-    image[310, 100] = 255
+    image[300:320, 20:180] = np.flip(image[300:320, 20:180], axis=1)  # its pixels are gone
+    assert boxes(detect, image)  # one clean read isn't proof
     assert boxes(detect, image) == set()
+
+
+def test_one_changed_pixel_does_not_end_a_cover_when_ocr_misses_it():
+    reader = PageReader([("demo@example.com", 20, 300, 180, 320)])
+    detect = TextDetector(reader=reader)
+    image = page()
+    first = boxes(detect, image)
+    reader.lines = []
+    image[310, 100] = 255  # a blinking cursor, say, not new text
+    assert boxes(detect, image) == first
+    assert boxes(detect, image) == first
 
 
 def test_new_secret_on_a_changed_row_is_found():
@@ -474,6 +486,18 @@ def covered_text(text, keywords=()):
     first = (box.x - 100) // 10
     last = (box.x + box.w - 100 + 9) // 10
     return text[max(first, 0) : last], box.category
+
+
+def test_a_match_inside_a_word_covers_the_whole_word():
+    covered, category = covered_text("see <demo@example.com>. for details about the plan")
+    assert category == "email"
+    assert "<demo@example.com>." in covered
+
+
+def test_a_one_word_region_is_covered_edge_to_edge():
+    reader = PageReader([("(demo@example.com)", 100, 100, 280, 120)])
+    (x, _, w, _, _), = boxes(TextDetector(reader=reader), page(width=700))
+    assert (x, x + w) == (100, 280)
 
 
 def test_cover_lands_on_a_full_width_secret():

@@ -16,8 +16,8 @@ def index():
 
 
 @router.get("/api/health", response_model=HealthResponse)
-def health():
-    return HealthResponse()
+def health(request: Request):
+    return HealthResponse(pipeline_mode=request.app.state.controller.pipeline_mode)
 
 
 @router.get("/api/state", response_model=PanelState)
