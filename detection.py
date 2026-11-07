@@ -129,6 +129,26 @@ class Detector:
             self._previous = None
             self._boxes = ()
 
+
+    def find_changed_area(self, current, previous):
+        """Work in progress: not used by detect() yet."""
+        import numpy as np
+
+        # First image or different image size: scan everything.
+        if previous is None or current.shape != previous.shape:
+            height, width = current.shape[:2]
+            return (0, 0, width, height)
+
+        # Compare current and previous pixels.
+        changed = np.any(current != previous, axis=2)
+
+        if not np.any(changed):
+            return None
+
+        # TODO: Find the left, top, right, and bottom of the changes.
+        # TODO: Return (x, y, width, height).
+        raise NotImplementedError('Changed-area calculation is not finished yet.')
+
     def detect(self, frame) -> list[Box]:
         try:
             import numpy as np
@@ -149,7 +169,6 @@ class Detector:
 
                 if self._previous is not None and np.array_equal(snapshot, self._previous):
                     return list(self._boxes)
-
 
                 if self._reader is None:
                     from rapidocr_onnxruntime import RapidOCR
