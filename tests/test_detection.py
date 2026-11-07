@@ -35,6 +35,40 @@ class DetectionTests(unittest.TestCase):
         self.assertFalse(luhn_valid('4111111111111112'))
         self.assertFalse(luhn_valid('0000000000000000'))
 
+    def test_keyword_spacing(self):
+        for text in (
+            'Welcome to Demo Maple Avenue',
+            'WelcometoDemo MapleAvenue',
+            'DEMOmapleAVENUE',
+            'Demo   Maple\tAvenue',
+        ):
+            with self.subTest(text=text):
+                self.assertIn('keyword', classify_text(text, ['Demo Maple Avenue']))
+
+        self.assertNotIn('keyword', classify_text('hello world', ['', '   ', '\t']))
+        self.assertNotIn('keyword', classify_text('Demo Oak Avenue', ['Demo Maple Avenue']))
+
+    def test_fullwidth_text(self):
+        for text, category in (
+            ('+1\uff08780\uff09 555-0123', 'phone'),
+            ('\uff11\uff12\uff13\uff14\uff15\uff16', '2fa'),
+            ('demo\uff20example\uff0ecom', 'email'),
+        ):
+            with self.subTest(category=category):
+                self.assertIn(category, classify_text(text))
+
+        self.assertIn('keyword', classify_text('Demo Maple Avenue', ['Demo\u3000Maple Avenue']))
+
+    def test_fullwidth_phone_with_only_phone_enabled(self):
+        detector = Detector(
+            enabled=['phone'],
+            reader=FakeReader([region('+1\uff08780\uff09 555-0123')]),
+        )
+        frame = np.full((80, 120, 3), 255, dtype=np.uint8)
+        boxes = detector.detect(frame)
+        self.assertEqual(boxes, [(10, 10, 90, 40, 'phone')])
+        self.assertTrue((apply_covers(frame, boxes)[20:40, 20:90] == 0).all())
+
     def test_padding_and_opaque_covers(self):
         frame = np.full((80, 120, 3), 255, dtype=np.uint8)
         boxes = Detector(reader=FakeReader([region('demo@example.com')])).detect(frame)
