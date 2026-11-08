@@ -35,6 +35,10 @@ _WHOLE_PIXEL = 0.05  # a shift this close to a whole number lands text on the sa
 _SCROLL_RECHECK = 30  # frames of fractional scrolling between reads of the whole view
 _UNREAD_READ_AT = 96  # rows of incoming text to collect before reading them
 _UNREAD_KEEP = 24  # rows left black after a read, as the last line may be cut off
+# With OCR workers reading every changed row ahead anyway, incoming rows are read on every
+# frame past the kept ones, so the black at the incoming edge stays one steady height
+# instead of growing and snapping back between reads.
+_UNREAD_READ_AT_AHEAD = _UNREAD_KEEP + 1
 _MOVE_MIN_HEIGHT = 60  # a changed area smaller than this isn't checked for a moved window
 _MOVE_MIN_WIDTH = 100
 _MOVE_COARSE = 4  # the shift is first estimated on frames this many times smaller
@@ -396,7 +400,10 @@ class Detector:
         self._scroll_min_width = _SCROLL_MIN_WIDTH * pixel_scale
         self._scroll_max_shift = _SCROLL_MAX_SHIFT * pixel_scale
         self._scroll_edge = _SCROLL_EDGE * pixel_scale
-        self._unread_read_at = _UNREAD_READ_AT * pixel_scale
+        reads_ahead = hasattr(reader, 'prepare')  # see read_ahead.py
+        self._unread_read_at = (
+            _UNREAD_READ_AT_AHEAD if reads_ahead else _UNREAD_READ_AT
+        ) * pixel_scale
         self._unread_keep = _UNREAD_KEEP * pixel_scale
         self._move_min_height = _MOVE_MIN_HEIGHT * pixel_scale
         self._move_min_width = _MOVE_MIN_WIDTH * pixel_scale
@@ -485,6 +492,111 @@ class Detector:
         return REREAD
 
     def _follow_scroll(self, image, changed):
+        """Follow a scroll, even with other things changing elsewhere on the screen.
+
+        The scroll is first looked for across everything that changed. Other changes, such
+        as a live OBS preview beside the scrolling window, make that whole area fail the
+        clean-scroll test, so then the columns that did scroll are found and tried alone.
+        Everything outside them still counts as changed.
+        """
+        remaining = self._follow_scroll_in(image, changed)
+        if self._scrolled:
+            return remaining
+        columns = self._scroll_columns(image, changed)
+        if columns is None:
+            return changed
+        left, right = columns
+        part = np.zeros_like(changed)
+        part[:, left:right] = changed[:, left:right]
+        remaining = self._follow_scroll_in(image, part)
+        if not self._scrolled:
+            return changed
+        remaining[:, :left] |= changed[:, :left]
+        remaining[:, right:] |= changed[:, right:]
+        return remaining
+
+    def _scroll_columns(self, image, changed):
+        """Left and right of the widest run of columns that scrolled vertically, or None.
+
+        Proposes only: the scroll found there must still pass every check of a clean
+        scroll before anything moves.
+        """
+        rows = np.flatnonzero(changed.any(axis=1))
+        columns = np.flatnonzero(changed.any(axis=0))
+        if not rows.size:
+            return None
+        top, bottom = int(rows[0]), int(rows[-1]) + 1
+        left, right = int(columns[0]), int(columns[-1]) + 1
+        if bottom - top < self._scroll_min_height or right - left < self._scroll_min_width:
+            return None
+        now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        mask = changed[top:bottom, left:right]
+        # Each stripe of columns proposes its own shift from its row profiles, as a whole
+        # scroll is found, so a pane that scrolled can win its stripes even while something
+        # beside it moves another way.
+        guesses = {}
+        stripe = self._scroll_min_width * 2
+        height = bottom - top
+        limit = min(self._scroll_max_shift, height // 2)
+        for start in range(0, right - left, stripe):
+            part = slice(start, min(start + stripe, right - left))
+            if part.stop - part.start < self._scroll_min_width // 2 or not mask[:, part].any():
+                continue
+            differences = _shift_differences(
+                _row_means(now[:, part]), _row_means(before[:, part]), limit
+            )
+            shift = min(
+                (s for s in range(-limit, limit + 1) if s), key=lambda s: differences[s + limit]
+            )
+            if differences[shift + limit] < differences[limit]:
+                guesses[shift] = guesses.get(shift, 0) + part.stop - part.start
+        if not guesses:
+            return None  # nothing moved vertically
+
+        textured = _texture(now) & mask
+        now_soft, before_soft = cv2.blur(now, (3, 3)), cv2.blur(before, (3, 3))
+        best = None
+        guess = max(guesses, key=guesses.get)
+        for shift in range(guess - 1, guess + 2):  # the profile shift can be off by a fraction
+            if shift == 0 or abs(shift) >= height:
+                continue
+            start, stop = max(shift, 0), height + min(shift, 0)
+            moved = textured[start:stop]
+            same = cv2.absdiff(now_soft[start:stop], before_soft[start - shift:stop - shift])
+            same = (same <= _SCROLL_TOLERANCE) & moved
+            score = int(same.sum())
+            if best is None or score > best[0]:
+                best = (score, moved.sum(axis=0), same.sum(axis=0))
+        if best is None or not best[0]:
+            return None
+        _, moved, same = best
+
+        block = self._scroll_edge * 2
+        good = []  # per block: True scrolled, False didn't, None nothing to tell by
+        for start in range(0, right - left, block):
+            have = int(moved[start:start + block].sum())
+            if have < block // 2:
+                good.append(None)
+            else:
+                good.append(bool(same[start:start + block].sum() >= (1 - _SCROLL_MAX_MISMATCH * 3) * have))
+        runs, run = [], None
+        for index, value in enumerate(good + [False]):
+            if value is False:
+                if run is not None:
+                    runs.append(run)
+                run = None
+            elif value is True:
+                run = (run[0] if run is not None else index, index + 1)
+        if not runs:
+            return None
+        first, last = max(runs, key=lambda r: r[1] - r[0])
+        run_left, run_right = left + first * block, min(left + last * block, right)
+        if run_right - run_left < self._scroll_min_width or (run_left, run_right) == (left, right):
+            return None
+        return run_left, run_right
+
+    def _follow_scroll_in(self, image, changed):
         """If the change is a clean vertical scroll, move known text along with it.
 
         The tolerant comparisons here only propose a shift, and never clear a pixel.
