@@ -56,16 +56,21 @@ class _Track:
     clear_reads: int = 0  # reads in a row that found nothing on changed pixels
     unsure: bool = False  # its pixels changed and nothing has explained why
     check_at: int | None = None  # frame to read this place again, if it needs it
+    followed: bool = False  # moved by a checked scroll or window move since it was last read
 
     @property
     def cover(self) -> Rect:
         return _union(self.reads)
 
-    def move(self, shift: float) -> None:
-        """Slide with a scroll. Never trimmed to the scrolling area, whose edges are only
-        an estimate: a bad one would cut a cover short for good."""
-        self.reads = [(x1, y1 + shift, x2, y2 + shift) for x1, y1, x2, y2 in self.reads]
-        self.pixels_at = self.pixels_at[0], self.pixels_at[1] + shift
+    def move(self, shift: float, sideways: int = 0) -> None:
+        """Slide with a scroll or a moved window. Never trimmed to the scrolling area, whose
+        edges are only an estimate: a bad one would cut a cover short for good."""
+        self.reads = [
+            (x1 + sideways, y1 + shift, x2 + sideways, y2 + shift)
+            for x1, y1, x2, y2 in self.reads
+        ]
+        self.pixels_at = self.pixels_at[0] + sideways, self.pixels_at[1] + shift
+        self.followed = True
 
     def touches(self, top: int, bottom: int) -> bool:
         return any(y1 < bottom and y2 > top for _, y1, _, y2 in self.reads)
@@ -105,7 +110,8 @@ def _moved(before: Rect, after: Rect, wobble: float) -> bool:
 
 class CoverTracks:
     """One detector's tracks. The detector calls these once a frame, in this order:
-    due, then follow_scroll on a scroll, then update once the scan has finished."""
+    due, then follow_scroll on a scroll or follow_move on a moved window, then update
+    once the scan has finished."""
 
     def __init__(self, pixel_scale: int = 1) -> None:
         self._wobble = _WOBBLE * pixel_scale
@@ -153,6 +159,21 @@ class CoverTracks:
         self._tracks = kept
         return unsure
 
+    def follow_move(
+        self, action: Callable[[Rect], str], dx: int, dy: int
+    ) -> list[Rect]:
+        """Move tracks with a window that moved whole. Returns places that must be read
+        again: covers whose new place doesn't show exactly the pixels they had."""
+        unsure = []
+        for track in self._tracks:
+            todo = action(track.cover)
+            if todo == MOVE:
+                track.move(dy, dx)
+            elif todo == REREAD:
+                track.unsure = True
+                unsure.append(track.cover)
+        return unsure
+
     def update(
         self, image: np.ndarray, sightings: list[Sighting], read: list[tuple[int, int, int, int]]
     ) -> None:
@@ -192,7 +213,10 @@ class CoverTracks:
         found = []
         for track in self._tracks:
             left, top, right, bottom = track.cover
-            margin = self._margin if track.unsure else 0
+            # The margin is for not knowing where changed text went. A cover that moved
+            # with a checked scroll or window move is where its text went, so a margin
+            # would only flash black around it, typically as it slides under an edge.
+            margin = self._margin if track.unsure and not track.followed else 0
             found.append(
                 (track.category, (left - margin, top - margin, right + margin, bottom + margin))
             )
@@ -233,6 +257,7 @@ class CoverTracks:
         track.clear_reads = 0
         track.unsure = False
         track.check_at = None
+        track.followed = False
 
     def _still_needed(
         self, track: _Track, image: np.ndarray, read: list[tuple[int, int, int, int]]

@@ -33,6 +33,7 @@ Every frame is scanned by the text layer and drawn by the compositor before the 
 
 1. It finds the rows that changed and reads only those. Past 60% of the screen, it reads the whole frame.
 2. When an area scrolls vertically, it moves the text it already knows instead of reading it again. Rows scrolling into view stay black until they've been read.
+   When a window is dragged in any direction, it finds the shift that makes the window's pixels match the previous frame exactly and moves known text and covers by it. Text moves only if every pixel of its new place matches. Anything else, and every pixel the shift doesn't explain, is read again. A cover moved this way gets no extra margin while it waits for a read, so it doesn't swell as text slides under another window's edge.
 3. It runs the rules on what it read: email, phone, 2FA code, API key, card number (with a Luhn check) and the user's keywords. Every rule is a regex in `detection.py`.
 4. `covers.py` keeps one cover on each secret from its first sighting until it is really gone: its pixels changed and a new read found nothing there, it left the screen, or the same text turned up somewhere else. Time alone never ends a cover. Covers keep a hash of the text, never the text.
 
@@ -68,6 +69,7 @@ Eclipse reduces risk. It doesn't guarantee that nothing leaks.
 | `python -m eval.stress_60` | Hard screen activity at 60 fps through real Apple OCR, counting leaked pixels directly |
 | `python -m eval.sustained_motion --seconds 60` | The whole pipeline over time, with failed reads, panic and resume, and new keywords. Uses fake OCR. |
 | `python -m eval.scroll_compare` | How covers behave during a scripted scroll |
+| `python -m eval.motion_flicker` | Window drags and scrolls through real Apple OCR: secret pixels left showing, and how much cover shapes change around their text from frame to frame |
 | `python -m eval.capture_bench` | Capture speed alone, per backend |
 | `python -m eval.obs_path send`, then `verify` | Which frames really reach an OBS recording. `--plan` runs output paths back to back in one recording. |
 
