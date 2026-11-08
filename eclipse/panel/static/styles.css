@@ -74,6 +74,8 @@ a {
 .sidebar {
     width: 253px;
     flex-shrink: 0;
+    margin-top: 5px;
+    margin-left: 5px;
     position: sticky;
     top: 0;
     height: 100vh;
@@ -81,7 +83,8 @@ a {
     flex-direction: column;
     padding: 31px 17px 22px;
     background: linear-gradient(165deg, #16141c, #100f15 70%);
-    border-right: 1px solid #302a37
+    border-right: 1px solid #302a37;
+    border: 0.5px solid rgb(144, 144, 144);
 }
 
 .brand {
@@ -208,7 +211,7 @@ a {
     padding: 15px 17px;
 
     border-radius: 13px;
-    border: 1px solid rgba(220, 200, 241, 0.18);
+    border: 1px solid rgba(200, 211, 241, 0.18);
 
     color: #b5adb8;
     font-size: 12px;
@@ -262,13 +265,13 @@ a {
         ),
         radial-gradient(
             ellipse at 0% 100%,
-            rgba(77, 77, 154, 0.42),
+            rgba(38, 63, 91, 0.42),
             transparent 67%
         ),
         linear-gradient(
             120deg,
-            rgba(20, 23, 28, 0.9),
-            rgba(28, 33, 35, 0.65)
+            rgba(11, 18, 29, 0.9),
+            rgba(33, 46, 59, 0.85)
         );
 
     opacity: 0;
@@ -315,6 +318,7 @@ a {
     color: #ffffff;
 
     border-color: rgba(51, 79, 149, 0.52);
+    
 
     box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, 0.11),
@@ -324,12 +328,12 @@ a {
 
 .nav-item:hover::before,
 .nav-item.active::before {
-    opacity: 1;
+    opacity: 0.8;
 }
 
 .nav-item:hover::after,
 .nav-item.active::after {
-    opacity: 1;
+    opacity: 0.8;
 }
 
 
