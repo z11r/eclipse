@@ -7,7 +7,7 @@ const path = require('node:path');
 // Execute the real frontend with a minimal DOM and controlled network timing.
 function panel() {
   const elements = new Map();
-  const element = () => ({disabled:false, classList:{toggle(){},add(){}},
+  const element = () => ({disabled:false, classList:{toggle(){},add(){}}, style:{setProperty(){}},
     append(){},replaceChildren(){},setAttribute(){},addEventListener(){}});
   const calls = [];
   const state = {panic:false, simulated:false, output_state:'protected',
