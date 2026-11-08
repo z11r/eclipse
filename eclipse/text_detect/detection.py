@@ -82,6 +82,10 @@ _KEYS = [
     re.compile(r'-{2,}\s*BEGIN [A-Z ]*PRIVATE KEY'),
     re.compile(r'(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{60,}={0,2}(?![A-Za-z0-9+/])'),
 ]
+# Unlike structured key formats, this broad token heuristic needs original
+# OCR word boundaries; concatenating prose can manufacture a match.
+_GENERIC_KEY = _KEYS[-1]
+
 # Characters OCR tends to swap, for matching keywords.
 _LOOKALIKES = {
     '0': 'o', 'o': '0', '1': 'il|', 'i': '1l|', 'l': '1i|',
@@ -144,7 +148,7 @@ def _standard_characters(text: str) -> tuple[str, list[int] | None]:
     return ''.join(converted), origins
 
 
-def _match_text(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
+def _match_text(text: str, keywords: Iterable[str] = (), allow_generic_key: bool = True) -> list[tuple[str, int, int]]:
     """Return (category, start, end) for each sensitive part of the text."""
     text, origins = _standard_characters(text)
     matches = []
@@ -170,6 +174,10 @@ def _match_text(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int,
         add('2fa', _CODE)
 
     for pattern in _KEYS:
+        # Removing spaces between OCR words must not manufacture a long token
+        # from ordinary prose. Structured key patterns still run on joined text.
+        if pattern is _GENERIC_KEY and not allow_generic_key:
+            continue
         add('api_key', pattern)
 
     for match in _CARD.finditer(text):
@@ -184,18 +192,18 @@ def _match_text(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int,
 
 
 @functools.lru_cache(maxsize=16384)
-def _remembered_matches(text: str, keywords: tuple[str, ...]) -> tuple:
-    return tuple(_match_text(text, keywords))
+def _remembered_matches(text: str, keywords: tuple[str, ...], allow_generic_key: bool = True) -> tuple:
+    return tuple(_match_text(text, keywords, allow_generic_key))
 
 
-def find_matches(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
+def find_matches(text: str, keywords: Iterable[str] = (), *, allow_generic_key: bool = True) -> list[tuple[str, int, int]]:
     """Return (category, start, end) for each sensitive part of the text.
 
     Answers are remembered. A frame re-checks every word on screen, nearly all of them
     unchanged, and checking them afresh took 2 ms a frame. The answer depends only on
     the text and the keywords, so a remembered one is always the same answer.
     """
-    return list(_remembered_matches(text, tuple(keywords)))
+    return list(_remembered_matches(text, tuple(keywords), allow_generic_key))
 
 
 def _row_means(gray) -> np.ndarray:
@@ -769,7 +777,9 @@ class Detector:
             for separator in (' ', ''):
                 joined = separator.join(part[4] for part in group)
 
-                for category, start, end in find_matches(joined, self._keywords):
+                for category, start, end in find_matches(
+                    joined, self._keywords, allow_generic_key=bool(separator)
+                ):
                     position = 0
                     touched = []
 

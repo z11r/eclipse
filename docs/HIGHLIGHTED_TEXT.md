@@ -39,3 +39,14 @@ panic/resume. Do not use real private information in screenshots or test logs.
 The macOS-only styled email tests exercise native Vision, rules, and cover
 placement. Non-macOS tests check region selection, contrast, geometry, retention
 of fast results, and propagation of retry failures; they do not prove OCR accuracy.
+
+## Ordinary text regression
+
+OCR word groups are also tried with spaces removed to recover split secrets.
+That synthetic no-space form no longer runs the broad 60-character generic
+API-key heuristic: it could classify a normal sentence as one long token.
+The heuristic still runs on original OCR observations and space-preserving
+groups. Structured key formats and split emails still run on both forms.
+This intentionally trades detection of an unlabelled generic token split across
+multiple OCR words for fewer prose false positives; known key formats remain
+covered. Restart Eclipse after updating to clear previously retained covers.

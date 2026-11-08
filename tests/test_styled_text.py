@@ -71,3 +71,39 @@ def test_failed_retry_is_not_reported_as_successful_empty_scan():
 
     with pytest.raises(RuntimeError):
         Broken().read_bgra(styled_page('amber'))
+
+
+@pytest.mark.parametrize('duplicate', [False, True])
+def test_ordinary_prose_does_not_become_generic_key_when_ocr_words_join(duplicate):
+    from eclipse.text_detect.detection import Detector
+
+    sentence = 'A short electronic or SMS message sent from one mobile device or computer to another'
+    regions = []
+    left = 10
+    for text in sentence.split():
+        right = left + len(text) * 10
+        regions.append((left, 20, right, 40, text))
+        if duplicate:
+            regions.append((left+1, 21, right+1, 41, text))
+        left = right + 8
+    detector = Detector(reader=lambda image: ([], None))
+    assert not any(category == 'api_key' for category, _, _ in detector._find_areas(regions))
+
+
+def test_real_generic_key_in_one_observation_still_matches():
+    from eclipse.text_detect.detection import Detector
+
+    detector = Detector(reader=lambda image: ([], None))
+    token = 'Ab9x' * 20
+    assert any(category == 'api_key' for category, _, _ in
+               detector._find_areas([(10, 20, 800, 40, token)]))
+
+
+def test_split_structured_key_and_email_still_match():
+    from eclipse.text_detect.detection import Detector
+
+    detector = Detector(reader=lambda image: ([], None))
+    for pieces, expected in [(['sk-', 'a' * 24], 'api_key'),
+                             (['demo@', 'example.com'], 'email')]:
+        regions = [(10, 20, 90, 40, pieces[0]), (95, 20, 300, 40, pieces[1])]
+        assert any(category == expected for category, _, _ in detector._find_areas(regions))
