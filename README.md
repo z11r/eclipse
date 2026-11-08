@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/eclipse-banner.png" alt="Eclipse" width="100%">
+</p>
+
 # Eclipse
 
 Other tools catch your API key. Eclipse catches the things that let people find your house.
