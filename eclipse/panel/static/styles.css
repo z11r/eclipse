@@ -1656,3 +1656,19 @@ a:focus-visible {
 .log-health.bad {
     color: #f9a0a0;
 }
+.cover-look {
+    background: #0C202B;
+    border: 1px solid #4A5C6A;
+    color: #E6EEF0;
+    border-radius: 9px;
+    padding: 8px 10px;
+    font: inherit;
+    font-size: 13px;
+    outline: 0;
+    max-width: 50%;
+}
+
+.cover-look:focus {
+    border-color: #38BDF8;
+    box-shadow: 0 0 0 3px rgba(56, 189, 248, .15);
+}

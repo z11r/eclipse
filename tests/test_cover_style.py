@@ -7,7 +7,9 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from eclipse.compositor.compositor import BLACK, BLUR, Compositor
+from eclipse.compositor.compositor import BLACK, BLUR, BLUR_TEXT, Compositor
+
+BLURS = pytest.mark.parametrize("style", [BLUR, BLUR_TEXT])
 from eclipse.panel.app import create_app
 from eclipse.panel.controller import LivePipelineController, MockPipelineController
 from eclipse.panel.schemas import CoverConfig
@@ -24,10 +26,11 @@ def box(x=50, y=30, w=40, h=20, frame_id=0):
     return Detection(x, y, w, h, "api_key", 0.9, 500, frame_id)
 
 
-def test_blur_hides_the_same_area_and_leaves_the_rest_alone():
+@BLURS
+def test_blur_hides_the_same_area_and_leaves_the_rest_alone(style):
     frame = gradient_frame()
     black = Compositor(padding=0).process(frame, lambda f: [box()])
-    blurred = Compositor(padding=0, style=BLUR).process(frame, lambda f: [box()])
+    blurred = Compositor(padding=0, style=style).process(frame, lambda f: [box()])
     outside = np.ones(frame.image.shape[:2], bool)
     outside[30:50, 50:90] = False
     assert (blurred[outside] == frame.image[outside]).all()
@@ -35,27 +38,30 @@ def test_blur_hides_the_same_area_and_leaves_the_rest_alone():
     assert not (blurred[30:50, 50:90] == 0).all()  # it really is a different look
 
 
-def test_blur_carries_nothing_from_the_pixels_under_it():
+@BLURS
+def test_blur_carries_nothing_from_the_pixels_under_it(style):
     plain, secret = gradient_frame(), gradient_frame()
     rng = np.random.default_rng(1)
     secret.image[30:50, 50:90] = rng.integers(0, 255, (20, 40, 3), dtype=np.uint8)
-    one = Compositor(padding=0, style=BLUR).process(plain, lambda f: [box()])
-    other = Compositor(padding=0, style=BLUR).process(secret, lambda f: [box()])
+    one = Compositor(padding=0, style=style).process(plain, lambda f: [box()])
+    other = Compositor(padding=0, style=style).process(secret, lambda f: [box()])
     assert (one == other).all()
 
 
-def test_a_ring_that_crosses_another_cover_never_sees_its_secret():
+@BLURS
+def test_a_ring_that_crosses_another_cover_never_sees_its_secret(style):
     plain, secret = gradient_frame(), gradient_frame()
     secret.image[30:50, 92:120] = 255  # under the second cover, inside the first's ring
     covers = lambda f: [box(), box(x=92, w=28)]
-    one = Compositor(padding=0, style=BLUR).process(plain, covers)
-    other = Compositor(padding=0, style=BLUR).process(secret, covers)
+    one = Compositor(padding=0, style=style).process(plain, covers)
+    other = Compositor(padding=0, style=style).process(secret, covers)
     assert (one == other).all()
 
 
-def test_a_cover_over_the_whole_frame_is_black():
+@BLURS
+def test_a_cover_over_the_whole_frame_is_black(style):
     frame = gradient_frame()
-    output = Compositor(padding=0, style=BLUR).process(frame, lambda f: [box(0, 0, 200, 100)])
+    output = Compositor(padding=0, style=style).process(frame, lambda f: [box(0, 0, 200, 100)])
     assert (output == 0).all()
 
 
@@ -102,18 +108,25 @@ def test_live_controller_changes_the_compositor_it_was_given(tmp_path, monkeypat
         _live(None).set_cover(CoverConfig(style=BLUR))
 
 
-def test_blur_looks_like_blurred_text_even_on_a_plain_background():
+@BLURS
+def test_blur_looks_like_blurred_text_even_on_a_plain_background(style):
     image = np.full((100, 200, 3), 30, np.uint8)  # one flat dark colour around the cover
     frame = Frame(image, 0.0, "screen", 0)
-    output = Compositor(padding=0, style=BLUR).process(frame, lambda f: [box()])
+    output = Compositor(padding=0, style=style).process(frame, lambda f: [box()])
     region = output[30:50, 50:90].astype(int)
     assert region.max() - region.min() > 40  # visible smudges, not just the background
     assert (np.abs(region - 30) > 20).any()
 
 
-def test_blurred_words_stay_put_while_the_cover_moves():
+@BLURS
+def test_blurred_words_stay_put_while_the_cover_moves(style):
     image = np.full((100, 200, 3), 30, np.uint8)
     frame = Frame(image, 0.0, "screen", 0)
-    here = Compositor(padding=0, style=BLUR).process(frame, lambda f: [box(x=50)])
-    there = Compositor(padding=0, style=BLUR).process(frame, lambda f: [box(x=110)])
+    here = Compositor(padding=0, style=style).process(frame, lambda f: [box(x=50)])
+    there = Compositor(padding=0, style=style).process(frame, lambda f: [box(x=110)])
     assert (here[30:50, 50:90] == there[30:50, 110:150]).all()
+
+
+def test_every_blur_look_is_a_style_the_panel_accepts():
+    for style in (BLUR, BLUR_TEXT):
+        assert CoverConfig(style=style).style == style

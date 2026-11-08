@@ -395,8 +395,8 @@ def main(argv: list[str] | None = None) -> int:
         "--cover",
         choices=STYLES,
         default="black",
-        help="how covers look: solid black, or blurred from the colours around them. "
-        "Both hide the same areas. Switch live from the panel",
+        help="how covers look: solid black, or blurred with word shapes or scrambled "
+        "characters under the blur. All hide the same areas. Switch live from the panel",
     )
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--delay", type=float, default=1.0, help="seconds behind live")
