@@ -450,11 +450,19 @@ def test_incoming_rows_stay_on_the_pane_when_something_beside_it_changes_too():
     rng = np.random.default_rng(3)
     last = np.full((700, 1100, 3), 90, np.uint8)
 
+    # Lines of word-like blocks across most of the pane, as text is.
+    page = np.full((lines[-1][1] + 540, 600, 3), 40, np.uint8)
+    for index, (_, top) in enumerate(lines):
+        length = 300 + index * 37 % 240
+        for x in range(20, 20 + length, 34 + index % 3 * 4):
+            page[top + 2:top + 16, x:x + 28 + index % 4] = 230 - index % 5 * 10
+
     def screen(offset):
         nonlocal last
         image = np.full((700, 1100, 3), 90, np.uint8)
-        image[:500] = scrolling_page(lines, offset, height=500, width=1100)
-        image[40:300, 760:1060] = cv2.resize(last, (300, 260), interpolation=cv2.INTER_AREA)
+        image[:500, 40:640] = page[offset:offset + 500]
+        # Smaller than the pane, as OBS's preview usually is beside a note.
+        image[40:160, 860:1010] = cv2.resize(last, (150, 120), interpolation=cv2.INTER_AREA)
         image[400:680, 700:720] = 60
         image[int(rng.integers(420, 680)):680, 700:720] = 200  # the meter
         last = image
@@ -470,7 +478,12 @@ def test_incoming_rows_stay_on_the_pane_when_something_beside_it_changes_too():
     assert bars
     assert all(bar.y >= 480 and bar.y + bar.h <= 500 for bar in bars)
     assert all(bar.x + bar.w <= 640 + 16 for bar in bars)
-    assert uncovered_ink(image, bars, 488, 500, 40, 640) == 0
+    ink = (image[488:500, 40:640] != 40).any(axis=2)
+    covered = np.zeros_like(ink)
+    for bar in bars:
+        rows = slice(max(bar.y - 488, 0), max(bar.y + bar.h - 488, 0))
+        covered[rows, max(bar.x - 40, 0):max(bar.x + bar.w - 40, 0)] = True
+    assert not (ink & ~covered).any()
 
 
 def test_scrolling_reads_incoming_rows_only_once_a_whole_line_has_come_in():

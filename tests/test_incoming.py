@@ -33,9 +33,10 @@ def first_frame(incoming, top=180):
 
 
 def black_rows(boxes):
+    """Rows not cleared: still unread, or shown as the last checked picture had them."""
     rows = set()
     for x, y, w, h, category in boxes:
-        if category == 'unread':
+        if category in ('unread', 'held'):
             rows.update(range(y, y + h))
     return rows
 
@@ -187,26 +188,27 @@ def test_rows_with_uncovered_text_that_looks_like_a_secret_stay_black():
     assert black_rows(incoming.settled(0)) == set(range(190, 198))
 
 
-def test_black_rows_cover_only_what_the_strip_showed():
+def test_rows_not_cleared_cover_only_what_the_strip_showed():
     incoming = IncomingRows(LINE)
     box, edge, inward = strip(180, HEIGHT)
     ink = [(30, 184, 100, 10), (200, 190, 50, 6)]  # two words; the rest was background
     incoming.record(0, [box], [(box, edge, inward, ink)], None, None, SIZE)
     incoming.record(1, [box], [(box, edge, inward, ink)], None, None, SIZE)  # still unread
     covers = incoming.settled(0)
-    assert sorted(covers) == sorted([(*rect, 'unread') for rect in ink])
+    assert sorted(covers) == sorted([(*rect, 'held') for rect in ink])
 
 
-def test_rows_no_later_frame_clears_hold_the_pane_instead_of_going_black():
+def test_rows_no_later_frame_clears_show_the_last_picture_there_not_black():
+    """Only those rows, where the strip showed something: the rest of the pane moves on."""
     incoming = IncomingRows(LINE)
     box, edge, inward = strip(180, HEIGHT)
+    ink = [(30, 184, 100, 10)]
     pane = (0, 0, WIDTH, HEIGHT)
-    incoming.record(0, [box], [(box, edge, inward, [box[:4]])], None, None, SIZE, pane=pane)
+    incoming.record(0, [box], [(box, edge, inward, ink)], None, None, SIZE, pane=pane)
     # Up 20, but still unread: the next frame's strip runs from row 160.
     later, edge1, inward1 = strip(160, HEIGHT)
     strips = [(later, edge1, inward1, [later[:4]])]
     everything = np.ones((HEIGHT, WIDTH), bool)
     incoming.record(1, [later], strips, everything, scroll(-20), SIZE, pane=pane)
     settled = incoming.settled(0)
-    assert (0, 0, WIDTH, HEIGHT, 'held') in settled
-    assert not [b for b in settled if b[4] == 'unread']
+    assert sorted(settled) == [(30, 184, 100, 10, 'held')]

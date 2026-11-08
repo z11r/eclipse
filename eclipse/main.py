@@ -112,6 +112,7 @@ class StatsLog:
         change = {name: now[name] - before.get(name, 0) for name in now}
         stats = self._pipeline.stats
         present = _drain(stats.present_intervals)
+        scan_times = _drain(stats.detect_times)
         ages = _drain(stats.scan_ages)
         slack = _drain(stats.slack)
         # What really passed. A log line can run late, and a rate must not pretend it didn't.
@@ -183,9 +184,31 @@ class StatsLog:
             f"capture-ms read {ms('pipeline.grab_seconds', captured):.1f} "
             f"grab {ms('capture.grab_seconds', captured):.1f} "
             f"convert {ms('capture.convert_seconds', captured):.1f} | "
-            f"detect-ms total {detect_ms:.1f} copy {copy_ms:.1f} diff {diff_ms:.1f} "
+            f"detect-ms total {detect_ms:.1f} p95 {_percentile(scan_times, 0.95):.1f} "
+            f"max {max(scan_times, default=0):.1f} "
+            f"over-frame {sum(t > 1000 / 60 for t in scan_times)} "
+            f"copy {copy_ms:.1f} diff {diff_ms:.1f} "
             f"ocr {ocr_ms:.1f} rules {rules_ms:.1f} track {track_ms:.1f} "
             f"other {detect_ms - known_ms:.1f} | "
+            f"diff-parts areas {ms('detect.areas_seconds', scanned):.1f} "
+            f"scroll {ms('detect.scroll_seconds', scanned):.1f} "
+            f"narrow {ms('detect.narrow_seconds', scanned):.1f} "
+            f"move {ms('detect.move_seconds', scanned):.1f} "
+            f"ahead {ms('detect.ahead_seconds', scanned):.1f} "
+            f"cut-short {count('detect.follow_cut')} repeated {count('detect.moves_repeated')} of {count('detect.repeat_tries')} "
+            f"beside-others {count('detect.repeat_crowded')} missed {count('detect.repeat_missed')} "
+            f"upright {count('detect.repeat_upright')} "
+            f"miss-by inside {count('detect.miss_inside')} near {count('detect.miss_near')} "
+            f"far {count('detect.miss_far')} lost {count('detect.miss_lost')} "
+            f"estimate {ms('detect.estimate_seconds', scanned):.1f} "
+            f"columns {ms('detect.columns_seconds', scanned):.1f} "
+            f"pixels {ms('detect.pixels_seconds', scanned):.1f} "
+            f"grow {ms('detect.grow_seconds', scanned):.1f} | "
+            f"held-rows lost {count('detect.held_lost')} unread {count('detect.held_unread')} "
+            f"cut {count('detect.held_cut')} doubtful {count('detect.held_doubtful')} "
+            f"lost-by view {count('detect.lost_view')} "
+            f"unexplained {count('detect.lost_unexplained')} edge {count('detect.lost_edge')} "
+            f"still {count('detect.lost_still')} skipped-tries {count('detect.follow_skipped')} | "
             f"read-ahead jobs {count('read.jobs')} hits {count('read.hits')} "
             f"misses {count('read.misses')} failed {count('read.failed_reads')} "
             f"shed {count('read.shed')} cancelled {count('read.cancelled')} "
@@ -202,6 +225,11 @@ class StatsLog:
             f"ms/read {ms('detect.scan_seconds', reads):.0f} "
             f"lines/read {count('detect.lines') / max(reads, 1):.0f} "
             f"det {ms('detect.det_seconds', reads):.0f} rec {ms('detect.rec_seconds', reads):.0f} | "
+            f"accuracy uncertain {count('detect.uncertain')} "
+            f"doubtful {count('detect.doubtful_lines')} rescues {count('detect.rescues')} "
+            f"cached {count('detect.rescue_cached')} skipped {count('detect.rescue_skipped')} "
+            f"failed {count('detect.rescue_failed')} "
+            f"rescue-ms {ms('detect.rescue_seconds', count('detect.rescues')):.0f} | "
             f"{webcam}"
             f"busy capture {busy('capture.grab_seconds', 'capture.convert_seconds'):.0%} "
             f"scan {busy('pipeline.scan_seconds'):.0%} "
@@ -384,6 +412,12 @@ def main(argv: list[str] | None = None) -> int:
         default=4,
         help="processes reading Apple OCR ahead of the scan; 0 reads one area at a time",
     )
+    parser.add_argument(
+        "--rescue-reads",
+        action="store_true",
+        help="with --ocr apple, reread lines that name a secret but show no readable value "
+        "with Apple's accurate OCR, within a time budget. Off by default",
+    )
     parser.add_argument("--log", default="eclipse-run.log", help="file for live stats")
     parser.add_argument(
         "--no-output", action="store_true", help="measure every stage but send frames nowhere"
@@ -440,7 +474,9 @@ def main(argv: list[str] | None = None) -> int:
                     reader = read_ahead = ReadAhead(OcrPool(args.ocr_workers))
                 except ReadError:
                     print("OCR workers didn't start, so reading one area at a time")
-            detect = TextDetector(reader=reader, pixel_scale=2)
+            # Careful rereads are opt-in, so the default detector is built exactly as before.
+            careful = {"rescue": AppleVisionReader(accurate=True)} if args.rescue_reads else {}
+            detect = TextDetector(reader=reader, pixel_scale=2, **careful)
             padding = PADDING * 2
         elif args.ocr == "windows":
             source = screen_source(args.capture, args.max_width, args.retina, args.fps)

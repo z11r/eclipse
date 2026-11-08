@@ -143,10 +143,13 @@ class AppleVisionReader:
     """
 
     FAST = 1  # VNRequestTextRecognitionLevelFast
+    ACCURATE = 0  # VNRequestTextRecognitionLevelAccurate: about 4 times slower per crop
 
-    def __init__(self) -> None:
+    def __init__(self, accurate: bool = False) -> None:
+        """accurate reads small and garbled text better, too slowly for whole frames."""
         if not IS_MAC:
             raise RuntimeError("Apple OCR needs macOS")
+        self._level = self.ACCURATE if accurate else self.FAST
 
     def __call__(self, image) -> tuple[list, None]:
         import cv2
@@ -177,7 +180,7 @@ class AppleVisionReader:
             finally:
                 Quartz.CVPixelBufferUnlockBaseAddress(buffer, 0)
             request = Vision.VNRecognizeTextRequest.alloc().init()
-            request.setRecognitionLevel_(self.FAST)
+            request.setRecognitionLevel_(self._level)
             request.setUsesLanguageCorrection_(False)  # it would "fix" random keys
             request.setMinimumTextHeight_(0.0)  # the default skips small text
             # Nothing Python-backed may reach Vision, not even a str inside an NSArray. It
