@@ -43,6 +43,8 @@ _MOVE_MIN_HEIGHT = 60  # a changed area smaller than this isn't checked for a mo
 _MOVE_MIN_WIDTH = 100
 _MOVE_COARSE = 4  # the shift is first estimated on frames this many times smaller
 _MOVE_SAMPLES = 4000  # textured pixels that vote on the exact shift
+_MOVE_SCREEN_SAMPLES = 500  # of those, how many first narrow the candidate shifts
+_MOVE_FINALISTS = 4  # candidate shifts that then get the full vote
 _MOVE_MIN_SHARE = 0.25  # share of changed textured pixels the shift must explain
 _TEXTURE = 40  # a pixel this far from its neighbours' range is part of text or an edge
 
@@ -352,8 +354,28 @@ def _shifted_match(image, before, dx: int, dy: int, area) -> np.ndarray:
     l, r = max(left, dx, 0), min(right, width + dx, width)
     if b > t and r > l:
         difference = cv2.absdiff(image[t:b, l:r], before[t - dy : b - dy, l - dx : r - dx])
-        match[t - top : b - top, l - left : r - left] = difference.max(axis=2) <= _NOISE_FLOOR
+        # Every channel within the floor, as one OpenCV pass: numpy's max over the
+        # channel axis took several milliseconds on a Retina screen.
+        floor = (_NOISE_FLOOR,) * 3
+        np.greater(
+            cv2.inRange(difference, (0, 0, 0), floor), 0,
+            out=match[t - top : b - top, l - left : r - left],
+        )
     return match
+
+
+def _shift_shares(image, before, ys, xs, now, shifts) -> np.ndarray:
+    """For each dx, dy in shifts, the share of the sampled pixels ys, xs that show exactly
+    what the previous frame showed dx, dy away. now holds image[ys, xs] as int16. Pixels
+    whose source is off the frame don't match."""
+    height, width = image.shape[:2]
+    shifts = np.asarray(shifts, dtype=np.intp).reshape(-1, 2)
+    from_y = ys[None, :] - shifts[:, 1:2]
+    from_x = xs[None, :] - shifts[:, 0:1]
+    inside = (from_y >= 0) & (from_y < height) & (from_x >= 0) & (from_x < width)
+    source = before[np.clip(from_y, 0, height - 1), np.clip(from_x, 0, width - 1)]
+    same = (np.abs(source.astype(np.int16) - now[None]).max(axis=2) <= _NOISE_FLOOR) & inside
+    return same.sum(axis=1) / ys.size
 
 
 def _text_hash(text: str) -> int:
@@ -721,24 +743,39 @@ class Detector:
         now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
         before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
         mask = changed[top:bottom, left:right]
+        mask8 = mask.view(np.uint8)
         size = (max((right - left) // _MOVE_COARSE, 8), max((bottom - top) // _MOVE_COARSE, 8))
-        small = []
+        # Blank unchanged pixels and shrink, then subtract each mean at the small size:
+        # shrinking averages, so this is the same as subtracting first. Both pictures and
+        # the changed mask shrink as floats in one three-channel call, about three times
+        # quicker than one call each. Floats matter: rounding to whole levels adds noise
+        # that phase correlation, which evens out every frequency, turns into another guess.
+        layers = [mask8.astype(np.float32)]
         for gray in (before, now):
-            values = np.where(mask, gray.astype(np.float32) - float(gray[mask].mean()), 0)
-            small.append(cv2.resize(values.astype(np.float32), size, interpolation=cv2.INTER_AREA))
+            layers.append(cv2.bitwise_and(gray, gray, mask=mask8).astype(np.float32))
+        coverage, *blanked = cv2.split(
+            cv2.resize(cv2.merge(layers), size, interpolation=cv2.INTER_AREA)
+        )
+        small = [
+            shrunk - np.float32(cv2.mean(gray, mask=mask8)[0]) * coverage
+            for shrunk, gray in zip(blanked, (before, now))
+        ]
         window = cv2.createHanningWindow(size, cv2.CV_32F)
         (sx, sy), _ = cv2.phaseCorrelate(small[0], small[1], window)
         guess = (round(sx * _MOVE_COARSE), round(sy * _MOVE_COARSE))
 
-        textured = _texture(now) & mask
-        ys, xs = np.nonzero(textured)
-        if ys.size < _MOVE_SAMPLES // 8:
+        textured = cv2.bitwise_and(_texture(now).view(np.uint8), mask8)
+        # In the same row-by-row order as np.nonzero, several times faster.
+        found = cv2.findNonZero(textured)
+        if found is None or len(found) < _MOVE_SAMPLES // 8:
             return None
+        found = found.reshape(-1, 2).astype(np.intp)  # x, y; some OpenCV builds add an axis
+        xs, ys = found[:, 0], found[:, 1]
         if ys.size > _MOVE_SAMPLES:
             pick = np.linspace(0, ys.size - 1, _MOVE_SAMPLES).astype(int)
             ys, xs = ys[pick], xs[pick]
         ys, xs = ys + top, xs + left
-        height, width = image.shape[:2]
+        now_pixels = image[ys, xs].astype(np.int16)
         candidates = {
             (guess[0] + ex, guess[1] + ey)
             for ex in range(-_MOVE_COARSE, _MOVE_COARSE + 1)
@@ -746,24 +783,23 @@ class Detector:
         }
         if self._last_move is not None:
             candidates.add(self._last_move)
-        best, best_share = None, 0.0
-        for dx, dy in candidates:
-            if (dx, dy) == (0, 0):
-                continue
-            sy_, sx_ = ys - dy, xs - dx
-            inside = (sy_ >= 0) & (sy_ < height) & (sx_ >= 0) & (sx_ < width)
-            if not inside.any():
-                continue
-            difference = np.abs(
-                image[ys[inside], xs[inside]].astype(np.int16)
-                - self._previous[sy_[inside], sx_[inside]].astype(np.int16)
-            ).max(axis=1)
-            share = float((difference <= _NOISE_FLOOR).sum()) / ys.size
-            if share > best_share:
-                best, best_share = (dx, dy), share
-        if best is None or best_share < _MOVE_MIN_SHARE:
+        candidates.discard((0, 0))
+        candidates = sorted(candidates)
+        # Every candidate first votes on a few evenly spread samples. The right shift
+        # matches nearly all of them, so only the leaders need the full vote.
+        step = max(ys.size // _MOVE_SCREEN_SAMPLES, 1)
+        screen = _shift_shares(
+            image, self._previous, ys[::step], xs[::step], now_pixels[::step], candidates
+        )
+        leaders = np.argsort(-screen, kind='stable')[:_MOVE_FINALISTS]
+        finalists = [candidates[i] for i in leaders if screen[i] > 0]
+        if not finalists:
             return None
-        return best
+        shares = _shift_shares(image, self._previous, ys, xs, now_pixels, finalists)
+        best = int(np.argmax(shares))
+        if shares[best] < _MOVE_MIN_SHARE:
+            return None
+        return finalists[best]
 
     def _follow_move(self, image, changed):
         """If a window moved whole, move known text and covers along with it.
@@ -793,17 +829,17 @@ class Detector:
             max(min(top, top + dy), 0), min(max(bottom, bottom + dy), height),
             max(min(left, left + dx), 0), min(max(right, right + dx), width),
         )
+        inside = np.s_[area[0]:area[1], area[2]:area[3]]
         match = np.zeros_like(changed)
-        match[area[0]:area[1], area[2]:area[3]] = _shifted_match(
-            image, self._previous, dx, dy, area
-        )
-        explained = changed & match
-        if not explained.any():
+        match[inside] = _shifted_match(image, self._previous, dx, dy, area)
+        # Nothing matches outside area, so only area needs combining with changed.
+        if not (changed[inside] & match[inside]).any():
             return changed
         self._last_move = shift
         self._moved = True
         self.stats['moves'] += 1
-        remaining = changed & ~match
+        remaining = changed.copy()
+        remaining[inside] &= ~match[inside]
 
         def action(rect) -> str:
             x1, y1, x2, y2 = rect[:4]
