@@ -23,15 +23,19 @@ class TextDetector:
         pixel_scale: int = 1,
         noise_floor: int = 0,
         ocr_threads: int = 6,
+        rescue=None,
     ) -> None:
         """noise_floor above 0 ignores sensor noise; use it for cameras, not screens.
 
         ocr_threads sizes the RapidOCR reader made when no reader is given. A second
         detector running beside the screen's should take fewer, so the two share the cores.
+
+        rescue is a slower, careful reader for the few lines the fast read leaves in doubt,
+        like a "password" label with no value read. None, the default, never rereads.
         """
         self._detector = Detector(
             keywords=keywords, reader=reader, pixel_scale=pixel_scale, noise_floor=noise_floor,
-            ocr_threads=ocr_threads,
+            ocr_threads=ocr_threads, rescue=rescue,
         )
         self._source = None
         self._read_ahead = reader if hasattr(reader, "prepare") else None

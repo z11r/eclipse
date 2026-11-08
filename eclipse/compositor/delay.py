@@ -135,6 +135,7 @@ class PipelineStats:
     scan_ages: deque = field(default_factory=_samples)  # ms from capture to scan start
     slack: deque = field(default_factory=_samples)  # ms left when safe; below 0 is late
     present_intervals: deque = field(default_factory=_samples)  # ms between new pictures
+    detect_times: deque = field(default_factory=_samples)  # ms each scan took
     rendered_scanned: int = 0  # results from an OCR read
     rendered_cached: int = 0  # results that reused earlier reads
     rendered_held: int = 0  # results that fell back on an older safe image
@@ -185,7 +186,9 @@ class _TimedDetector:
         try:
             found = self._detect(frame)
         finally:
-            self._stats.detect_seconds += time.monotonic() - started
+            spent = time.monotonic() - started
+            self._stats.detect_seconds += spent
+            self._stats.detect_times.append(spent * 1000)
         if self.on_found is not None:
             try:
                 self.on_found(frame, found)

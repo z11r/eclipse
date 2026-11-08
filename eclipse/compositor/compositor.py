@@ -111,9 +111,10 @@ class Compositor:
             # went out already, so nothing new can. With no such picture, black.
             last = self._last_safe
             usable = last is not None and last.image.shape == output.shape
+            pad = self._padding  # as much margin as a cover gets, for faint text edges
             for x, y, w, h in self._held:
-                top, left = max(y, 0), max(x, 0)
-                bottom, right = min(y + h, height), min(x + w, width)
+                top, left = max(y - pad, 0), max(x - pad, 0)
+                bottom, right = min(y + h + pad, height), min(x + w + pad, width)
                 output[top:bottom, left:right] = (
                     last.image[top:bottom, left:right] if usable else FILL
                 )
