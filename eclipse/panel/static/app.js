@@ -282,3 +282,14 @@ for (const link of document.querySelectorAll('.side-nav .nav-item')) {
     link.classList.add('active');
   });
 }
+
+function setActiveNav(clickedItem) {
+    document.querySelectorAll('.side-nav .nav-item')
+        .forEach(item => {
+            item.classList.remove('active');
+            item.removeAttribute('aria-current');
+        });
+
+    clickedItem.classList.add('active');
+    clickedItem.setAttribute('aria-current', 'location');
+}
