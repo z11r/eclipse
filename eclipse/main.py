@@ -49,6 +49,10 @@ WEBCAM_NOISE_FLOOR = 8
 # OCR threads for the camera when it runs beside the screen. Its reads are small, and
 # the screen's reader keeps its six, so together they still leave cores for OBS.
 WEBCAM_OCR_THREADS = 2
+# Seconds of the delay a scanned frame waits for later frames to read the rows scrolling
+# into it. Never more of the delay than the share, leaving the rest for slow scans.
+LOOK_AHEAD = 0.3
+LOOK_AHEAD_SHARE = 0.3
 
 
 class StatsLog:
@@ -167,7 +171,8 @@ class StatsLog:
             f"results read {count('pipeline.rendered_scanned')} "
             f"cached {count('pipeline.rendered_cached')} "
             f"held {count('pipeline.rendered_held')} "
-            f"blackout {count('pipeline.rendered_blackout')} | "
+            f"blackout {count('pipeline.rendered_blackout')} "
+            f"held-panes {count('pipeline.held_panes')} | "
             f"camera-sends {count('pipeline.sends')} black {count('pipeline.black_sends')} "
             f"new-pictures {count('pipeline.distinct_presented')} "
             f"protected-age-ms {age:.0f} frozen-max-ms {stats.max_frozen_seconds * 1000:.0f} | "
@@ -350,6 +355,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--delay", type=float, default=1.0, help="seconds behind live")
+    parser.add_argument(
+        "--look-ahead",
+        type=float,
+        default=None,
+        help="seconds of the delay each frame waits for later frames to read the rows "
+        f"scrolling into it, which then need no black strip; 0 turns it off. Default "
+        f"{LOOK_AHEAD} s, at most {LOOK_AHEAD_SHARE:.0%} of the delay",
+    )
     parser.add_argument("--max-width", type=int, default=1920)
     parser.add_argument("--retina", action="store_true", help="capture every Retina pixel")
     parser.add_argument(
@@ -453,8 +466,13 @@ def main(argv: list[str] | None = None) -> int:
         warm_up(corner)
         warm_up(alone)
     sink = (DiscardingCam if args.no_output else VirtualCam)(fps=args.fps)
+    if args.look_ahead is None:
+        args.look_ahead = min(LOOK_AHEAD, max(args.delay, 0) * LOOK_AHEAD_SHARE)
+    elif not 0 <= args.look_ahead < args.delay:
+        parser.error("--look-ahead must be at least 0 and less than --delay")
     pipeline = DelayedPipeline(
-        source, sink, detect, compositor, args.delay, args.fps, args.max_frames
+        source, sink, detect, compositor, args.delay, args.fps, args.max_frames,
+        look_ahead=args.look_ahead,
     )
     controller = LivePipelineController(
         pipeline, getattr(detect, "configure", None), views=views

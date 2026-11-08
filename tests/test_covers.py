@@ -130,7 +130,9 @@ def test_scrolling_covers_land_on_their_text_on_frames_with_no_ocr():
         cover = next(d for d in run.secrets() if d.category == "email")
         assert cover.y == EMAIL_TOP - offset
         assert cover.h == LINE_HEIGHT
-    assert run.reader.calls == reads
+    # Nine frames: the rows coming in are read once whole lines are in, the email never.
+    assert run.reader.calls - reads <= 5
+    assert all(height < 120 for height, _ in run.reader.read_sizes[reads:])
 
 
 def test_a_new_scroll_does_not_trim_a_cover_at_the_edge_of_the_screen():
@@ -214,7 +216,20 @@ def test_new_text_coming_onto_the_screen_stays_covered_until_it_is_read():
     for offset in walk(6, 90, 6):
         output = run.at(offset)
         assert shown_secret_pixels(scene, offset, output) == 0
-        assert run.unread()
+        assert shown_cut_line_pixels(scene, offset, output) == 0
+
+
+def shown_cut_line_pixels(scene, offset, output):
+    """Pixels shown of the line the bottom edge cuts through, which no read sees whole."""
+    raw = scene.image(offset)
+    ink = (raw != BACKGROUND).any(axis=2)
+    rows = ink.any(axis=1)
+    bottom = len(rows)
+    while bottom > 0 and rows[bottom - 1]:
+        bottom -= 1  # up through the rows of the line touching the edge
+    cut = np.zeros_like(ink)
+    cut[bottom:] = ink[bottom:]
+    return int((cut & (output == raw).all(axis=2)).sum())
 
 
 def test_read_rows_lose_their_cover_on_the_same_frame():
@@ -232,10 +247,10 @@ def test_read_rows_lose_their_cover_on_the_same_frame():
 def test_stopping_clears_the_unread_strip_with_no_ghost_band():
     run = Run()
     run.at(0)
-    for offset in walk(6, 36, 6):
+    for offset in walk(5, 50, 5):
         run.at(offset)
-    assert run.unread()
-    output = run.at(30)
+    assert run.unread()  # at 45 the bottom edge cuts a line
+    output = run.at(45)
     assert not run.unread()
     assert covered_rows(output, 600).size == 0  # no secret there, so nothing covers it
 
@@ -658,3 +673,22 @@ def test_a_bad_setting_changes_nothing():
     assert detector._keywords == ()
     assert "email" in {d.category for d in run.secrets()}
     assert shown_secret_pixels(run.scene, 0, run.at(0)) == 0
+
+
+def test_a_secret_cut_by_a_scrolling_panes_edge_keeps_its_cover():
+    """No read sees a line the pane's edge cuts through, so finding nothing there is no
+    reason to drop its cover. It goes when the text has left the pane."""
+    from eclipse.text_detect.covers import CoverTracks, Sighting
+
+    def run(pane):
+        tracks = CoverTracks()
+        image = np.full((200, 300, 3), 30, np.uint8)
+        image[52:68, 40:140] = 230
+        tracks.update(image, [Sighting("email", (40, 50, 140, 70), 1, True)], [(0, 200, 0, 300)])
+        image[52:60, 40:140] = 30  # its top half scrolled up under the pane's top edge at 60
+        for _ in range(3):
+            tracks.update(image, [], [(0, 200, 0, 300)], pane)
+        return [category for category, _ in tracks.covers()]
+
+    assert run((60, 200, 0, 300)) == ["email"]
+    assert run(None) == []

@@ -26,14 +26,17 @@ Detector = Callable[[Frame], list[Detection]]
 
 PADDING = 10  # the spec's minimum, in pixels
 FILL = (0, 0, 0)  # BGR. Fixed, so a cover carries nothing from the pixels under it.
+HELD = "held"  # an area to show as the last safe picture showed it, not covered black
 
 
 class Compositor:
     def __init__(self, padding: int = PADDING) -> None:
         self._padding = padding
         self._boxes: list[tuple[int, int, int, int]] = []  # this frame's boxes
+        self._held: list[tuple[int, int, int, int]] = []  # this frame's held areas
         self._last_safe: Rendered | None = None
         self.held_frames = 0
+        self.held_areas = 0  # areas shown as the last safe picture had them: a local stutter
 
     def process(self, frame: Frame, detect: Detector) -> np.ndarray:
         """Scan a frame and return what is safe to send."""
@@ -42,7 +45,9 @@ class Compositor:
     def render(self, frame: Frame, detect: Detector, generation: int = 0) -> Rendered:
         """Scan a frame and return what is safe to send, labelled with what it shows."""
         try:
-            self._boxes = self._checked(frame, detect(frame))
+            found = detect(frame)
+            self._boxes = self._checked(frame, [d for d in found if d.category != HELD])
+            self._held = self._checked(frame, [d for d in found if d.category == HELD])
             image = self._redact(frame)
         except Exception as error:
             return self._hold(frame, error, generation)
@@ -101,6 +106,18 @@ class Compositor:
         for left, top, right, bottom in self.covered_areas(height, width):
             # A solid fill, because blurred text can sometimes be recovered.
             output[top:bottom, left:right] = FILL
+        if self._held:
+            # Not checked yet, so it shows what the last safe picture showed there: that
+            # went out already, so nothing new can. With no such picture, black.
+            last = self._last_safe
+            usable = last is not None and last.image.shape == output.shape
+            for x, y, w, h in self._held:
+                top, left = max(y, 0), max(x, 0)
+                bottom, right = min(y + h, height), min(x + w, width)
+                output[top:bottom, left:right] = (
+                    last.image[top:bottom, left:right] if usable else FILL
+                )
+            self.held_areas += len(self._held)
         return output
 
     def _hold(self, frame: Frame, error: Exception, generation: int) -> Rendered:

@@ -230,8 +230,8 @@ def test_a_stalled_worker_makes_the_exit_code_a_failure(monkeypatch, capsys):
 
         detect = staticmethod(stalling)
 
-    def quick_pipeline(*args):
-        return DelayedPipeline(*args[:7], join_seconds=0.1)
+    def quick_pipeline(*args, **options):
+        return DelayedPipeline(*args[:7], join_seconds=0.1, **options)
 
     monkeypatch.setattr(app, "TestPattern", Pattern)
     monkeypatch.setattr(app, "VirtualCam", FakeCam)

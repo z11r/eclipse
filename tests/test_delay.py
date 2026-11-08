@@ -273,3 +273,83 @@ def test_output_that_truly_falls_behind_catches_up():
     stats, sink = run(delay=0.02, fps=200, max_frames=60, sink=Slow())
     assert stats.skipped > 0
     assert stats.shown + stats.skipped + stats.dropped == 60  # every frame is accounted for
+
+
+INCOMING_COLOUR = 77  # rows a detector would hold black as they scroll in
+
+
+class IncomingSource(StampedSource):
+    def read(self):
+        frame = super().read()
+        frame.image[40:50, 10:70] = INCOMING_COLOUR
+        return frame
+
+
+class LookAheadDetector:
+    """Reports the incoming rows as unread at first. Later, settled() reports them read,
+    with the secret still covered, as a detector that looked ahead would."""
+
+    def __init__(self, fail_on=None):
+        self.fail_on = fail_on
+        self.settled_ids = []
+
+    def __call__(self, frame):
+        if frame.frame_id == self.fail_on:
+            raise RuntimeError("scan failed")
+        return [*finds_secret(frame), Detection(10, 40, 60, 10, "unread", 1.0, 0, frame.frame_id)]
+
+    def settled(self, frame):
+        self.settled_ids.append(frame.frame_id)
+        return finds_secret(frame)
+
+
+def run_ahead(detect, look_ahead=0.03, delay=0.1, fps=100, max_frames=20):
+    sink = Sink()
+    pipeline = DelayedPipeline(
+        IncomingSource(), sink, detect, Compositor(padding=0), delay, fps, max_frames,
+        look_ahead=look_ahead,
+    )
+    return pipeline.run(), sink
+
+
+def shows_incoming(image):
+    return bool((image == INCOMING_COLOUR).any())
+
+
+def test_looking_ahead_sends_what_later_frames_settled():
+    detect = LookAheadDetector()
+    stats, sink = run_ahead(detect)
+    sent = sink.images[:-1]  # the last is the final black
+    assert stats.scanned == 20
+    assert all(shows_incoming(image) for image in sent)  # no black strip
+    assert no_secret_in(sink.images)
+    ids = [frame_id(image) for image in sent]
+    assert ids == sorted(ids)
+    assert detect.settled_ids == sorted(detect.settled_ids)
+
+
+def test_looking_ahead_waits_within_the_delay():
+    stats, sink = run_ahead(LookAheadDetector(), look_ahead=0.03, delay=0.1)
+    assert min(stats.latencies) >= 90
+    assert min(stats.slack) > 0  # every frame was drawn before it was due
+
+
+def test_a_failed_scan_sends_the_frames_waiting_with_what_they_first_reported():
+    stats, sink = run_ahead(LookAheadDetector(fail_on=10), look_ahead=0.05)
+    waited = [image for image in sink.images[:-1] if frame_id(image) < 10]
+    assert waited and no_secret_in(sink.images)
+    # Frames still waiting when the scan failed go out with their black strip.
+    assert any(not shows_incoming(image) for image in waited)
+    assert stats.held >= 1
+
+
+def test_without_settled_the_detector_is_used_as_before():
+    stats, sink = run_ahead(lambda frame: LookAheadDetector()(frame))
+    assert not any(shows_incoming(image) for image in sink.images)
+
+
+def test_looking_ahead_must_leave_part_of_the_delay():
+    with pytest.raises(ValueError):
+        DelayedPipeline(
+            StampedSource(), Sink(), finds_secret, Compositor(), 0.1, 30, 1, look_ahead=0.1
+        )
