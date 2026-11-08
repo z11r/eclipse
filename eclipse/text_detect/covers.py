@@ -34,6 +34,9 @@ _RECHECK_FRAMES = 15  # how often to retry a secret OCR lost on pixels that didn
 _SAME_TOLERANCE = 40  # blurred pixels this close count as the same
 _SAME_MAX_MISMATCH = 0.03  # past this share of pixels, the content has changed
 _UNSURE_MARGIN = 24  # extra cover while a secret's pixels changed and it wasn't found
+_FOLLOW_REACH = 64  # most pixels a camera cover's text is looked for from where it was
+_FOLLOW_MIN_SIDE = 6  # text this small has too few pixels to be found again
+_LEAD_FRAMES = 4  # frames a lost camera cover keeps stretching along its last move
 
 
 @dataclass(frozen=True)
@@ -57,10 +60,13 @@ class _Track:
     unsure: bool = False  # its pixels changed and nothing has explained why
     check_at: int | None = None  # frame to read this place again, if it needs it
     followed: bool = False  # moved by a checked scroll or window move since it was last read
+    velocity: tuple[int, int] = (0, 0)  # its last followed dx, dy, where to look first next
+    lost: int = 0  # frames since following last found its text, while it was moving
+    lead: Rect | None = None  # where moving text that following lost may have gone
 
     @property
     def cover(self) -> Rect:
-        return _union(self.reads)
+        return _union([*self.reads, self.lead] if self.lead else self.reads)
 
     def move(self, shift: float, sideways: int = 0) -> None:
         """Slide with a scroll or a moved window. Never trimmed to the scrolling area, whose
@@ -71,6 +77,7 @@ class _Track:
         ]
         self.pixels_at = self.pixels_at[0] + sideways, self.pixels_at[1] + shift
         self.followed = True
+        self.lead = None
 
     def touches(self, top: int, bottom: int) -> bool:
         return any(y1 < bottom and y2 > top for _, y1, _, y2 in self.reads)
@@ -110,12 +117,13 @@ def _moved(before: Rect, after: Rect, wobble: float) -> bool:
 
 class CoverTracks:
     """One detector's tracks. The detector calls these once a frame, in this order:
-    due, then follow_scroll on a scroll or follow_move on a moved window, then update
-    once the scan has finished."""
+    due, then follow_scroll on a scroll or follow_move on a moved window (follow_each on
+    a camera), then update once the scan has finished."""
 
     def __init__(self, pixel_scale: int = 1) -> None:
         self._wobble = _WOBBLE * pixel_scale
         self._margin = _UNSURE_MARGIN * pixel_scale
+        self._reach = _FOLLOW_REACH * pixel_scale
         self.clear()
 
     def clear(self) -> None:
@@ -173,6 +181,80 @@ class CoverTracks:
                 track.unsure = True
                 unsure.append(track.cover)
         return unsure
+
+    def follow_each(self, image: np.ndarray, changed: np.ndarray) -> bool:
+        """For cameras: move each cover whose pixels changed to where its own text went.
+
+        A sheet in a hand moves on its own, apart from the person and anything else, so
+        there is no one shift for the frame. Each cover's text, as last read, is looked for
+        near where it was, ahead by its last move. The new spot is taken only if it passes
+        the same blurred-tolerance check that keeps a cover on still text, so a cover only
+        ever follows its own text, never nearby motion. Text that blurred, tilted or grew
+        too much fails the check and is left to reads and the unsure margin, as before.
+        Returns whether any cover moved.
+        """
+        height, width = image.shape[:2]
+        gray = None
+        followed = False
+        for track in self._tracks:
+            x1, y1, x2, y2 = track.cover
+            rows = slice(max(int(y1), 0), max(min(int(y2) + 1, height), 0))
+            columns = slice(max(int(x1), 0), max(min(int(x2) + 1, width), 0))
+            if not changed[rows, columns].any() or self._unchanged(track, image):
+                continue
+            if gray is None:  # shrunk to grey and softened once, for every cover
+                gray = cv2.blur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (3, 3))
+            shift = self._find(track, gray)
+            if shift is not None:
+                before = track.reads, track.pixels_at, track.followed, track.lead
+                track.move(shift[1], shift[0])
+                if self._unchanged(track, image):
+                    track.unsure = False
+                    track.velocity = shift
+                    track.lost = 0
+                    followed = True
+                    continue
+                track.reads, track.pixels_at, track.followed, track.lead = before
+            self._lose(track)
+            followed = followed or track.lead is not None
+        return followed
+
+    def _lose(self, track: _Track) -> None:
+        """Following lost text that was moving, most often to motion blur. Until a read or
+        a match finds it again, stretch the cover along its last move, so it covers the
+        path the text is likely on. This only ever adds black, never moves a cover off."""
+        if track.velocity == (0, 0) or track.lost >= _LEAD_FRAMES:
+            track.velocity, track.lost, track.lead = (0, 0), 0, None
+            return
+        track.lost += 1
+        dx, dy = (track.lost * step for step in track.velocity)
+        x1, y1, x2, y2 = _union(track.reads)
+        track.lead = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+
+    def _find(self, track: _Track, gray: np.ndarray) -> tuple[int, int] | None:
+        """The dx, dy where the track's text best matches now, or None. Only proposes."""
+        template = track.pixels
+        rows, columns = template.shape
+        if (
+            rows < _FOLLOW_MIN_SIDE or columns < _FOLLOW_MIN_SIDE
+            or int(template.max()) - int(template.min()) <= _SAME_TOLERANCE
+        ):
+            return None  # blank pixels match anywhere
+        height, width = gray.shape
+        left, top = track.pixels_at[0], round(track.pixels_at[1])
+        ahead = track.lost + 1  # frames of travel since it was last found
+        guess_x, guess_y = left + track.velocity[0] * ahead, top + track.velocity[1] * ahead
+        x1, y1 = max(guess_x - self._reach, 0), max(guess_y - self._reach, 0)
+        x2 = min(guess_x + columns + self._reach, width)
+        y2 = min(guess_y + rows + self._reach, height)
+        if x2 - x1 < columns or y2 - y1 < rows:
+            return None  # it would be partly off the frame
+        scores = cv2.matchTemplate(
+            gray[y1:y2, x1:x2], cv2.blur(template, (3, 3)), cv2.TM_SQDIFF
+        )
+        _, _, (best_x, best_y), _ = cv2.minMaxLoc(scores)
+        shift = (x1 + best_x - left, y1 + best_y - top)
+        return None if shift == (0, 0) else shift
 
     def update(
         self, image: np.ndarray, sightings: list[Sighting], read: list[tuple[int, int, int, int]]
@@ -258,6 +340,7 @@ class CoverTracks:
         track.unsure = False
         track.check_at = None
         track.followed = False
+        track.lost, track.lead = 0, None
 
     def _still_needed(
         self, track: _Track, image: np.ndarray, read: list[tuple[int, int, int, int]]
@@ -280,7 +363,9 @@ class CoverTracks:
         if right <= left or bottom <= top:
             return False  # it left the frame
         track.unsure = True
-        if checked:
+        if checked and track.lead is None:
+            # A read of text that following lost mid-move proves nothing: what lost it,
+            # motion blur, also keeps OCR from reading it.
             track.clear_reads += 1
             if track.clear_reads >= _CLEAR_READS:
                 return False
