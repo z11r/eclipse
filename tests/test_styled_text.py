@@ -185,3 +185,39 @@ def test_line_width_word_box_is_refined_but_missing_other_secret_keeps_fallback(
     assert Reader()._refine_email_boxes(pixels, [(box, 'demo@example.com', .9)])[0][0] != box
     sentence = [(box, 'demo@example.com PASSWORD=fake-secret-123', .9)]
     assert Reader()._refine_email_boxes(pixels, sentence) == sentence
+
+
+@pytest.mark.parametrize('pieces', [
+    ['demo@example.com'], ['demo@', 'example.com'], ['demo', '@', 'example', '.', 'com'],
+])
+def test_email_in_sentence_does_not_expand_to_surrounding_words(pieces):
+    from eclipse.text_detect.detection import Detector
+
+    words = ['You', 'have', 'not', 'interacted', 'with'] + pieces + ['before.', 'Do', 'you', 'want', 'to', 'add', 'this', 'invitation?']
+    regions = []
+    x = 10
+    for word in words:
+        right = x + len(word)*10
+        regions.append((x, 20, right, 40, word))
+        x = right+8
+    start = regions[5][0]
+    end = regions[5+len(pieces)-1][2]
+    found = Detector(reader=lambda image: ([], None))._find_areas(regions)
+    emails = [rect for kind, rect, _ in found if kind == 'email']
+    assert emails
+    assert all(rect[0] >= start and rect[2] <= end for rect in emails)
+    assert min(rect[0] for rect in emails) == start
+    assert max(rect[2] for rect in emails) == end
+
+
+def test_separate_emails_in_same_sentence_both_remain_covered():
+    from eclipse.text_detect.detection import Detector
+
+    regions = [(10, 20, 180, 40, 'first@example.com'),
+               (188, 20, 220, 40, 'and'),
+               (228, 20, 408, 40, 'second@example.com')]
+    found = Detector(reader=lambda image: ([], None))._find_areas(regions)
+    emails = [rect for kind, rect, _ in found if kind == 'email']
+    assert any(rect[0] == 10 for rect in emails)
+    assert any(rect[2] == 408 for rect in emails)
+    assert not any(rect[0] <= 188 and rect[2] >= 220 for rect in emails)

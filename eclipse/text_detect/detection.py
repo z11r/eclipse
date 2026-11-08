@@ -795,6 +795,19 @@ class Detector:
                             touched.append((part, first, last))
                         position += len(part[4]) + len(separator)
 
+                    if separator == '' and category == 'email':
+                        # A compact row can turn "hello demo@example.com bye"
+                        # into one apparent address spanning all three words.
+                        # Prefer email positions already established from actual
+                        # OCR text or the space-preserving pass. Compact joining
+                        # remains a fallback for addresses those passes missed.
+                        established = [rect for kind, rect, _ in areas if kind == 'email']
+                        if any(
+                            rect[0] < part[2] and rect[2] > part[0]
+                            and rect[1] < part[3] and rect[3] > part[1]
+                            for rect in established for part, _, _ in touched
+                        ):
+                            continue
                     if len(touched) > 1:
                         for part, first, last in touched:
                             areas.add((
