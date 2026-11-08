@@ -117,3 +117,26 @@ def test_small_change_is_noticed_however_faint():
     changed[10, 10, 2] = changed[10, 10, 2] + 1  # one level, one pixel, one channel
     detect(Frame(changed, 0.03, "screen", 1))
     assert detect.stats["partial_scans"] == 1
+
+
+@needs_mac
+@pytest.mark.parametrize('style', ['plain', 'amber', 'underlined', 'selected'])
+def test_styled_email_is_recognized_and_covered(style):
+    """Run on macOS: exercise native Vision, rules and final cover placement."""
+    image = np.full((900, 1600, 3), 30, dtype=np.uint8)
+    text = 'alex.fake@example.com'
+    x, y, scale, thickness = 200, 300, 1.6, 3
+    (width, height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    colour = (240, 240, 240) if style in ('plain', 'selected') else (0, 180, 240)
+    if style == 'selected':
+        cv2.rectangle(image, (x-5, y-height-5), (x+width+5, y+baseline+5), (180, 70, 20), -1)
+    cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thickness)
+    if style == 'underlined':
+        cv2.line(image, (x, y+5), (x+width, y+5), colour, 2)
+    frame = Frame(image, 0.0, 'screen', 0)
+    detections = TextDetector(reader=AppleVisionReader(), pixel_scale=2)(frame)
+    emails = [d for d in detections if d.category == 'email']
+    assert emails, 'Styled fake email was not detected'
+    assert any(d.x <= x+10 and d.x+d.w >= x+width-10 for d in emails)
+    output = Compositor().process(frame, lambda f: detections)
+    assert not output[y-height:y, x:x+width].any()

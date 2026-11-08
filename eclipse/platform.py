@@ -143,6 +143,7 @@ class AppleVisionReader:
     """
 
     FAST = 1  # VNRequestTextRecognitionLevelFast
+    ACCURATE = 0  # VNRequestTextRecognitionLevelAccurate
 
     def __init__(self) -> None:
         if not IS_MAC:
@@ -154,7 +155,27 @@ class AppleVisionReader:
         return self.read_bgra(cv2.cvtColor(image, cv2.COLOR_BGR2BGRA))
 
     def read_bgra(self, pixels) -> tuple[list, None]:
-        """Read a BGRA image. A pixel buffer reads a full frame in 58 ms, a CGImage in 88."""
+        """Fast screen read, plus accurate contrast-normalized reads of colored areas.
+
+        Keep both sets of observations: a retry is supplementary and must not
+        discard a secret found by the fast pass. Coordinates stay in input pixels.
+        Both direct calls and shared-memory OCR workers enter through this method.
+        """
+        from eclipse.text_detect.styled_text import colour_regions, contrast_bgra
+
+        words, _ = self._read_vision(pixels, self.FAST)
+        words = list(words)
+        for left, top, right, bottom in colour_regions(pixels):
+            crop = contrast_bgra(pixels[top:bottom, left:right])
+            extra, _ = self._read_vision(crop, self.ACCURATE)
+            for corners, text, confidence in extra:
+                translated = [[x + left, y + top] for x, y in corners]
+                if not any(text == old[1] and translated == old[0] for old in words):
+                    words.append((translated, text, confidence))
+        return words, None
+
+    def _read_vision(self, pixels, level) -> tuple[list, None]:
+        """One native Vision request; errors propagate to the fail-closed pipeline."""
         import numpy as np
         import objc
         import Quartz
@@ -177,7 +198,7 @@ class AppleVisionReader:
             finally:
                 Quartz.CVPixelBufferUnlockBaseAddress(buffer, 0)
             request = Vision.VNRecognizeTextRequest.alloc().init()
-            request.setRecognitionLevel_(self.FAST)
+            request.setRecognitionLevel_(level)
             request.setUsesLanguageCorrection_(False)  # it would "fix" random keys
             request.setMinimumTextHeight_(0.0)  # the default skips small text
             # Nothing Python-backed may reach Vision, not even a str inside an NSArray. It
