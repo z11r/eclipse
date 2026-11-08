@@ -30,6 +30,10 @@ _KEEP_READS = 3  # a cover holds this many recent reads, so their wobble doesn't
 _WOBBLE = 3  # an OCR box can shift this far between reads of text that didn't move
 _MIN_OVERLAP = 0.3  # share of the smaller box that makes two boxes the same place
 _CLEAR_READS = 2  # reads that must find nothing on new pixels before a cover comes off
+# The same, for a secret only a careful reread found, such as a value after a label under
+# a spell-check underline. The fast read never finds it, so two of its reads meant nothing:
+# the cover came off mid-scroll and back on at the next careful read, blinking.
+_CLEAR_READS_CAREFUL = 8
 _RECHECK_FRAMES = 15  # how often to retry a secret OCR lost on pixels that didn't change
 _SAME_TOLERANCE = 40  # blurred pixels this close count as the same
 _SAME_MAX_MISMATCH = 0.03  # past this share of pixels, the content has changed
@@ -44,6 +48,7 @@ class Sighting:
     rect: Rect
     text_hash: int
     fresh: bool  # read from this frame's pixels, not carried over from an earlier read
+    careful: bool = False  # only a careful reread found it; a fast read can't see it
 
 
 @dataclass
@@ -57,6 +62,7 @@ class _Track:
     unsure: bool = False  # its pixels changed and nothing has explained why
     check_at: int | None = None  # frame to read this place again, if it needs it
     followed: bool = False  # moved by a checked scroll or window move since it was last read
+    careful: bool = False  # found by a careful reread, so a fast read missing it means little
 
     @property
     def cover(self) -> Rect:
@@ -246,7 +252,10 @@ class CoverTracks:
 
     def _start(self, sighting: Sighting, image: np.ndarray) -> _Track:
         pixels, place = self._grab(sighting.rect, image)
-        return _Track(sighting.category, sighting.text_hash, [sighting.rect], pixels, place)
+        return _Track(
+            sighting.category, sighting.text_hash, [sighting.rect], pixels, place,
+            careful=sighting.careful,
+        )
 
     def _refresh(self, track: _Track, sightings: list[Sighting], image: np.ndarray) -> None:
         rect = _union(sighting.rect for sighting in sightings)
@@ -265,6 +274,8 @@ class CoverTracks:
         track.unsure = False
         track.check_at = None
         track.followed = False
+        # A fast read finding it again shows it's readable now; a careful one keeps it careful.
+        track.careful = all(sighting.careful for sighting in sightings)
 
     def _still_needed(
         self, track: _Track, image: np.ndarray, read: list[tuple[int, int, int, int]]
@@ -289,7 +300,7 @@ class CoverTracks:
         track.unsure = True
         if checked:
             track.clear_reads += 1
-            if track.clear_reads >= _CLEAR_READS:
+            if track.clear_reads >= (_CLEAR_READS_CAREFUL if track.careful else _CLEAR_READS):
                 return False
         track.check_at = self._now + 1
         return True
