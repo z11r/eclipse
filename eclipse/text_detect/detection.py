@@ -6,6 +6,7 @@ If detection fails, the pipeline must black out the frame."""
 import bisect
 import functools
 import math
+import re
 import threading
 import time
 from typing import Iterable
@@ -15,9 +16,11 @@ import numpy as np
 
 from eclipse.text_detect.covers import MOVE, REREAD, STAY, CoverTracks, Sighting
 from eclipse.text_detect.incoming import IncomingRows, ScrollStep
+from eclipse.text_detect.labels import garbled_label
 from eclipse.text_detect.rules import (
     UNREAD_MARK,
     ends_in_label,
+    find_careful_spans,
     find_spans,
     names_a_secret,
     keyword_pattern,
@@ -53,6 +56,7 @@ _SCROLL_RECHECK = 30  # frames of fractional scrolling between reads of the whol
 _UNREAD_READ_AT = 96  # rows of incoming text to collect before reading them
 _UNREAD_KEEP = 24  # rows left black after a read, as the last line may be cut off
 _CUT_REACH = 3  # a line cut by a pane edge is looked for this many ordinary lines deep
+_RAIL_SHARE = 0.95  # share of rows a column must be inked in to be a border, not text
 _LINE_GAP = 1  # blank rows, beyond this many, part one line from the next
 _FOLLOW_BUDGET = 0.004  # seconds a frame may spend trying areas past its largest
 _FOLLOW_STRICT = 0.004  # seconds before a frame stops trying motion last frame didn't have
@@ -127,6 +131,10 @@ _RESCUE_BUDGET = 0.15
 _RESCUE_BURST = 0.3
 _RESCUE_REACH = 24
 _RESCUE_CACHE = 256
+_RESCUE_WHILE_MOVING = False  # careful rereads take 25-55 ms in the scan: while text moves they stall frames
+_WAITING_MARGIN = 2  # standard pixels of cover around a value waiting for its careful reread
+# A word that ends in a separator, or one OCR read with a stray mark after it: "abc:", "x=.".
+_ENDS_IN_SEPARATOR = re.compile(r'[:=][.,;"\x27]{0,2}$')
 _SEPARATORS = {TIGHT: ' ', SPACE: ' ', UNREAD: f' {UNREAD_MARK} ', NEWLINE: '\n'}
 _TIGHT_SEPARATORS = {TIGHT: '', SPACE: ' ', UNREAD: f' {UNREAD_MARK} ', NEWLINE: '\n'}
 
@@ -392,6 +400,12 @@ def _cut_line(
     ink = _ink(area)
     if ink is None:
         return fallback
+    # Columns inked in nearly every row are rails, not text: a pane's border, the pane
+    # beside it, a scroll bar. Text leaves gaps between lines. Counted as ink, a rail left
+    # no blank row anywhere, so three lines at the edge stayed black, each line in turn.
+    rails = ink.mean(axis=0) > _RAIL_SHARE
+    if rails.any() and not rails.all():
+        ink = ink[:, ~rails]
     rows = ink.any(axis=1)
     gap = _LINE_GAP * scale
     if not rows[:gap + 1].any():
@@ -575,6 +589,7 @@ class Detector:
             'repeat_seconds': 0.0,
             'uncertain': 0, 'doubtful_lines': 0, 'rescues': 0, 'rescue_cached': 0,
             'rescue_skipped': 0, 'rescue_failed': 0, 'rescue_seconds': 0.0,
+            'rescue_deferred': 0,
         }
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
@@ -590,6 +605,10 @@ class Detector:
         self._rescue_allowance = _RESCUE_BURST
         self._rescue_clock = None
         self._rescued = {}  # crop fingerprint -> words read there, newest last
+        self._careful_ids = set()  # ids of words a careful reread gave, still on screen
+        self._careful_areas = set()
+        self._rescue_waiting = set()  # ids of doubtful words whose reread had no room yet
+        self._was_full = False  # whether the last scan read the whole screen
         self._ocr_threads = ocr_threads  # for the RapidOCR reader made when none is given
         # Cameras redraw every pixel with sensor noise, so any-pixel-changed would read
         # the whole frame every time. Above 0, blocks whose average moved less than
@@ -1142,7 +1161,7 @@ class Detector:
                 new_top = max(y1 + exact_shift, top_of_view)
                 new_bottom = min(y2 + exact_shift, bottom_of_view)
                 if new_bottom > new_top:
-                    moved.append((x1, new_top, x2, new_bottom, text))
+                    moved.append(self._carry(region, (x1, new_top, x2, new_bottom, text)))
 
         for place in self._tracks.follow_scroll(
             action, exact_shift, top_of_view, bottom_of_view, image
@@ -1447,7 +1466,7 @@ class Detector:
             if todo == STAY:
                 moved.append(region)
             elif todo == MOVE:
-                moved.append((x1 + dx, y1 + dy, x2 + dx, y2 + dy, text))
+                moved.append(self._carry(region, (x1 + dx, y1 + dy, x2 + dx, y2 + dy, text)))
             else:
                 # Read the line whole wherever it may be now, never just the part that changed.
                 for place in ((x1, y1, x2, y2), (x1 + dx, y1 + dy, x2 + dx, y2 + dy)):
@@ -2114,9 +2133,13 @@ class Detector:
         lines = self._lines(regions, image)
         uncertain = 0
         self._doubtful = []  # (line's parts, ...) the fast read can't settle
+        self._careful_areas = set()  # areas found only in a careful reread's words
 
         def add(span, part, first, last, text):
-            areas.add((span.category, self._cover(part, first, last), _text_hash(text)))
+            area = (span.category, self._cover(part, first, last), _text_hash(text))
+            areas.add(area)
+            if id(part) in self._careful_ids:
+                self._careful_areas.add(area)
 
         # A line under a label line is judged with it, so "Commit SHA:" over its hash, or
         # "Password:" over a form's field, gives the value its meaning. The label line is
@@ -2147,6 +2170,11 @@ class Detector:
                     separator + part[4] for separator, part in zip(separators, parts[1:])
                 )
                 spans = find_spans(joined, self._keywords)
+                if not standalone_only and self._careful_ids and any(
+                    id(part) in self._careful_ids for part in parts
+                ):
+                    # A careful reread of a garbled line: a label two edits off counts.
+                    spans = spans + find_careful_spans(joined)
                 if not standalone_only and (
                     self._rescue is None or not _in_doubt(joined, spans)
                 ):
@@ -2184,7 +2212,44 @@ class Detector:
         self._uncertain = uncertain
         return areas
 
-    def _rescue_reads(self, image, fresh) -> list[tuple]:
+    def _carry(self, old: tuple, new: tuple) -> tuple:
+        """new is old moved by a scroll or drag: it keeps old's marks, as a careful
+        reread's word or a line waiting for one."""
+        key = id(old)
+        if key in self._careful_ids:
+            self._careful_ids.add(id(new))
+        if key in self._rescue_waiting:
+            self._rescue_waiting.add(id(new))
+        return new
+
+    def _waiting_covers(self, width: int, height: int) -> set[tuple]:
+        """Covers for values after a label the fast read garbled, until the careful reread
+        settles them, so the value doesn't show for the half second that takes.
+
+        Only after a word that names a secret or reads as junk and ends in a separator
+        (RSIAI.wiod: abc): a word like "password" in a sentence covers nothing.
+        """
+        boxes = set()
+        margin = _WAITING_MARGIN * self._pixel_scale
+        for parts in self._doubtful:
+            if not any(id(part) in self._rescue_waiting for part in parts):
+                continue
+            for index, part in enumerate(parts[:-1]):
+                word = part[4].rstrip()
+                if _ENDS_IN_SEPARATOR.search(word) and (
+                    names_a_secret(word) or garbled_label(word)
+                ):
+                    for value in parts[index + 1 :]:
+                        left = max(0, math.floor(value[0]) - margin)
+                        top = max(0, math.floor(value[1]) - margin)
+                        right = min(width, math.ceil(value[2]) + margin)
+                        bottom = min(height, math.ceil(value[3]) + margin)
+                        if right > left and bottom > top:
+                            boxes.add((left, top, right - left, bottom - top, 'unread'))
+                    break
+        return boxes
+
+    def _rescue_reads(self, image, fresh, moving: bool = False) -> list[tuple]:
         """Reread, carefully, lines the fast read left in doubt, and return what it saw.
 
         A line is in doubt when it names a secret ("password", "card number") but no value
@@ -2204,29 +2269,60 @@ class Detector:
         height, width = image.shape[:2]
         crops = []
         for parts in self._doubtful:
-            if not any(id(part) in fresh for part in parts):
+            if not any(id(part) in fresh for part in parts) and not any(
+                id(part) in self._rescue_waiting for part in parts
+            ):
                 continue
             self.stats['doubtful_lines'] += 1
             tall = max(float(np.median([p[3] - p[1] for p in parts])), 1.0)
             top = max(int(min(p[1] for p in parts) - 0.5 * tall), 0)
             bottom = min(int(math.ceil(max(p[3] for p in parts) + 0.5 * tall)), height)
+            # The rows of this line, with room for a spell-check underline under it. Ink
+            # outside them belongs to the lines above and below, and blanked out, as cut-off
+            # neighbours made Vision misread a whole line (passwrod: abc as Rasswredac).
+            own = (
+                max(int(min(p[1] for p in parts) - 0.15 * tall), 0),
+                min(int(math.ceil(max(p[3] for p in parts) + 0.4 * tall)), height),
+            )
             if parts[-1][4].rstrip().endswith(':') or ends_in_label(parts[-1][4]):
                 # A label with nothing after it: its value may be on the next line.
                 bottom = min(int(math.ceil(bottom + 1.5 * tall)), height)
+                own = (own[0], bottom)
             left = max(int(min(p[0] for p in parts) - tall), 0)
             right = min(int(math.ceil(max(p[2] for p in parts) + _RESCUE_REACH * tall)), width)
             for crop in crops:
                 if top <= crop[1] + tall and bottom >= crop[0] - tall and (
                     left < crop[3] and right > crop[2]
                 ):
-                    crop[:] = [min(crop[0], top), max(crop[1], bottom),
-                               min(crop[2], left), max(crop[3], right)]
+                    crop[:4] = [min(crop[0], top), max(crop[1], bottom),
+                                min(crop[2], left), max(crop[3], right)]
+                    crop[4].append(own)
+                    crop[5].extend(parts)
                     break
             else:
-                crops.append([top, bottom, left, right])
+                crops.append([top, bottom, left, right, [own], list(parts)])
+        # Lines left over for lack of time wait for a later frame, even on a still screen,
+        # where nothing is read fresh again. They're dropped once read or gone.
+        waiting = set()
+        for crop in crops[_RESCUE_PER_FRAME:]:
+            waiting.update(id(part) for part in crop[5])
+        if moving:
+            # A careful read takes 25-30 ms inside the scan; while text moves that holds up
+            # frames and the covers jump. The lines wait, covered, until the screen settles.
+            for crop in crops:
+                waiting.update(id(part) for part in crop[5])
+            self._rescue_waiting = waiting
+            self.stats['rescue_deferred'] += len(crops)
+            return []
         words = []
-        for top, bottom, left, right in crops[:_RESCUE_PER_FRAME]:
-            pixels = np.ascontiguousarray(image[top:bottom, left:right])
+        for top, bottom, left, right, rows, members in crops[:_RESCUE_PER_FRAME]:
+            pixels = np.array(image[top:bottom, left:right])
+            keep = np.zeros(bottom - top, bool)
+            for first, last in rows:
+                keep[max(first - top, 0) : max(last - top, 0)] = True
+            if not keep.all():
+                edge = np.concatenate((pixels[:, 0], pixels[:, -1]))
+                pixels[~keep] = np.median(edge, axis=0).astype(pixels.dtype)
             key = (top, left, pixels.shape, hash(pixels.tobytes()))
             if key in self._rescued:
                 self.stats['rescue_cached'] += 1
@@ -2234,6 +2330,7 @@ class Detector:
                 continue
             if self._rescue_allowance <= 0:
                 self.stats['rescue_skipped'] += 1
+                waiting.update(id(part) for part in members)
                 continue
             started = time.monotonic()
             try:
@@ -2251,6 +2348,7 @@ class Detector:
                 self._rescued.pop(next(iter(self._rescued)))
             words.extend(found)
         self.stats['rescue_skipped'] += max(len(crops) - _RESCUE_PER_FRAME, 0)
+        self._rescue_waiting = waiting
         return words
 
     def _look_ahead(self, key, image) -> None:
@@ -2349,7 +2447,10 @@ class Detector:
                 self.reused_read = not areas
                 self.stats['cached_frames'] += self.reused_read
 
-                if not areas and not self._scrolled and not self._moved:
+                # Doubtful lines still waiting for a careful reread keep a still screen
+                # scanning, cheaply, until each has had one.
+                waiting = self._rescue is not None and bool(self._rescue_waiting)
+                if not areas and not self._scrolled and not self._moved and not waiting:
                     self._look_ahead(key, snapshot)
                     return list(self._boxes)
 
@@ -2397,11 +2498,23 @@ class Detector:
 
                 find_started = time.monotonic()
                 found = self._find_areas(regions, snapshot)
-                if self._rescue is not None and self._doubtful and fresh:
-                    rescued = self._rescue_reads(snapshot, fresh)
+                if self._rescue is not None and self._doubtful and (fresh or self._rescue_waiting):
+                    rescued = self._rescue_reads(
+                        snapshot, fresh,
+                        # Whole new screens frame after frame, as while apps switch, stall
+                        # the same way. A single new screen is read carefully at once.
+                        moving=(self._scrolled or self._moved or (full and self._was_full))
+                        and not _RESCUE_WHILE_MOVING,
+                    )
                     if rescued:
                         regions.extend(rescued)
+                        self._careful_ids.update(id(word) for word in rescued)
                         found = self._find_areas(regions, snapshot)
+                self._was_full = full
+                # Forget rereads no longer on screen, so an id is never reused by mistake.
+                on_screen = {id(region) for region in regions}
+                self._careful_ids &= on_screen
+                self._rescue_waiting &= on_screen
                 self.stats['uncertain'] += self._uncertain
                 track_started = time.monotonic()
                 self.stats['find_seconds'] += track_started - find_started
@@ -2410,6 +2523,7 @@ class Detector:
                     Sighting(
                         category, rect, text_hash,
                         any(_overlaps((rect[1], rect[3], rect[0], rect[2]), a) for a in areas),
+                        (category, rect, text_hash) in self._careful_areas,
                     )
                     for category, rect, text_hash in found
                     if category in self._enabled
@@ -2435,6 +2549,8 @@ class Detector:
                 }
                 for ink in self._strip_ink.values():
                     boxes.update((x, y, w, h, 'unread') for x, y, w, h in ink)
+                if self._rescue is not None and self._rescue_waiting:
+                    boxes.update(self._waiting_covers(width, height))
 
                 self.stats['track_seconds'] += time.monotonic() - track_started
                 # Save results only after the whole scan succeeds.

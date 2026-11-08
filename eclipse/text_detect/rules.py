@@ -17,6 +17,8 @@ import re
 import unicodedata
 from typing import Iterable, NamedTuple
 
+from eclipse.text_detect import labels
+
 
 class Span(NamedTuple):
     """One sensitive value in a line of text.
@@ -145,25 +147,58 @@ _LABEL_END = re.compile(
 )
 
 
+_LAST_WORD = re.compile(r'([\w.\-$@]+)["\x27]?$')
+# A separator a misspelled label can stand before. The exact labels above also take
+# separators OCR misread; a label that is itself a guess needs a real one, or an unread mark.
+_FUZZY_SEPARATOR = re.compile(rf'(?:=>|:=|==|=|:|{UNREAD_MARK})(?!=)')
+# A separator read after an unread mark: the mark was only the gap before it.
+_REAL_SEPARATOR = re.compile(rf'(=>|:=|==|=|:)(?!=)[\s{UNREAD_MARK}]*')
+_FUZZY_MAX_SEPARATORS = 64  # separators tried in one line, so dense text stays cheap
+
+
 # Words that say a secret is on this line. When no value is found beside one, the fast
 # read may have garbled it, so the line is worth reading again more carefully.
 _NAMES_SECRET = re.compile(
     r'(?:passw(?:or)?d|passphrase|pwd|secret|api[_ -]?key|private[_ -]?key|access[_ -]?token'
-    r'|card\s*(?:number|no)|cvv|cvc)',
+    r'|card\s*(?:number|no)|cvv|cvc'
+    # Codes with letters, which a spell-check underline turns to junk: read them again.
+    r'|(?:verification|recovery|backup|security)\s+codes?)',
     re.I,
 )
 
 
 @functools.lru_cache(maxsize=16384)
 def names_a_secret(text: str) -> bool:
-    """Whether a line mentions a secret by name, whatever follows."""
-    return _NAMES_SECRET.search(text) is not None
+    """Whether a line mentions a secret by name, whatever follows. A word up to two edits
+    from "password" counts, as OCR may have garbled the label, and so does a junk word
+    before : or =, as a spell-check underline makes of a misspelled label. A careful read
+    settles it."""
+    return (
+        _NAMES_SECRET.search(text) is not None
+        or labels.looks_like_label(text) is not None
+        or labels.garbled_label(text)
+    )
 
 
 @functools.lru_cache(maxsize=16384)
 def ends_in_label(text: str) -> bool:
-    """Whether a word ends in a secret's label without a separator after it."""
-    return _LABEL_END.search(text) is not None
+    """Whether a word ends in a secret's label without a separator after it, including a
+    misspelled password label such as pasword or DB_PASWORD."""
+    if _LABEL_END.search(text) is not None:
+        return True
+    # A misspelled label with no separator read after it. Not one cut short (passwor),
+    # which is likelier the start of a longer word OCR split, as password_length.
+    word = _LAST_WORD.search(text)
+    return (
+        word is not None
+        and labels.names_password(word.group(1))
+        and not labels.cut_short(_parts_last(word.group(1)))
+    )
+
+
+def _parts_last(name: str) -> str:
+    parts = labels._parts(name)
+    return parts[-1] if parts else name
 
 
 _SECRET_MIN = 6  # an unlabelled-looking token: shorter values after "token:" are words
@@ -174,7 +209,8 @@ _REFERENCE = re.compile(
     r'(?:[A-Za-z_][\w.]*\s*\('
     # A lookup by a setting's name, however OCR garbles the call before it: a spell-check
     # underline turned os.getenv("DB_PASSWORD") into R%AoionY("D8_PASSWORD").
-    r'|\S*\(\s*["\x27`]?[A-Z][A-Z0-9_]{2,}["\x27`]?\s*\)'
+    # The closing ) OCR can read as } ] | l J or 1, as under a spell-check underline.
+    r'|\S*\(\s*["\x27`]?[A-Z][A-Z0-9_]{2,}["\x27`]?\s*[)}\]|lJ1]'
     # ${NAME} as OCR reads it: $ as S or 5, { as I, l or (.
     r'|[S5][{(Il1|]\s*[A-Z][A-Z0-9]*_[A-Z0-9_]+\s*[})Il1|]'
     r'|\$\{|\$\(|\$[A-Z_][A-Z0-9_]*(?![\w])|%[A-Za-z_]\w*%|\{\{|<%'
@@ -384,8 +420,14 @@ def _labelled_secrets(text: str) -> Iterable[Span]:
         # A colon OCR read as a quote or semicolon stands for a colon.
         separator = match.group('sep') or match.group('bare') or ':'
         if separator == UNREAD_MARK:
-            # Unknown, perhaps a colon: a password may run on, to the next unread mark.
-            separator = ':' if password else '='
+            real = _REAL_SEPARATOR.match(text, start)
+            if real:
+                # The mark stood for the gap before a separator OCR did read, as in
+                # password = os.getenv(...): the value is what follows that one.
+                separator, start = real.group(1), real.end()
+            else:
+                # Unknown, perhaps a colon: a password may run on, to the next unread mark.
+                separator = ':' if password else '='
         found = _value(text, start, separator, allow_words=password)
         if found is None:
             continue
@@ -393,6 +435,59 @@ def _labelled_secrets(text: str) -> Iterable[Span]:
         if not password and len(text[begin:end].strip()) < _SECRET_MIN:
             continue
         yield Span('api_key', begin, end, match.start(), False)
+    yield from _misspelled_passwords(text)
+    yield from _password_flags(text)
+
+
+# --password hunter2 on a command line, or -password as some tools and OCR write it. Only
+# a flag that spells a label counts: -p can mean anything.
+_FLAG = re.compile(r'(?<![\w\-])--?([A-Za-z][\w\-]{2,30})[ \t]+(?=[^\s\-])')
+
+
+def _password_flags(text: str) -> Iterable[Span]:
+    for flag in _FLAG.finditer(text):
+        if labels.names_password(flag.group(1)):
+            found = _value(text, flag.end(), '=', allow_words=False)
+            if found is not None:
+                yield Span('api_key', found[0], found[1], flag.start(), False)
+
+
+def _misspelled_passwords(text: str, careful: bool = False) -> Iterable[Span]:
+    """Passwords after a label the exact rule doesn't know: pasword=12345, DB_PASWORD=x,
+    passw0rd: x, pass word = x. The value is parsed as for any password label. careful
+    lets a label be two edits off, for words a careful reread gave."""
+    for count, separator in enumerate(_FUZZY_SEPARATOR.finditer(text)):
+        if count >= _FUZZY_MAX_SEPARATORS:
+            break
+        found = labels.key_before(text, separator.start())
+        if found is None and careful:
+            found = _careful_key_before(text, separator.start())
+        if found is None:
+            continue
+        key, key_start = found
+        if _LABEL.match(text, key_start) or _LABEL.match(text, max(key_start - 1, 0)):
+            continue  # an exact label: found above
+        sign = separator.group()
+        if sign == '=' and text[separator.start() - 1 : separator.start()] in ('<', '>', '!'):
+            continue
+        if sign == UNREAD_MARK and labels.cut_short(_parts_last(key)):
+            continue  # passwor, then a gap: likelier password_length split by OCR
+        start = separator.end()
+        while start < len(text) and (text[start].isspace() or text[start] == UNREAD_MARK):
+            start += 1
+        if sign == UNREAD_MARK:
+            real = _REAL_SEPARATOR.match(text, start)
+            if real:
+                sign, start = real.group(1), real.end()
+            else:
+                sign = ':'
+        value = _value(text, start, ':' if sign == ':' else '=', allow_words=True)
+        if value is None:
+            continue
+        begin, end = value
+        if sign == ':' and key[-1:] in 'sS' and re.fullmatch(r'\d{1,3}|\d+\s+[A-Za-z]+', text[begin:end]):
+            continue  # "Passwords: 3 saved" counts passwords
+        yield Span('api_key', begin, end, key_start, False)
 
 
 def _phones(text: str) -> Iterable[Span]:
@@ -415,7 +510,19 @@ def _phones(text: str) -> Iterable[Span]:
         yield Span('phone', offset + first, offset + last + 1, match.start(), False)
 
 
+# A code with letters, after a label that says it's a security code:
+# "Recovery code: abcd-efgh-ijkl", "Verification code: AB12-CD34". Digits alone are above.
+_LETTER_CODE = re.compile(
+    r'\b(?:verification|recovery|backup|security|authentication|login|sign[- ]?in|one[- ]?time'
+    r'|2fa|mfa|otp|access|confirmation)\s+codes?\s*[:=]\s*'
+    r'(?P<value>[A-Za-z0-9]{2,10}(?:-[A-Za-z0-9]{2,10}){1,5})(?![\w\-])',
+    re.I,
+)
+
+
 def _codes(text: str) -> Iterable[Span]:
+    for match in _LETTER_CODE.finditer(text):
+        yield Span('2fa', match.start('value'), match.end('value'), match.start(), False)
     if _CODE_HINT.search(text):
         for match in _CODE.finditer(text):
             yield Span('2fa', match.start(), match.end(), match.start(), False)
@@ -504,3 +611,32 @@ def find_spans(text: str, keywords: tuple[str, ...] = ()) -> tuple[Span, ...]:
     is always the same answer.
     """
     return tuple(_match(text, tuple(keywords)))
+
+
+def _careful_key_before(text: str, end: int) -> tuple[str, int] | None:
+    """The name before a separator, if it is within two edits of a password label."""
+    stop = end
+    while stop > 0 and text[stop - 1] in ' \t"\x27':
+        stop -= 1
+    start = stop
+    while start > 0 and (text[start - 1].isalnum() or text[start - 1] in '_-.$@'):
+        start -= 1
+    name = text[start:stop]
+    return (name, start) if name and labels.names_password_carefully(name) else None
+
+
+@functools.lru_cache(maxsize=4096)
+def find_careful_spans(text: str) -> tuple[Span, ...]:
+    """Passwords whose label is two edits off, for a line a careful reread gave.
+
+    Only for such lines: on a fast read, two edits isn't enough to call a word a label.
+    """
+    standard, origins = standard_characters(text)
+    spans = [span for span in _misspelled_passwords(standard, careful=True)]
+    if origins is None:
+        return tuple(spans)
+    return tuple(
+        span._replace(start=origins[span.start], end=origins[span.end - 1] + 1,
+                      anchor=origins[min(span.anchor, span.start)])
+        for span in spans if span.end > span.start
+    )
