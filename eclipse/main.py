@@ -24,7 +24,7 @@ from eclipse.capture.pattern import TestPattern
 from eclipse.capture.preferred import PreferredCapture
 from eclipse.capture.screen import ScreenCapture
 from eclipse.capture.webcam import WebcamCapture
-from eclipse.compositor.compositor import PADDING, Compositor
+from eclipse.compositor.compositor import PADDING, STYLES, Compositor
 from eclipse.compositor.delay import DelayedPipeline
 from eclipse.compositor.pip import PictureInPictureCompositor, PictureInPictureDetector
 from eclipse.output.virtual_cam import DiscardingCam, VirtualCam
@@ -382,6 +382,13 @@ def main(argv: list[str] | None = None) -> int:
         default=PIP_SIZE,
         help="the camera's width in the corner, as a share of the screen's",
     )
+    parser.add_argument(
+        "--cover",
+        choices=STYLES,
+        default="black",
+        help="how covers look: solid black, or blurred from the colours around them. "
+        "Both hide the same areas. Switch live from the panel",
+    )
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--delay", type=float, default=1.0, help="seconds behind live")
     parser.add_argument(
@@ -502,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         compositor = PictureInPictureCompositor(detect, padding=padding)
         warm_up(corner)
         warm_up(alone)
+    compositor.style = args.cover  # switchable live from the panel
     sink = (DiscardingCam if args.no_output else VirtualCam)(fps=args.fps)
     if args.look_ahead is None:
         args.look_ahead = min(LOOK_AHEAD, max(args.delay, 0) * LOOK_AHEAD_SHARE)
@@ -512,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         look_ahead=args.look_ahead,
     )
     controller = LivePipelineController(
-        pipeline, getattr(detect, "configure", None), views=views
+        pipeline, getattr(detect, "configure", None), views=views, compositor=compositor
     )
     measuring = args.max_frames is not None  # a bounded run is a measurement, not a stream
     server, keys = start_controls(

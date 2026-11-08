@@ -21,6 +21,7 @@ Category = Literal[
 Source = Literal["screen", "webcam", "irl"]
 Mode = Literal["desktop", "irl"]
 View = Literal["screen", "both", "webcam"]  # what goes out: see eclipse/capture/dual.py
+CoverStyle = Literal["black", "blur"]  # how covers look: see eclipse/compositor/compositor.py
 
 
 class PanelConfig(BaseModel):
@@ -55,6 +56,11 @@ class ViewConfig(BaseModel):
     view: View
 
 
+class CoverConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    style: CoverStyle
+
+
 class DetectorHealth(str, Enum):
     READY = "ready"
     UNAVAILABLE = "unavailable"
@@ -70,6 +76,7 @@ class PanelState(BaseModel):
     # has a single source, as without --with-webcam.
     view: View | None = None
     views: list[View] = Field(default_factory=list)
+    cover_style: CoverStyle = "black"
     enabled: list[Category] = Field(default_factory=lambda: list(ALL_CATEGORIES))
     keywords: list[str] = Field(default_factory=list)
     config_status: Literal["applied", "pending", "failed"] = "applied"
