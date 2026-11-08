@@ -35,6 +35,12 @@ _WHOLE_PIXEL = 0.05  # a shift this close to a whole number lands text on the sa
 _SCROLL_RECHECK = 30  # frames of fractional scrolling between reads of the whole view
 _UNREAD_READ_AT = 96  # rows of incoming text to collect before reading them
 _UNREAD_KEEP = 24  # rows left black after a read, as the last line may be cut off
+_MOVE_MIN_HEIGHT = 60  # a changed area smaller than this isn't checked for a moved window
+_MOVE_MIN_WIDTH = 100
+_MOVE_COARSE = 4  # the shift is first estimated on frames this many times smaller
+_MOVE_SAMPLES = 4000  # textured pixels that vote on the exact shift
+_MOVE_MIN_SHARE = 0.25  # share of changed textured pixels the shift must explain
+_TEXTURE = 40  # a pixel this far from its neighbours' range is part of text or an edge
 
 
 class DetectionError(RuntimeError):
@@ -326,6 +332,26 @@ def _unexplained(
     return cv2.max(_strongest(too_dark), _strongest(too_bright)) > _NOISE_FLOOR
 
 
+def _texture(gray) -> np.ndarray:
+    """Pixels on text or an edge: blank areas match any shift, so they can't vote."""
+    kernel = np.ones((3, 3), np.uint8)
+    return cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel) > _TEXTURE
+
+
+def _shifted_match(image, before, dx: int, dy: int, area) -> np.ndarray:
+    """Within area (top, bottom, left, right), the pixels that show exactly what the
+    previous frame showed dx, dy away. Pixels whose source is off the frame never match."""
+    height, width = image.shape[:2]
+    top, bottom, left, right = area
+    match = np.zeros((bottom - top, right - left), bool)
+    t, b = max(top, dy, 0), min(bottom, height + dy, height)
+    l, r = max(left, dx, 0), min(right, width + dx, width)
+    if b > t and r > l:
+        difference = cv2.absdiff(image[t:b, l:r], before[t - dy : b - dy, l - dx : r - dx])
+        match[t - top : b - top, l - left : r - left] = difference.max(axis=2) <= _NOISE_FLOOR
+    return match
+
+
 def _text_hash(text: str) -> int:
     """Tells text apart across reads, so tracks never have to keep the text itself."""
     return hash(''.join(text.split()).lower())
@@ -348,6 +374,7 @@ class Detector:
             'scanned_share': 0.0, 'diff_seconds': 0.0, 'find_seconds': 0.0,
             'det_seconds': 0.0, 'rec_seconds': 0.0, 'reads': 0, 'lines': 0, 'scrolls': 0,
             'checks': 0, 'copy_seconds': 0.0, 'track_seconds': 0.0, 'cached_frames': 0,
+            'moves': 0,
         }
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
@@ -371,6 +398,8 @@ class Detector:
         self._scroll_edge = _SCROLL_EDGE * pixel_scale
         self._unread_read_at = _UNREAD_READ_AT * pixel_scale
         self._unread_keep = _UNREAD_KEEP * pixel_scale
+        self._move_min_height = _MOVE_MIN_HEIGHT * pixel_scale
+        self._move_min_width = _MOVE_MIN_WIDTH * pixel_scale
         self._tracks = CoverTracks(pixel_scale)
         self._shape = None
         self._lock = threading.RLock()
@@ -430,6 +459,8 @@ class Detector:
         self._boxes = ()
         self._unread = {}  # one strip for each way rows can come in: 1 is down, -1 is up
         self._scrolled = False
+        self._moved = False  # whether known text moved with a window this frame
+        self._last_move = None  # the last window move, which the next one likely repeats
         self._view = None  # top and bottom of the area scrolling now
         self._fractional_frames = 0  # frames of this scroll that landed between pixels
 
@@ -567,6 +598,139 @@ class Detector:
         self._collect_unread(shift, left, right, first_row, length, remaining)
         return remaining
 
+    def _move_shift(self, image, changed, area):
+        """The dx, dy that a window moving whole explains best, or None.
+
+        Unchanged pixels are blanked before comparing, so still content around the move
+        can't vote for no move at all. The estimate only proposes: the shift has to make
+        nearly all sampled text pixels match exactly before anything is moved by it.
+        """
+        top, bottom, left, right = area
+        now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        mask = changed[top:bottom, left:right]
+        size = (max((right - left) // _MOVE_COARSE, 8), max((bottom - top) // _MOVE_COARSE, 8))
+        small = []
+        for gray in (before, now):
+            values = np.where(mask, gray.astype(np.float32) - float(gray[mask].mean()), 0)
+            small.append(cv2.resize(values.astype(np.float32), size, interpolation=cv2.INTER_AREA))
+        window = cv2.createHanningWindow(size, cv2.CV_32F)
+        (sx, sy), _ = cv2.phaseCorrelate(small[0], small[1], window)
+        guess = (round(sx * _MOVE_COARSE), round(sy * _MOVE_COARSE))
+
+        textured = _texture(now) & mask
+        ys, xs = np.nonzero(textured)
+        if ys.size < _MOVE_SAMPLES // 8:
+            return None
+        if ys.size > _MOVE_SAMPLES:
+            pick = np.linspace(0, ys.size - 1, _MOVE_SAMPLES).astype(int)
+            ys, xs = ys[pick], xs[pick]
+        ys, xs = ys + top, xs + left
+        height, width = image.shape[:2]
+        candidates = {
+            (guess[0] + ex, guess[1] + ey)
+            for ex in range(-_MOVE_COARSE, _MOVE_COARSE + 1)
+            for ey in range(-_MOVE_COARSE, _MOVE_COARSE + 1)
+        }
+        if self._last_move is not None:
+            candidates.add(self._last_move)
+        best, best_share = None, 0.0
+        for dx, dy in candidates:
+            if (dx, dy) == (0, 0):
+                continue
+            sy_, sx_ = ys - dy, xs - dx
+            inside = (sy_ >= 0) & (sy_ < height) & (sx_ >= 0) & (sx_ < width)
+            if not inside.any():
+                continue
+            difference = np.abs(
+                image[ys[inside], xs[inside]].astype(np.int16)
+                - self._previous[sy_[inside], sx_[inside]].astype(np.int16)
+            ).max(axis=1)
+            share = float((difference <= _NOISE_FLOOR).sum()) / ys.size
+            if share > best_share:
+                best, best_share = (dx, dy), share
+        if best is None or best_share < _MOVE_MIN_SHARE:
+            return None
+        return best
+
+    def _follow_move(self, image, changed):
+        """If a window moved whole, move known text and covers along with it.
+
+        Something moved whole when its pixels now show exactly what the previous frame
+        showed one fixed dx, dy away. Known text moves only if every pixel of its new
+        place matches; anything else is read again, as is every pixel the move doesn't
+        explain, so a wrong shift only costs time. Returns what still needs reading.
+        """
+        rows = np.flatnonzero(changed.any(axis=1))
+        if not rows.size:
+            return changed
+        columns = np.flatnonzero(changed.any(axis=0))
+        top, bottom = int(rows[0]), int(rows[-1]) + 1
+        left, right = int(columns[0]), int(columns[-1]) + 1
+        if bottom - top < self._move_min_height or right - left < self._move_min_width:
+            return changed
+
+        shift = self._move_shift(image, changed, (top, bottom, left, right))
+        if shift is None:
+            self._last_move = None
+            return changed
+        dx, dy = shift
+        height, width = image.shape[:2]
+        # Where moved content can be now: the changed area and its own copy dx, dy away.
+        area = (
+            max(min(top, top + dy), 0), min(max(bottom, bottom + dy), height),
+            max(min(left, left + dx), 0), min(max(right, right + dx), width),
+        )
+        match = np.zeros_like(changed)
+        match[area[0]:area[1], area[2]:area[3]] = _shifted_match(
+            image, self._previous, dx, dy, area
+        )
+        explained = changed & match
+        if not explained.any():
+            return changed
+        self._last_move = shift
+        self._moved = True
+        self.stats['moves'] += 1
+        remaining = changed & ~match
+
+        def action(rect) -> str:
+            x1, y1, x2, y2 = rect[:4]
+            old = (
+                max(math.floor(y1), 0), min(math.ceil(y2), height),
+                max(math.floor(x1), 0), min(math.ceil(x2), width),
+            )
+            if old[1] <= old[0] or old[3] <= old[2] or not changed[
+                old[0]:old[1], old[2]:old[3]
+            ].any():
+                return STAY  # nothing changed where it was: still text beside the move
+            new = (
+                max(math.floor(y1 + dy), 0), min(math.ceil(y2 + dy), height),
+                max(math.floor(x1 + dx), 0), min(math.ceil(x2 + dx), width),
+            )
+            if new[1] <= new[0] or new[3] <= new[2]:
+                return REREAD  # it would leave the frame, so nothing is known about it
+            if match[new[0]:new[1], new[2]:new[3]].all():
+                return MOVE  # what's left of it on the frame shows exactly what it had
+            return REREAD
+
+        moved = []
+        for region in self._regions:
+            todo = action(region)
+            x1, y1, x2, y2, text = region
+            if todo == STAY:
+                moved.append(region)
+            elif todo == MOVE:
+                moved.append((x1 + dx, y1 + dy, x2 + dx, y2 + dy, text))
+            else:
+                # Read the line whole wherever it may be now, never just the part that changed.
+                for place in ((x1, y1, x2, y2), (x1 + dx, y1 + dy, x2 + dx, y2 + dy)):
+                    remaining[_inside(place)] = True
+        for place in self._tracks.follow_move(action, dx, dy):
+            remaining[_inside(place)] = True
+            remaining[_inside((place[0] + dx, place[1] + dy, place[2] + dx, place[3] + dy))] = True
+        self._regions = moved
+        return remaining
+
     def _collect_unread(self, shift, left, right, first, length, remaining):
         """Track rows new to the screen. They stay black until they can be read.
 
@@ -631,6 +795,9 @@ class Detector:
                 cv2.bitwise_or(difference[0], difference[1]), difference[2]
             ) > 0
         changed = self._follow_scroll(image, changed)
+        if not self._scrolled and not self._noise_floor:
+            # A camera's noise never matches exactly, and its pictures aren't windows.
+            changed = self._follow_move(image, changed)
         self._read_unread(changed)
 
         for place in self._tracks.due():
@@ -864,13 +1031,14 @@ class Detector:
                 diff_started = time.monotonic()
                 self.stats['copy_seconds'] += diff_started - copy_started
                 self._scrolled = False
+                self._moved = False
                 areas = self._changed_areas(snapshot)
                 self.stats['frames'] += 1
                 self.stats['diff_seconds'] += time.monotonic() - diff_started
                 self.reused_read = not areas
                 self.stats['cached_frames'] += self.reused_read
 
-                if not areas and not self._scrolled:
+                if not areas and not self._scrolled and not self._moved:
                     return list(self._boxes)
 
                 if self._reader is None:
