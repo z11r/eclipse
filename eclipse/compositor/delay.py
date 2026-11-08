@@ -299,6 +299,8 @@ class DelayedPipeline:
                     self.stats.capture_attempts += 1
                     if paced or self._room_for_a_frame():
                         self._grab()
+                        if getattr(self._source, "finished", False):
+                            break  # a recorded clip ran out: drain what's queued and stop
                     else:
                         with self._lock:
                             self.stats.capture_skips += 1

@@ -542,8 +542,8 @@ def test_main_connects_the_real_controller(monkeypatch):
     built = {}
 
     class Recording(app.LivePipelineController):
-        def __init__(self, pipeline, configure):
-            super().__init__(pipeline, configure, Path("/nonexistent/config.json"))
+        def __init__(self, pipeline, configure, **options):
+            super().__init__(pipeline, configure, Path("/nonexistent/config.json"), **options)
             built["controller"] = self
 
     def controls(controller, panel, hotkey):

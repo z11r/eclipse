@@ -12,20 +12,25 @@ import signal
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Callable
 
 import cv2
+import numpy as np
 
+from eclipse.capture.clip import LiveClip
+from eclipse.capture.dual import PIP_SIZE, VIEWS, DualCapture
 from eclipse.capture.pattern import TestPattern
 from eclipse.capture.preferred import PreferredCapture
 from eclipse.capture.screen import ScreenCapture
 from eclipse.capture.webcam import WebcamCapture
 from eclipse.compositor.compositor import PADDING, Compositor
 from eclipse.compositor.delay import DelayedPipeline
+from eclipse.compositor.pip import PictureInPictureCompositor, PictureInPictureDetector
 from eclipse.output.virtual_cam import DiscardingCam, VirtualCam
 from eclipse.panel.app import PANEL_HOST, PANEL_PORT, start_panel
 from eclipse.panel.controller import LivePipelineController
-from eclipse.panel.hotkey import PANIC_KEYS, PanicHotkey
+from eclipse.panel.hotkey import PANIC_KEYS, VIEW_KEYS, PanicHotkey
 from eclipse.platform import (
     AppleVisionReader,
     WindowsOCRReader,
@@ -34,9 +39,16 @@ from eclipse.platform import (
 )
 from eclipse.text_detect import TextDetector
 from eclipse.text_detect.read_ahead import OcrPool, ReadAhead, ReadError
+from eclipse.types import Frame
 
 
 RETINA_MAX_WIDTH = 6016  # wide enough never to shrink a built-in or Studio Display
+# A camera's 8x8 block averages wander up to about 6 from noise alone. New text moves
+# them far more, so only the parts of the picture that really changed are read again.
+WEBCAM_NOISE_FLOOR = 8
+# OCR threads for the camera when it runs beside the screen. Its reads are small, and
+# the screen's reader keeps its six, so together they still leave cores for OBS.
+WEBCAM_OCR_THREADS = 2
 
 
 class StatsLog:
@@ -126,6 +138,16 @@ class StatsLog:
         rules_ms = ms("detect.find_seconds", scanned)
         track_ms = ms("detect.track_seconds", scanned)
         known_ms = copy_ms + diff_ms + ocr_ms + rules_ms + track_ms
+        webcam = ""
+        if "detect.webcam_scans" in now:
+            webcam_scans = count("detect.webcam_scans")
+            webcam = (
+                f"webcam scans {webcam_scans} repeats {count('detect.webcam_repeats')} "
+                f"reads {count('detect.webcam_reads')} "
+                f"ms/scan {ms('detect.webcam_scan_seconds', webcam_scans):.1f} "
+                f"camera {fps('capture.webcam_frames'):.1f}fps "
+                f"screen {fps('capture.screen_frames'):.1f}fps | "
+            )
         age = -1.0
         if stats.last_presented_at is not None:
             age = (now["clock.seconds"] - stats.last_presented_at) * 1000
@@ -174,6 +196,7 @@ class StatsLog:
             f"ms/read {ms('detect.scan_seconds', reads):.0f} "
             f"lines/read {count('detect.lines') / max(reads, 1):.0f} "
             f"det {ms('detect.det_seconds', reads):.0f} rec {ms('detect.rec_seconds', reads):.0f} | "
+            f"{webcam}"
             f"busy capture {busy('capture.grab_seconds', 'capture.convert_seconds'):.0%} "
             f"scan {busy('pipeline.scan_seconds'):.0%} "
             f"output {busy('output.fit_seconds', 'output.send_seconds'):.0%} "
@@ -210,6 +233,29 @@ def screen_source(capture: str, max_width: int, retina: bool, fps: int):
     return PreferredCapture(ScreenCaptureKitCapture(max_width, retina, fps), polling)
 
 
+def warm_up(detector) -> None:
+    """Load a detector's OCR model now, on its own thread, so the first switch to a
+    view that needs it doesn't freeze the picture while the model loads. A blank
+    picture of another size, so the first real frame starts afresh."""
+
+    def run() -> None:
+        try:
+            detector(Frame(np.zeros((64, 64, 3), np.uint8), 0.0, "webcam", -1))
+        except Exception:
+            pass  # a real frame will try again, and fail closed if it must
+
+    threading.Thread(target=run, name="eclipse-warm-up", daemon=True).start()
+
+
+def camera_input(value: str):
+    """A camera index, or a recorded clip standing in for a camera."""
+    if value.isdigit():
+        return WebcamCapture(int(value))
+    if not Path(value).is_file():
+        raise FileNotFoundError(value)
+    return LiveClip(value, "webcam", loop=True)
+
+
 def _stop_on_sigterm() -> Callable[[], None]:
     """Treat a polite kill like Ctrl+C, so it ends in black too. Returns how to undo it."""
 
@@ -232,22 +278,28 @@ def start_controls(controller: LivePipelineController, panel: bool, hotkey: bool
             print(f"Panel unavailable: {PANEL_HOST}:{PANEL_PORT} didn't start")
         else:
             print(f"Panel at http://{PANEL_HOST}:{PANEL_PORT}")
-    keys = None
+    keys = []
     if hotkey:
-        keys = PanicHotkey(controller.panic)
-        if keys.start():
+        panic = PanicHotkey(controller.panic)
+        if panic.start():
+            keys.append(panic)
             print(f"Panic key: {PANIC_KEYS}")
         else:
             print(
                 "Panic key unavailable. On macOS, allow Input Monitoring in System Settings "
                 "> Privacy & Security. The panel's panic button still works."
             )
+        if controller.views:
+            switch = PanicHotkey(controller.next_view, VIEW_KEYS)
+            if switch.start():
+                keys.append(switch)
+                print(f"Switch view key: {VIEW_KEYS} ({' > '.join(controller.views)})")
     return server, keys
 
 
 def stop_controls(server, keys) -> None:
-    if keys is not None:
-        keys.stop()
+    for key in keys or ():
+        key.stop()
     if server is not None:
         server.should_exit = True
 
@@ -264,6 +316,37 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         metavar="INDEX",
         help="capture this camera instead of the screen (0 is usually the built-in one)",
+    )
+    parser.add_argument(
+        "--clip",
+        metavar="PATH",
+        help="play a recorded video through the live pipeline instead of the screen",
+    )
+    parser.add_argument(
+        "--clip-source",
+        choices=["screen", "webcam", "irl"],
+        default="screen",
+        help="what the clip stands in for, as tagged on its frames",
+    )
+    parser.add_argument("--loop", action="store_true", help="replay the clip when it ends")
+    parser.add_argument(
+        "--with-webcam",
+        metavar="INDEX_OR_CLIP",
+        help="add this camera in a corner of the screen (or clip); each is scanned "
+        "separately. A video file path stands in for the camera, looped",
+    )
+    parser.add_argument(
+        "--view",
+        choices=VIEWS,
+        default="both",
+        help="with --with-webcam, what to show first: the screen, both, or the webcam. "
+        "Switch live with the panel's PUT /api/view or the switch view key",
+    )
+    parser.add_argument(
+        "--pip-size",
+        type=float,
+        default=PIP_SIZE,
+        help="the camera's width in the corner, as a share of the screen's",
     )
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--delay", type=float, default=1.0, help="seconds behind live")
@@ -299,6 +382,15 @@ def main(argv: list[str] | None = None) -> int:
         "--no-hotkey", action="store_true", help="no panic key, as with --max-frames"
     )
     args = parser.parse_args(argv)
+    chosen = [args.test_pattern, args.webcam is not None, args.clip is not None]
+    if sum(chosen) > 1:
+        parser.error("pick one of --test-pattern, --webcam and --clip")
+    if args.loop and args.clip is None:
+        parser.error("--loop only works with --clip")
+    if args.with_webcam is not None and (args.test_pattern or args.webcam is not None):
+        parser.error("--with-webcam adds a camera to the screen or a --clip")
+    if not 0 < args.pip_size <= 1:
+        parser.error("--pip-size must be above 0 and at most 1")
     cv2.setNumThreads(2)  # leave the cores to OBS
 
     padding = PADDING
@@ -308,7 +400,15 @@ def main(argv: list[str] | None = None) -> int:
         detect = source.detect
     elif args.webcam is not None:
         source = WebcamCapture(args.webcam)
-        detect = TextDetector()
+        detect = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR)
+    elif args.clip is not None:
+        if not Path(args.clip).is_file():
+            print(f"No clip at {args.clip}")
+            return 1
+        source = LiveClip(args.clip, args.clip_source, args.loop)
+        # A webcam recording carries sensor noise, so it needs the webcam's noise floor.
+        noise = WEBCAM_NOISE_FLOOR if args.clip_source == "webcam" else 0
+        detect = TextDetector(noise_floor=noise)
     else:
         if not screen_capture_allowed():
             print(
@@ -336,11 +436,29 @@ def main(argv: list[str] | None = None) -> int:
             detect = TextDetector()
 
     compositor = Compositor(padding=padding)
+    views = None
+    if args.with_webcam is not None:
+        try:
+            camera = camera_input(args.with_webcam)
+        except FileNotFoundError:
+            print(f"No camera clip at {args.with_webcam}")
+            return 1
+        source = views = DualCapture(source, camera, args.pip_size, args.fps, args.view)
+        # RapidOCR for the camera even with Apple OCR on the screen: Vision allows one
+        # read per process, and misses small text on a camera's lower resolution.
+        corner = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR, ocr_threads=WEBCAM_OCR_THREADS)
+        alone = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR)  # the camera at full size
+        detect = PictureInPictureDetector(detect, corner, alone)
+        compositor = PictureInPictureCompositor(detect, padding=padding)
+        warm_up(corner)
+        warm_up(alone)
     sink = (DiscardingCam if args.no_output else VirtualCam)(fps=args.fps)
     pipeline = DelayedPipeline(
         source, sink, detect, compositor, args.delay, args.fps, args.max_frames
     )
-    controller = LivePipelineController(pipeline, getattr(detect, "configure", None))
+    controller = LivePipelineController(
+        pipeline, getattr(detect, "configure", None), views=views
+    )
     measuring = args.max_frames is not None  # a bounded run is a measurement, not a stream
     server, keys = start_controls(
         controller, not (args.no_panel or measuring), not (args.no_hotkey or measuring)

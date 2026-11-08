@@ -60,6 +60,31 @@ Useful options:
 
 Don't run `python eclipse/main.py`. That puts the package folder on Python's import path, where our `platform.py` hides the standard library module of the same name.
 
+To debug with the same input every time, play a recorded clip through the live pipeline instead of the screen. It plays at the clip's own speed and stops when the clip ends:
+
+```bash
+python -m eclipse.main --clip eval/clips/planted_secrets.mp4
+```
+
+Add `--loop` to replay it, and `--clip-source webcam` or `--clip-source irl` to tag its frames as that source.
+
+To stream the screen and a webcam together, add the camera's index. It goes in the bottom right corner, a quarter of the screen's width (change that with `--pip-size 0.3`):
+
+```bash
+python -m eclipse.main --with-webcam 0
+```
+
+The screen and the camera are each scanned on their own, side by side, and joined only after both are covered. A face moving in the corner never makes the screen be read again, and a camera picture that hasn't changed since the last frame isn't read at all. A video file path in place of the index stands in for the camera, looped, and it works with `--clip` too.
+
+With `--with-webcam`, you can switch live between three views: `screen`, `both` (the default) and `webcam` (the camera alone, full size). Start on another one with `--view screen`. To switch:
+
+- Press Ctrl+Alt+V to step through screen, both, webcam and round again.
+- Or, for the panel, call `PUT /api/view` with `{"view": "screen" | "both" | "webcam"}`. It returns the panel state. `GET /api/state` reports `view` (the current one) and `views` (the ones this run can switch to). A run without a webcam reports `null` and `[]`, and `PUT /api/view` returns 409.
+
+Both inputs keep running in every view, so a switch takes effect on the next frame. A switch that adds a source (screen → both) just shows up after the usual delay. A switch that drops one (both → screen, or anything → webcam) cuts the output at once: black goes out for about the delay (1 s by default) until the new view's first checked frame arrives, so nothing of the dropped source is shown after the switch.
+
+If the camera's scan falls behind, the screen doesn't wait for it. The corner keeps the last camera picture that was checked, with its covers, so only the corner slows down. The screen waits only if that picture would be more than half a second behind.
+
 Run the tests with:
 
 ```bash
