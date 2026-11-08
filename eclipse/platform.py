@@ -47,6 +47,19 @@ def camera_backend() -> int:
     return cv2.CAP_ANY
 
 
+def stamped_virtual_camera(width: int, height: int):
+    """OBS Virtual Camera that stamps each frame with the tick it is due, or None.
+
+    Only on macOS, where Eclipse writes to OBS's camera extension itself. Elsewhere
+    pyvirtualcam sends the frames and stamps them as they leave.
+    """
+    if not IS_MAC:
+        return None
+    from eclipse.output.obs_mac_camera import ObsMacCamera
+
+    return ObsMacCamera(width, height)
+
+
 def screen_capture_allowed() -> bool:
     """Whether this process may record the screen.
 

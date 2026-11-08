@@ -152,13 +152,20 @@ def test_percentile_handles_no_samples():
 
 
 class FakeCamera:
+    """Records when each frame left and which tick it was stamped with."""
+
     device = "fake"
 
-    def __init__(self, **kwargs):
+    def __init__(self, *args):
         self.times = []
+        self.dues = []
 
-    def send(self, image):
+    def prepare(self, image):
+        return image
+
+    def send(self, image, due):
         self.times.append(virtual_cam.time.monotonic())
+        self.dues.append(due)
 
     def close(self):
         pass
@@ -180,7 +187,7 @@ class FakeClock:
 def test_new_and_repeated_frames_leave_on_the_same_ticks(monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(virtual_cam, "time", clock)
-    monkeypatch.setattr(virtual_cam.pyvirtualcam, "Camera", FakeCamera)
+    monkeypatch.setattr(virtual_cam, "open_camera", FakeCamera)
 
     def slow_fit(image, width, height):
         clock.now += 0.008
@@ -200,7 +207,7 @@ def test_new_and_repeated_frames_leave_on_the_same_ticks(monkeypatch):
 def test_output_running_late_is_counted_and_does_not_burst_to_catch_up(monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(virtual_cam, "time", clock)
-    monkeypatch.setattr(virtual_cam.pyvirtualcam, "Camera", FakeCamera)
+    monkeypatch.setattr(virtual_cam, "open_camera", FakeCamera)
     fits = iter([0.0, 0.1, 0.0, 0.0])
 
     def uneven_fit(image, width, height):
@@ -215,6 +222,46 @@ def test_output_running_late_is_counted_and_does_not_burst_to_catch_up(monkeypat
         gaps = np.diff(cam._camera.times)
     assert cam.stats["late_ticks"] == 1
     assert min(gaps) >= 1 / 60 - 1e-9  # never two frames at once after a stall
+
+
+def test_frames_are_stamped_with_their_tick_not_with_when_they_left(monkeypatch):
+    """OBS paces by the stamp, so a late wake-up must not move it."""
+    clock = FakeClock()
+    monkeypatch.setattr(virtual_cam, "time", clock)
+    monkeypatch.setattr(virtual_cam, "open_camera", FakeCamera)
+    wake_ups = iter([0.0, 0.004, 0.0, 0.012, 0.001, 0.0])
+
+    def oversleep(seconds):
+        clock.now += seconds + next(wake_ups)
+
+    clock.sleep = oversleep
+    cam = virtual_cam.VirtualCam(fps=60)
+    with cam:
+        for index in range(6):
+            cam.send(picture(index))
+    assert np.diff(cam._camera.dues) == pytest.approx(1 / 60)
+    assert max(np.array(cam._camera.times) - cam._camera.dues) == pytest.approx(0.012)
+
+
+def test_a_stall_keeps_the_stamps_on_one_grid(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(virtual_cam, "time", clock)
+    monkeypatch.setattr(virtual_cam, "open_camera", FakeCamera)
+    fits = iter([0.0, 0.0, 0.07, 0.0, 0.0])
+
+    def uneven_fit(image, width, height):
+        clock.now += next(fits)
+        return image
+
+    monkeypatch.setattr(virtual_cam, "fit", uneven_fit)
+    cam = virtual_cam.VirtualCam(fps=60)
+    with cam:
+        for index in range(5):
+            cam.send(picture(index))
+    ticks = (np.array(cam._camera.dues) - cam._camera.dues[0]) * 60
+    assert ticks == pytest.approx(np.round(ticks), abs=1e-6)  # whole ticks apart
+    assert list(np.round(np.diff(ticks))) == [1, 5, 1, 1]  # the stall skips ticks, never shifts them
+    assert all(sent >= due for sent, due in zip(cam._camera.times, cam._camera.dues))
 
 
 def test_a_lagging_scan_sheds_new_frames_instead_of_scanning_stale_ones():

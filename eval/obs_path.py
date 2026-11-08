@@ -8,12 +8,21 @@ sent frame it shows, so a repeat or a skip can't hide behind a healthy send coun
     python -m eval.obs_path send --seconds 25 --fps 60
     python -m eval.obs_path verify ~/Movies     (the newest recording there)
 
+To compare output paths in one recording, run segments back to back. Each segment
+numbers its frames from its own block of 10000, so verify reports them separately:
+
+    python -m eval.obs_path send --seconds 10 --plan pyvirtualcam,stamped,pyvirtualcam+late,stamped+late
+
+"stamped" is VirtualCam's own camera, "pyvirtualcam" the old path, and "+late" holds
+each frame up to --late-ms after its tick, the way a busy Eclipse wakes up late.
+
 No screen content is involved, so the recording holds only this pattern.
 """
 
 from __future__ import annotations
 
 import argparse
+import random
 import statistics
 import sys
 import time
@@ -24,9 +33,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from eclipse.output import virtual_cam
 from eclipse.output.virtual_cam import OUTPUT_HEIGHT, OUTPUT_WIDTH, VirtualCam
 
 BITS = 16
+SEGMENT = 10000  # frame numbers per plan segment, so up to 6 segments fit in BITS
 CHECK_BITS = 8
 CELL = 64  # pixels at 1080p, so a block is still 42 pixels wide at 720p
 MARGIN = 32
@@ -135,27 +146,70 @@ def analyse(numbers: list[int | None], recorded_fps: float) -> PathReport:
     )
 
 
-def send(seconds: float, fps: int) -> None:
+class PyVirtualCamOutput(VirtualCam):
+    """The old output path: pyvirtualcam stamps each frame with when it leaves."""
+
+    def _open_camera(self):
+        return virtual_cam.PyVirtualCamera(OUTPUT_WIDTH, OUTPUT_HEIGHT, self._fps)
+
+
+OUTPUTS = {"stamped": VirtualCam, "pyvirtualcam": PyVirtualCamOutput}
+
+
+def parse_plan(plan: str) -> list[tuple[str, bool]]:
+    """Segments like "stamped" or "pyvirtualcam+late", in the order they run."""
+    steps = []
+    for item in plan.split(","):
+        name, _, extra = item.strip().partition("+")
+        if name not in OUTPUTS or extra not in ("", "late"):
+            raise ValueError(f"Unknown plan step {item!r}: use {', '.join(OUTPUTS)}, optionally +late")
+        steps.append((name, extra == "late"))
+    if len(steps) > (1 << BITS) // SEGMENT:
+        raise ValueError(f"At most {(1 << BITS) // SEGMENT} segments fit in one recording")
+    return steps
+
+
+def send(seconds: float, fps: int, plan: str = "stamped", late_ms: float = 10.0) -> None:
+    steps = parse_plan(plan)
     frames = int(seconds * fps)
-    print(f"Sending {frames} numbered frames at {fps} fps. Start recording in OBS now.")
-    camera = VirtualCam(fps=fps)
-    gaps = []
-    with camera:
-        last = None
-        started = time.monotonic()
-        for index in range(frames):
-            camera.send(pattern(index))
-            now = time.monotonic()
-            if last is not None:
-                gaps.append((now - last) * 1000)
-            last = now
-        elapsed = time.monotonic() - started
-    gaps.sort()
-    print(
-        f"Sent {frames} in {elapsed:.1f} s = {frames / elapsed:.2f} fps, interval ms "
-        f"p50 {gaps[len(gaps) // 2]:.2f} p95 {gaps[int(len(gaps) * 0.95)]:.2f} max {gaps[-1]:.2f}, "
-        f"late ticks {camera.stats['late_ticks']}"
-    )
+    if frames > SEGMENT:
+        raise ValueError(f"At most {SEGMENT} frames per segment")
+    print(f"Sending {len(steps)} x {frames} numbered frames at {fps} fps. Start recording in OBS now.")
+    rng = random.Random(1)
+    for segment, (name, late) in enumerate(steps):
+        if segment:
+            time.sleep(1.5)  # a visible gap, and OBS starts a fresh timeline for the next path
+        hold = late_ms / 1000 if late else 0.0
+
+        def may_send() -> bool:  # runs after the tick, so this delays the frame's departure
+            time.sleep(rng.uniform(0, hold))
+            return True
+
+        label = name + (f"+late (up to {late_ms:g} ms)" if late else "")
+        camera = OUTPUTS[name](fps=fps)
+        gaps = []
+        try:
+            with camera:
+                last = None
+                started = time.monotonic()
+                for index in range(frames):
+                    camera.send(pattern(segment * SEGMENT + index), may_send if hold else None)
+                    now = time.monotonic()
+                    if last is not None:
+                        gaps.append((now - last) * 1000)
+                    last = now
+                elapsed = time.monotonic() - started
+        except Exception as error:  # keep the recording useful for the other segments
+            print(f"Segment {segment} {label} failed: {type(error).__name__}: {error}")
+            continue
+        gaps.sort()
+        dropped = getattr(camera._camera, "stats", {})
+        print(
+            f"Segment {segment} {label}: sent {frames} in {elapsed:.1f} s = {frames / elapsed:.2f} fps, "
+            f"interval ms p50 {gaps[len(gaps) // 2]:.2f} p95 {gaps[int(len(gaps) * 0.95)]:.2f} "
+            f"max {gaps[-1]:.2f}, late ticks {camera.stats['late_ticks']}"
+            + (f", camera {dropped}" if dropped else "")
+        )
 
 
 def newest_recording(folder: str) -> str | None:
@@ -192,20 +246,39 @@ def verify(path: str) -> int:
             break
         numbers.append(read_number(image))
     video.release()
-    report = analyse(numbers, recorded_fps)
-    per_second = report.fresh_per_second or [0]
     print(f"Recording: {width}x{height} at {recorded_fps:.2f} fps, {len(numbers)} frames")
-    print(
-        f"Measured over {report.seconds:.1f} s: {report.fresh_fps:.2f} fresh frames per second "
-        f"(per second: median {statistics.median(per_second)}, min {min(per_second)}, "
-        f"max {max(per_second)})"
-    )
-    print(
-        f"Repeats {report.repeats}, sent frames lost {report.skipped}, went backwards "
-        f"{report.backwards}, unreadable {report.undecoded}, "
-        f"longest hold {report.longest_hold} frames"
-    )
+    for segment, part in split_segments(numbers).items():
+        report = analyse(part, recorded_fps)
+        per_second = report.fresh_per_second or [0]
+        print(
+            f"Segment {segment}: {report.fresh_fps:.2f} fresh frames per second over "
+            f"{report.seconds:.1f} s (per second: median {statistics.median(per_second)}, "
+            f"min {min(per_second)}, max {max(per_second)})"
+        )
+        print(
+            f"  Repeats {report.repeats}, sent frames lost {report.skipped}, went backwards "
+            f"{report.backwards}, unreadable {report.undecoded}, "
+            f"longest hold {report.longest_hold} frames"
+        )
     return 0
+
+
+def split_segments(numbers: list[int | None]) -> dict[int, list[int | None]]:
+    """Each plan segment's stretch of the recording, with other segments' frames blanked."""
+    spans: dict[int, list[int]] = {}
+    for index, number in enumerate(numbers):
+        if number is not None:
+            span = spans.setdefault(number // SEGMENT, [index, index])
+            span[1] = index
+    if not spans:
+        return {0: numbers}
+    return {
+        segment: [
+            number if number is not None and number // SEGMENT == segment else None
+            for number in numbers[first : last + 1]
+        ]
+        for segment, (first, last) in sorted(spans.items())
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -214,11 +287,13 @@ def main(argv: list[str] | None = None) -> int:
     sender = commands.add_parser("send")
     sender.add_argument("--seconds", type=float, default=25)
     sender.add_argument("--fps", type=int, default=60)
+    sender.add_argument("--plan", default="stamped", help="comma-separated output paths to run in turn")
+    sender.add_argument("--late-ms", type=float, default=10.0, help="most a +late segment holds a frame")
     checker = commands.add_parser("verify")
     checker.add_argument("path")
     args = parser.parse_args(argv)
     if args.command == "send":
-        send(args.seconds, args.fps)
+        send(args.seconds, args.fps, args.plan, args.late_ms)
         return 0
     return verify(args.path)
 
