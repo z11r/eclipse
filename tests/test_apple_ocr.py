@@ -157,3 +157,28 @@ def test_email_in_sentence_keeps_surrounding_words_visible():
     boxes = [d for d in detections if d.category == 'email']
     assert boxes
     assert all(d.x > x+prefix_width-80 and d.x+d.w < x+prefix_width+email_width+80 for d in boxes)
+
+
+@needs_mac
+@pytest.mark.parametrize('secret', ['password=INVALID_DEMO_8842', 'API_KEY=DEMO_UNUSED_219B'])
+@pytest.mark.parametrize('foreground,background', [
+    ((0, 0, 200), (0, 255, 255)),
+    ((130, 0, 130), (255, 0, 255)),
+    ((240, 240, 240), (30, 30, 30)),
+])
+def test_styled_labeled_credential_is_detected_without_hiding_sentence(secret, foreground, background):
+    image = np.full((500, 2400, 3), 255, np.uint8)
+    prefix, suffix = 'The dummy field ', ' inside the sentence.'
+    x, y, scale, thickness = 50, 250, 1.3, 2
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    prefix_width = cv2.getTextSize(prefix, font, scale, thickness)[0][0]
+    secret_width, secret_height = cv2.getTextSize(secret, font, scale, thickness)[0]
+    start = x+prefix_width
+    cv2.putText(image, prefix, (x, y), font, scale, (20, 20, 20), thickness)
+    cv2.rectangle(image, (start, y-secret_height-5), (start+secret_width+5, y+8), background, -1)
+    cv2.putText(image, secret, (start, y), font, scale, foreground, thickness)
+    cv2.putText(image, suffix, (start+secret_width, y), font, scale, (20, 20, 20), thickness)
+    found = TextDetector(reader=AppleVisionReader(), pixel_scale=2)(Frame(image, 0, 'screen', 0))
+    boxes = [d for d in found if d.category == 'api_key']
+    assert boxes
+    assert all(d.x >= start-70 and d.x+d.w <= start+secret_width+70 for d in boxes)

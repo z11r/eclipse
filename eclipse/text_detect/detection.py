@@ -795,13 +795,17 @@ class Detector:
                             touched.append((part, first, last))
                         position += len(part[4]) + len(separator)
 
-                    if separator == '' and category == 'email':
+                    # Numeric formats must retain OCR word boundaries. Joining
+                    # chart cells can manufacture codes, phones and even cards.
+                    if separator == '' and category in {'2fa', 'phone', 'card'}:
+                        continue
+                    if separator == '' and category in {'email', 'api_key'}:
                         # A compact row can turn "hello demo@example.com bye"
                         # into one apparent address spanning all three words.
                         # Prefer email positions already established from actual
                         # OCR text or the space-preserving pass. Compact joining
                         # remains a fallback for addresses those passes missed.
-                        established = [rect for kind, rect, _ in areas if kind == 'email']
+                        established = [rect for kind, rect, _ in areas if kind == category]
                         if any(
                             rect[0] < part[2] and rect[2] > part[0]
                             and rect[1] < part[3] and rect[3] > part[1]
