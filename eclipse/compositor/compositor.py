@@ -91,8 +91,12 @@ class Compositor:
             for x, y, w, h in self._boxes
         ]
 
+    def _canvas(self, frame: Frame) -> np.ndarray:
+        """A fresh copy of the picture to cover. Subclasses may build it from more parts."""
+        return frame.image.copy()
+
     def _redact(self, frame: Frame) -> np.ndarray:
-        output = frame.image.copy()
+        output = self._canvas(frame)
         height, width = output.shape[:2]
         for left, top, right, bottom in self.covered_areas(height, width):
             # A solid fill, because blurred text can sometimes be recovered.

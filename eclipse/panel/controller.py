@@ -13,9 +13,10 @@ from typing import Callable, Iterable, Protocol
 from fastapi import HTTPException
 from .schemas import (
     ALL_CATEGORIES, TEXT_CATEGORIES, VISUAL_CATEGORIES, CatchLog,
-    DetectorHealth, ModeConfig, PanelConfig, PanelState,
+    DetectorHealth, ModeConfig, PanelConfig, PanelState, ViewConfig,
 )
 from .events import EventHistory
+from eclipse.capture.dual import drops_a_source
 
 PANIC_WAIT_SECONDS = 0.2  # a panic reports confirmed black if it arrives this soon
 APPLY_WAIT_SECONDS = 2.0  # a settings change reports its outcome if it arrives this soon
@@ -79,6 +80,10 @@ class PipelineController(Protocol):
     def panic(self) -> PanelState: ...
     def resume(self) -> PanelState: ...
     def set_mode(self, mode: ModeConfig) -> PanelState: ...
+    def set_view(self, view: ViewConfig) -> PanelState: ...
+
+
+_VIEWS = ["screen", "both", "webcam"]
 
 
 class MockPipelineController:
@@ -94,10 +99,17 @@ class MockPipelineController:
             detector_health={**{c: DetectorHealth.UNAVAILABLE for c in ALL_CATEGORIES}},
             enabled=list(ALL_CATEGORIES),
             keywords=self._store.load(),
+            view="both",
+            views=list(_VIEWS),
         )
 
     def get_state(self) -> PanelState:
         with self._lock:
+            return self._state.model_copy(deep=True)
+
+    def set_view(self, view: ViewConfig) -> PanelState:
+        with self._lock:
+            self._state.view = view.view
             return self._state.model_copy(deep=True)
 
     def set_config(self, config: PanelConfig) -> PanelState:
@@ -140,6 +152,11 @@ class LivePipelineController:
 
     configure takes (keywords, enabled). Pass None if this run's detector has none, as
     with the test pattern, and settings changes are refused rather than ignored.
+
+    views is the capture that switches between screen, both and webcam (a DualCapture),
+    or None for a run with one source. A switch that drops a source cuts the output at
+    once: black goes out until the new view's first frame has been scanned, about the
+    delay later, so nothing of the dropped source shows after the switch.
     """
     pipeline_mode = "live"
 
@@ -149,8 +166,11 @@ class LivePipelineController:
         configure: Callable[[Iterable[str], Iterable[str]], None] | None,
         config_path: Path | None = None,
         apply_wait: float = APPLY_WAIT_SECONDS,
+        views=None,
     ):
         self._pipeline = pipeline
+        self._views = views
+        self._view_lock = Lock()  # one switch at a time; panic never takes this
         self._gate = pipeline.gate
         self._configure = configure
         self._apply_wait = apply_wait
@@ -181,6 +201,8 @@ class LivePipelineController:
             blackout_confirmed=self._gate.black_confirmed,
             mode="desktop",
             irl_available=False,
+            view=self._views.view if self._views is not None else None,
+            views=self.views,
             enabled=enabled,
             keywords=keywords,
             held_frames=pipeline.stats.rendered_held,
@@ -229,6 +251,30 @@ class LivePipelineController:
         if mode.mode != "desktop":
             raise HTTPException(status_code=409, detail="IRL mode not available")
         return self.get_state()
+
+    @property
+    def views(self) -> list[str]:
+        return list(self._views.views) if self._views is not None else []
+
+    def set_view(self, view: ViewConfig) -> PanelState:
+        """Switch what the output shows. Takes effect on the next captured frame."""
+        if self._views is None:
+            raise HTTPException(status_code=409, detail="This run has no webcam to switch to")
+        with self._view_lock:
+            old = self._views.view
+            if view.view != old:
+                cut = self._gate.cut if drops_a_source(old, view.view) else None
+                self._views.set_view(view.view, cut)
+        return self.get_state()
+
+    def next_view(self) -> PanelState:
+        """The switch view key: on to the next view, and round again."""
+        views = self.views
+        if not views:
+            return self.get_state()
+        with self._view_lock:
+            following = views[(views.index(self._views.view) + 1) % len(views)]
+        return self.set_view(ViewConfig(view=following))
 
     def _is_stricter(self, config: PanelConfig) -> bool:
         """Whether this hides anything the current settings don't."""
@@ -285,5 +331,7 @@ class LivePipelineController:
         if self._configure is None:
             return "Test run with a stand-in detector. Real screen text is not being protected."
         if pipeline.last_output in ("scanned", "cached"):
-            return "Screen text protection is running. Webcam and IRL protection are planned."
+            shown = self._views.view if self._views is not None else "screen"
+            protected = {"screen": "Screen", "both": "Screen and webcam", "webcam": "Webcam"}
+            return f"{protected[shown]} text protection is running. IRL protection is planned."
         return "The output is covered until a frame has been checked."

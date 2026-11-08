@@ -20,6 +20,7 @@ Category = Literal[
 ]
 Source = Literal["screen", "webcam", "irl"]
 Mode = Literal["desktop", "irl"]
+View = Literal["screen", "both", "webcam"]  # what goes out: see eclipse/capture/dual.py
 
 
 class PanelConfig(BaseModel):
@@ -49,6 +50,11 @@ class ModeConfig(BaseModel):
     mode: Mode
 
 
+class ViewConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    view: View
+
+
 class DetectorHealth(str, Enum):
     READY = "ready"
     UNAVAILABLE = "unavailable"
@@ -60,6 +66,10 @@ class PanelState(BaseModel):
     blackout_confirmed: bool = False  # a black frame has gone out since it was requested
     mode: Mode = "desktop"
     irl_available: bool = False
+    # What the output shows, and what it can be switched to. None and [] when the run
+    # has a single source, as without --with-webcam.
+    view: View | None = None
+    views: list[View] = Field(default_factory=list)
     enabled: list[Category] = Field(default_factory=lambda: list(ALL_CATEGORIES))
     keywords: list[str] = Field(default_factory=list)
     held_frames: int = 0

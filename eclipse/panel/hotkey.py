@@ -7,6 +7,7 @@ from typing import Callable
 from eclipse.platform import keyboard_listening_allowed
 
 PANIC_KEYS = "<ctrl>+<alt>+b"
+VIEW_KEYS = "<ctrl>+<alt>+v"  # with --with-webcam: screen, both, webcam, and round again
 
 
 def _system_listener(keys: str, on_press: Callable[[], None]):

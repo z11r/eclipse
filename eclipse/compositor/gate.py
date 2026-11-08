@@ -23,6 +23,8 @@ import time
 
 from eclipse.types import Rendered
 
+_PAST_THE_TICK = 1e-6  # seconds
+
 
 class OutputGate:
     def __init__(self) -> None:
@@ -49,6 +51,19 @@ class OutputGate:
             self._panicked = False
             self._floor = time.monotonic()
             self._invalidations += 1
+
+    def cut(self) -> float:
+        """Only frames captured from now on may go out, as after resume, but leaving any
+        panic as it is. For a switch that stops showing a source: what is already
+        queued still shows it, so black goes out until the new view reaches the output.
+
+        Returns the floor. It sits just past the clock's reading, as the clock ticks only
+        every 15 ms on Windows, and a frame taken in the same tick must not get out.
+        """
+        with self._changed:
+            self._floor = max(self._floor, time.monotonic() + _PAST_THE_TICK)
+            self._invalidations += 1
+            return self._floor
 
     def close(self) -> None:
         """Nothing but black from now on, for good."""

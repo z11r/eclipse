@@ -336,6 +336,7 @@ class Detector:
 
     def __init__(
         self, keywords=(), enabled=None, padding=0, reader=None, pixel_scale=1, noise_floor=0,
+        ocr_threads=6,
     ):
         self.stats = {
             'frames': 0, 'full_scans': 0, 'partial_scans': 0, 'scan_seconds': 0.0,
@@ -351,6 +352,7 @@ class Detector:
 
         self.padding = padding
         self._reader = reader
+        self._ocr_threads = ocr_threads  # for the RapidOCR reader made when none is given
         # Cameras redraw every pixel with sensor noise, so any-pixel-changed would read
         # the whole frame every time. Above 0, blocks whose average moved less than
         # this count as unchanged. Screens are exact, so they keep 0.
@@ -873,7 +875,7 @@ class Detector:
                     # take every core, which starves OBS. Six threads scan as fast.
                     self._reader = RapidOCR(
                         det_limit_type='max', det_limit_side_len=1536, use_cls=False,
-                        intra_op_num_threads=6, inter_op_num_threads=1,
+                        intra_op_num_threads=self._ocr_threads, inter_op_num_threads=1,
                     )
 
                 started = time.monotonic()

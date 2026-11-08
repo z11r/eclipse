@@ -1,8 +1,8 @@
-"""The six routes in Max's handoff, plus /api/health and GET /."""
+"""The six routes in Max's handoff, plus /api/health, /api/view and GET /."""
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from pathlib import Path
-from .schemas import CatchLog, HealthResponse, ModeConfig, PanelConfig, PanelState
+from .schemas import CatchLog, HealthResponse, ModeConfig, PanelConfig, PanelState, ViewConfig
 
 router = APIRouter(tags=["panel"])
 
@@ -48,3 +48,9 @@ def resume(request: Request):
 @router.put("/api/mode", response_model=PanelState)
 def mode(config: ModeConfig, request: Request):
     return request.app.state.controller.set_mode(config)
+
+
+@router.put("/api/view", response_model=PanelState)
+def view(config: ViewConfig, request: Request):
+    """Show the screen, both, or the webcam. 409 if this run has only one source."""
+    return request.app.state.controller.set_view(config)
