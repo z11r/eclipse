@@ -3,12 +3,11 @@
 Images must be uint8 BGR arrays. Boxes are (x, y, width, height, category).
 If detection fails, the pipeline must black out the frame."""
 
+import bisect
 import functools
 import math
-import re
 import threading
 import time
-import unicodedata
 from typing import Iterable
 
 import cv2
@@ -16,6 +15,15 @@ import numpy as np
 
 from eclipse.text_detect.covers import MOVE, REREAD, STAY, CoverTracks, Sighting
 from eclipse.text_detect.incoming import IncomingRows, ScrollStep
+from eclipse.text_detect.rules import (
+    UNREAD_MARK,
+    ends_in_label,
+    find_spans,
+    names_a_secret,
+    keyword_pattern,
+    luhn_valid,
+    standard_characters,
+)
 
 Box = tuple[int, int, int, int, str]
 CATEGORIES = frozenset({'email', 'phone', '2fa', 'api_key', 'card', 'keyword'})
@@ -38,7 +46,6 @@ _SCROLL_EXACT = 0.01  # share of a group's change a scroll may leave unexplained
 _SCROLL_LOOSE = 0.25  # past this share left unexplained, even the best group didn't scroll
 _SCROLL_JOIN_BLOCKS = 16  # smaller groups can match a scroll by chance, so never join
 _SCROLL_PART_WIDTH = 100  # narrowest pane, once it is told apart from what changed beside it
-_SCROLL_TRIES = 3  # parts of a change tried alone when the whole of it isn't a scroll
 _NOISE_FLOOR = 8  # a pixel this close to where it came from hasn't changed
 _CHANGE_BLOCK = 8  # with a sensor noise floor, compare blocks this size, not single pixels
 _WHOLE_PIXEL = 0.05  # a shift this close to a whole number lands text on the same pixels
@@ -47,11 +54,20 @@ _UNREAD_READ_AT = 96  # rows of incoming text to collect before reading them
 _UNREAD_KEEP = 24  # rows left black after a read, as the last line may be cut off
 _CUT_REACH = 3  # a line cut by a pane edge is looked for this many ordinary lines deep
 _LINE_GAP = 1  # blank rows, beyond this many, part one line from the next
+_FOLLOW_BUDGET = 0.004  # seconds a frame may spend trying areas past its largest
+_FOLLOW_STRICT = 0.004  # seconds before a frame stops trying motion last frame didn't have
+_FOLLOW_RETRY = 4  # and every this many frames, everything is tried in full again
+_SCROLL_RECHECK_REACH = 64  # rows past twice the first estimate the pane's own one looks
+_SCROLL_SHRINK = 2  # finding the scrolling pane compares frames this many times smaller
+_MOVE_REPEAT_REACH = 6  # pixels either way a carried-on drag's expected shift may be off
+_MOVE_GAP_MAX = 8  # most dropped captures a drag's expected shift is stretched across
+_MOVE_HALVE_FIRST = 1_000_000  # pixels past which a move guess halves before floats
 _UNREAD_MIN_WAIT = 2  # frames between reads of rows that came in whole
 _UNREAD_MIN_NEW = 8  # rows past the kept ones that a read after waiting needs
 _INK_ROW_GAP = 4  # blank rows that still join one line's ink into one cover
 _INK_WORD_GAP = 24  # blank columns that still join words; wider gaps part them
 _INK_BACKGROUND = 0.5  # share of a strip one colour must fill to be its background
+_INK_SAMPLES = 4096  # pixels looked at to find that colour
 _STAYED_PUT_PIXELS = 40  # text pixels in uncovered rows needed to judge if they moved
 _STAYED_PUT_SHARE = 0.98  # of them unchanged, for a drag over a still background
 # With OCR workers reading every changed row ahead anyway, incoming rows are read on every
@@ -65,6 +81,7 @@ _MOVE_SAMPLES = 4000  # textured pixels that vote on the exact shift
 _MOVE_SCREEN_SAMPLES = 500  # of those, how many first narrow the candidate shifts
 _MOVE_FINALISTS = 4  # candidate shifts that then get the full vote
 _MOVE_MIN_SHARE = 0.25  # share of changed textured pixels the shift must explain
+_MOVE_CLIMB = 8  # most steps from the best candidate to a better neighbour
 # Changes this close, sideways or up and down, count as one area. Lines of scrolling text
 # sit closer than the up-and-down gap, so a pane mostly stays one area; windows side by
 # side, like a scrolling note beside OBS's live preview, sit farther apart than the
@@ -86,168 +103,54 @@ _AREA_INSIDE = 0.8  # share of an area that must lie in a failing one to count a
 # a small part of the box the two filled together, and must be tried on its own again.
 _AREA_SIMILAR = 0.5
 _TEXTURE = 40  # a pixel this far from its neighbours' range is part of text or an edge
+# How words on a line meet, in text heights. Closer than _TIGHT_GAP, OCR split one token,
+# as Vision splits long hex into pieces. Up to _JOIN_GAP they are words of one line. Past
+# that they part, unless a label ends the first and the pixels between show a mark OCR
+# didn't read, up to _UNREAD_REACH. _MARK_EDGE is left out beside each word for its edges.
+_TIGHT_GAP = 0.3
+_JOIN_GAP = 2
+_UNREAD_REACH = 4
+_MARK_EDGE = 0.15
+# Past this gap, in text heights, a line that names a secret is checked for punctuation
+# OCR dropped, like the '", "' between JSON fields, so a value ends there.
+_MARK_GAP = 0.6
+# A line ending in a label, as "Password:" or "Commit SHA:", gives its meaning to the line
+# right below: no more than this many text heights below, starting under or just past it.
+_BELOW_GAP = 1.5  # Vision's boxes for small text are tight, so gaps look wide
+_LABEL_WORDS = 3  # most words in a label line whose colon OCR misread
+TIGHT, SPACE, UNREAD, NEWLINE = 'tight', 'space', 'unread', 'newline'
+# Careful rereads of lines the fast read left in doubt, when a rescue reader is given:
+# crops reread in one frame, seconds of rereading allowed per second, and the most saved
+# up. A crop reaches this many text heights past its line, for a value OCR didn't see.
+_RESCUE_PER_FRAME = 2
+_RESCUE_BUDGET = 0.15
+_RESCUE_BURST = 0.3
+_RESCUE_REACH = 24
+_RESCUE_CACHE = 256
+_SEPARATORS = {TIGHT: ' ', SPACE: ' ', UNREAD: f' {UNREAD_MARK} ', NEWLINE: '\n'}
+_TIGHT_SEPARATORS = {TIGHT: '', SPACE: ' ', UNREAD: f' {UNREAD_MARK} ', NEWLINE: '\n'}
 
 
 class DetectionError(RuntimeError):
     """Detection failed. The pipeline must black out this frame."""
 
 
-# OCR can read @ as a copyright sign, and the last dot as a comma or a space. Only
-# common endings count without a dot, so "@alice hello" isn't an email.
-_EMAIL = re.compile(
-    r'[A-Z0-9._%+\-]+\s*[@©]\s*[A-Z0-9.\-]+'
-    r'(?:\s*\.\s*[A-Z]{2,}|[\s,]+(?:com|org|net|edu|gov|io|ca|co|dev|ai)\b)',
-    re.I,
-)
-_PHONE = re.compile(
-    r'(?<!\w)(?:\+\d{1,3}[ .\-]?)?(?:\(\d{3}\)|\d{3})[ .\-]?\d{3}[ .\-]?\d{4}(?!\w)'
-)
-# A labeled phone remains private even when OCR misreads some area-code digits.
-_PHONE_LABEL = re.compile(r'\b(?:phone|telephone|mobile|tel)\s*[:=]\s*([^\r\n:;]{7,40})', re.I)
-# A bare 6-8 digit number can be a code. 4-5 digits are too common (ports, years),
-# so they only count next to a word like "code".
-_CODE_ALONE = re.compile(r'(?<![\w.:/\-])(?:\d{6,8}|\d{3}[ \-]\d{3})(?![\w.:/\-])')
-_CODE_HINT = re.compile(r'\b(?:code|otp|verification|verify|2fa|passcode|pin)\b', re.I)
-_CODE = re.compile(r'(?<!\w)\d(?:[ \-]?\d){3,7}(?!\w)')
-_CARD = re.compile(r'(?<!\d)(?:\d[ \-]?){12,18}\d(?!\d)')
-_KEYS = [
-    re.compile(r'\b(?:sk|rk)-(?:proj-|live-|test-)?[A-Za-z0-9_\-]{16,}\b'),
-    re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b'),
-    re.compile(r'\b(?:AKIA|ASIA)\s?[A-Z0-9]{16}\b'),
-    re.compile(r'\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b'),
-    re.compile(r'\bxox[abeoprs]-[A-Za-z0-9\-]{10,}'),
-    re.compile(r'\bAIza[A-Za-z0-9_\-]{30,}'),
-    re.compile(r'\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b'),
-    # Any name ending in one of these, so DB_PASSWORD and AWS_SECRET_ACCESS_KEY count.
-    re.compile(
-        r'(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]*'
-        r'(?:api[_ -]?key|access[_ -]?key|access[_ -]?token|token|secret(?:[_ -]?key)?'
-        r'|private[_ -]?key|passw(?:or)?d|pwd|authorization)'
-        r'\b\s*[=:]\s*[\"\x27]?(?:Bearer\s+)?[^\s\"\x27,;]{6,}',
-        re.I,
-    ),
-    re.compile(r'\bBearer\s+[A-Za-z0-9._~+/=\-]{12,}', re.I),
-    re.compile(r'(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])'),
-    # A password inside a link: postgres://user:password@host
-    re.compile(r'\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s/@]+@', re.I),
-    # A private key: its header, then each line of its body.
-    re.compile(r'-{2,}\s*BEGIN [A-Z ]*PRIVATE KEY'),
-    re.compile(r'(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{60,}={0,2}(?![A-Za-z0-9+/])'),
-]
-# Characters OCR tends to swap, for matching keywords.
-_LOOKALIKES = {
-    '0': 'o', 'o': '0', '1': 'il|', 'i': '1l|', 'l': '1i|',
-    '2': 'z', 'z': '2', '5': 's', 's': '5', '8': 'b', 'b': '8',
-}
-_SHORT_KEYWORD = 4  # below this many characters, match whole words only
-
-
-def luhn_valid(value: str) -> bool:
-    digits = [int(c) for c in value if c.isascii() and c.isdigit()]
-
-    if not 13 <= len(digits) <= 19 or len(set(digits)) == 1:
-        return False
-
-    total = 0
-
-    for index, digit in enumerate(reversed(digits)):
-        if index % 2:
-            digit *= 2
-            if digit > 9:
-                digit -= 9
-        total += digit
-
-    return total % 10 == 0
-
-
-def _keyword_pattern(word: str) -> re.Pattern:
-    """Match a keyword through spacing changes and common OCR misreads.
-
-    OCR can drop spaces or add them inside a word, so any gap is allowed anywhere.
-    """
-    letters = ''.join(unicodedata.normalize('NFKC', word).lower().split())
-    pattern = r'\s*'.join(
-        '[' + re.escape(char + _LOOKALIKES.get(char, '')) + ']' for char in letters
-    )
-
-    if len(letters) < _SHORT_KEYWORD:
-        pattern = rf'(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])'
-
-    return re.compile(pattern, re.I)
-
-
-def _standard_characters(text: str) -> tuple[str, list[int] | None]:
-    """Convert look-alike characters, such as full-width brackets, to standard ones.
-
-    One character can become several, so this also returns where each one came from.
-    Covers need positions in the text OCR gave us, not in the converted text.
-    """
-    if text.isascii():
-        return text, None
-
-    converted = []
-    origins = []
-
-    for index, char in enumerate(text):
-        standard = unicodedata.normalize('NFKC', char)
-        converted.append(standard)
-        origins.extend([index] * len(standard))
-
-    return ''.join(converted), origins
+# The rules themselves live in rules.py. These names stay here for callers and tests.
+_keyword_pattern = keyword_pattern
+_standard_characters = standard_characters
 
 
 def _match_text(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
-    """Return (category, start, end) for each sensitive part of the text."""
-    text, origins = _standard_characters(text)
-    matches = []
-
-    def place(category, start, end):
-        if origins is None:
-            matches.append((category, start, end))
-        elif end > start:
-            matches.append((category, origins[start], origins[end - 1] + 1))
-
-    def add(category, pattern):
-        for match in pattern.finditer(text):
-            place(category, match.start(), match.end())
-
-    add('email', _EMAIL)
-    add('phone', _PHONE)
-    for match in _PHONE_LABEL.finditer(text):
-        if sum(char.isdecimal() for char in match.group(1)) >= 7:
-            place('phone', match.start(), match.end())
-    add('2fa', _CODE_ALONE)
-
-    if _CODE_HINT.search(text):
-        add('2fa', _CODE)
-
-    for pattern in _KEYS:
-        add('api_key', pattern)
-
-    for match in _CARD.finditer(text):
-        if luhn_valid(match.group()):
-            place('card', match.start(), match.end())
-
-    for word in keywords:
-        if word.strip():
-            add('keyword', _keyword_pattern(word))
-
-    return matches
-
-
-@functools.lru_cache(maxsize=16384)
-def _remembered_matches(text: str, keywords: tuple[str, ...]) -> tuple:
-    return tuple(_match_text(text, keywords))
+    """Return (category, start, end) for each sensitive value in the text."""
+    return [span[:3] for span in find_spans(text, tuple(keywords))]
 
 
 def find_matches(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int, int]]:
-    """Return (category, start, end) for each sensitive part of the text.
+    """Return (category, start, end) for each sensitive value in the text.
 
-    Answers are remembered. A frame re-checks every word on screen, nearly all of them
-    unchanged, and checking them afresh took 2 ms a frame. The answer depends only on
-    the text and the keywords, so a remembered one is always the same answer.
+    Answers are remembered: see find_spans. Each span is the value, not its label.
     """
-    return list(_remembered_matches(text, tuple(keywords)))
+    return [span[:3] for span in find_spans(text, tuple(keywords))]
 
 
 def _row_means(gray) -> np.ndarray:
@@ -255,6 +158,13 @@ def _row_means(gray) -> np.ndarray:
     # The sums are whole numbers well under 2**53, so float64 holds them exactly, and
     # dividing exact sums gives the same values numpy's mean does.
     return cv2.reduce(gray, 1, cv2.REDUCE_SUM, dtype=cv2.CV_64F)[:, 0] / gray.shape[1]
+
+
+def _best_shift(differences: np.ndarray, limit: int) -> int:
+    """The nonzero shift with the smallest difference, the most negative of any tie."""
+    scores = np.array(differences, dtype=float)
+    scores[limit] = np.inf  # no move at all isn't a shift
+    return int(np.argmin(scores)) - limit
 
 
 def _shift_differences(now_rows, before_rows, limit: int, block: int = 128) -> np.ndarray:
@@ -377,6 +287,49 @@ def _unexplained(
     return cv2.max(_strongest(too_dark), _strongest(too_bright)) > _NOISE_FLOOR
 
 
+@functools.lru_cache(maxsize=64)
+def _hanning(size) -> np.ndarray:
+    """Phase correlation's window for a picture size, made once. Never written to."""
+    window = cv2.createHanningWindow(size, cv2.CV_32F)
+    window.flags.writeable = False
+    return window
+
+
+def _changed_box(changed, box):
+    """The smallest (top, bottom, left, right) holding every changed pixel, all of which
+    lie within box, or None if nothing changed. Only box is looked at."""
+    top, bottom, left, right = box
+    inside = changed[top:bottom, left:right].view(np.uint8)
+    rows = np.flatnonzero(cv2.reduce(inside, 1, cv2.REDUCE_MAX))
+    if not rows.size:
+        return None
+    columns = np.flatnonzero(cv2.reduce(inside, 0, cv2.REDUCE_MAX))
+    return (
+        top + int(rows[0]), top + int(rows[-1]) + 1,
+        left + int(columns[0]), left + int(columns[-1]) + 1,
+    )
+
+
+def _phase_guess(merged, size) -> tuple[int, int]:
+    """The shift phase correlation finds between two blanked pictures, at full scale.
+
+    merged holds the changed mask (0 to 255) and both pictures blanked by it, as floats.
+    Shrinking averages, so each picture's mean over changed pixels comes from the small
+    pictures, not another pass over the big ones. Floats matter: rounding to whole levels
+    adds noise that phase correlation, which evens out every frequency, turns into
+    another guess.
+    """
+    coverage, *blanked = cv2.split(cv2.resize(merged, size, interpolation=cv2.INTER_AREA))
+    coverage /= 255
+    total = float(coverage.sum())
+    small = [
+        shrunk - np.float32(float(shrunk.sum()) / total if total else 0.0) * coverage
+        for shrunk in blanked
+    ]
+    (sx, sy), _ = cv2.phaseCorrelate(small[0], small[1], _hanning(size))
+    return round(sx * _MOVE_COARSE), round(sy * _MOVE_COARSE)
+
+
 def _texture(gray) -> np.ndarray:
     """Pixels on text or an edge: blank areas match any shift, so they can't vote."""
     kernel = np.ones((3, 3), np.uint8)
@@ -408,7 +361,9 @@ def _ink(area: np.ndarray) -> np.ndarray | None:
     fills most of it, so there is no telling background from text."""
     if area.size == 0:
         return np.zeros(area.shape[:2], bool)
-    sample = area[::2, ::2].reshape(-1, 3).astype(np.int32)
+    # The background is most of the area, so a few thousand evenly spread pixels find it.
+    step = max(int((area.shape[0] * area.shape[1] / _INK_SAMPLES) ** 0.5), 1)
+    sample = area[::step, ::step].reshape(-1, 3).astype(np.int32)
     packed = (sample[:, 0] << 16) | (sample[:, 1] << 8) | sample[:, 2]
     colours, counts = np.unique(packed, return_counts=True)
     common = int(counts.argmax())
@@ -520,6 +475,73 @@ def _outside(result, part, changed):
     return result | (changed & ~part)
 
 
+def _marked(image, left, right, height) -> bool:
+    """Whether the pixels between two words on a line show a mark OCR didn't read.
+
+    The edges next to each word are left out, as glyphs' soft edges spill past their boxes.
+    With no telling background from text, it may hold a mark, so the answer is yes.
+    """
+    if image is None:
+        return False
+    edge = _MARK_EDGE * height
+    x1, x2 = int(math.ceil(left[2] + edge)), int(math.floor(right[0] - edge))
+    y1, y2 = int(max(min(left[1], right[1]), 0)), int(math.ceil(max(left[3], right[3])))
+    if x2 <= x1 or y2 <= y1:
+        return False
+    ink = _ink(image[y1:y2, x1:x2])
+    return True if ink is None else bool(ink.any())
+
+
+def _in_doubt(text: str, spans) -> bool:
+    """Whether a line's fast read leaves it unsettled: a value whose check failed, or a
+    secret named with no value found for it, which a misread may have hidden."""
+    if any(span.uncertain for span in spans):
+        return True
+    return names_a_secret(text) and not any(
+        span.category in ('api_key', 'card') for span in spans
+    )
+
+
+def _labelled_from_above(lines) -> dict[int, int]:
+    """For each line right under a line that ends in a label, that label line's index."""
+    starts = sorted((parts[0][1], index) for index, (parts, _) in enumerate(lines))
+    tops = [top for top, _ in starts]
+    found = {}
+    for index, (parts, _) in enumerate(lines):
+        last = parts[-1][4].rstrip()
+        # A short line ending in a colon, which OCR can read as a quote or semicolon.
+        short = len(parts) <= _LABEL_WORDS and not any('"' in p[4] for p in parts[:-1])
+        if not (
+            last.endswith((':', '..')) or ends_in_label(last)
+            or short and (
+                last[-1:] in ('"', ';') and last.count('"') == 1
+                or last.endswith(('".', "'."))
+            )
+        ):
+            continue
+        top, bottom = min(p[1] for p in parts), max(p[3] for p in parts)
+        left, right = parts[0][0], parts[-1][2]
+        tall = bottom - top
+        first = bisect.bisect_left(tops, top + 0.5 * tall)
+        last_row = bisect.bisect_right(tops, bottom + _BELOW_GAP * tall)
+        # The nearest line below that starts under the label or just past its end.
+        for _, other in starts[first:last_row]:
+            start = lines[other][0][0][0]
+            if other != index and other not in found and left - tall <= start <= right + tall:
+                found[other] = index
+                break
+    return found
+
+
+_has_word = functools.lru_cache(maxsize=16384)(lambda text: any(c.isalnum() for c in text))
+
+
+def _alternatives(one, other) -> bool:
+    """Whether two text boxes on a row are mostly the same place, so two readings of it."""
+    overlap = min(one[2], other[2]) - max(one[0], other[0])
+    return overlap > 0.5 * min(one[2] - one[0], other[2] - other[0])
+
+
 def _text_hash(text: str) -> int:
     """Tells text apart across reads, so tracks never have to keep the text itself."""
     return hash(''.join(text.split()).lower())
@@ -535,14 +557,24 @@ class Detector:
 
     def __init__(
         self, keywords=(), enabled=None, padding=0, reader=None, pixel_scale=1, noise_floor=0,
-        ocr_threads=6,
+        ocr_threads=6, rescue=None, rescue_budget=_RESCUE_BUDGET,
     ):
         self.stats = {
             'frames': 0, 'full_scans': 0, 'partial_scans': 0, 'scan_seconds': 0.0,
             'scanned_share': 0.0, 'diff_seconds': 0.0, 'find_seconds': 0.0,
             'det_seconds': 0.0, 'rec_seconds': 0.0, 'reads': 0, 'lines': 0, 'scrolls': 0,
             'checks': 0, 'copy_seconds': 0.0, 'track_seconds': 0.0, 'cached_frames': 0,
-            'moves': 0, 'areas_left_out': 0,
+            'moves': 0, 'areas_left_out': 0, 'areas_seconds': 0.0, 'scroll_seconds': 0.0,
+            'narrow_seconds': 0.0, 'move_seconds': 0.0, 'ahead_seconds': 0.0, 'follow_cut': 0,
+            'estimate_seconds': 0.0, 'columns_seconds': 0.0, 'pixels_seconds': 0.0,
+            'grow_seconds': 0.0, 'held_lost': 0, 'held_unread': 0, 'held_cut': 0,
+            'held_doubtful': 0, 'follow_skipped': 0, 'lost_view': 0, 'lost_unexplained': 0,
+            'lost_edge': 0, 'lost_still': 0, 'moves_repeated': 0,
+            'repeat_tries': 0, 'repeat_crowded': 0, 'repeat_upright': 0, 'repeat_missed': 0,
+            'miss_inside': 0, 'miss_near': 0, 'miss_far': 0, 'miss_lost': 0, 'drag_searched': 0,
+            'repeat_seconds': 0.0,
+            'uncertain': 0, 'doubtful_lines': 0, 'rescues': 0, 'rescue_cached': 0,
+            'rescue_skipped': 0, 'rescue_failed': 0, 'rescue_seconds': 0.0,
         }
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
@@ -552,6 +584,12 @@ class Detector:
 
         self.padding = padding
         self._reader = reader
+        # A slower, more careful reader for lines the fast read left in doubt, or None.
+        self._rescue = rescue
+        self._rescue_budget = rescue_budget
+        self._rescue_allowance = _RESCUE_BURST
+        self._rescue_clock = None
+        self._rescued = {}  # crop fingerprint -> words read there, newest last
         self._ocr_threads = ocr_threads  # for the RapidOCR reader made when none is given
         # Cameras redraw every pixel with sensor noise, so any-pixel-changed would read
         # the whole frame every time. Above 0, blocks whose average moved less than
@@ -648,12 +686,20 @@ class Detector:
         self._scrolled = False
         self._moved = False  # whether known text moved with a window this frame
         self._last_move = None  # the last window move, which the next one likely repeats
+        self._drag_before = None  # the move the frame before that, while a drag goes on
+        # Captures between the frame compared against and this one: more than one when
+        # frames were dropped. And the captures the last two moves each spanned.
+        self._previous_key = None
+        self._gap = self._move_gap = self._before_gap = 1
+        self._drag_area = None  # top, bottom, left, right of what the last move carried
         self._view = None  # top and bottom of the area scrolling now
         self._fractional_frames = 0  # frames of this scroll that landed between pixels
         # Areas whose changes keep going unexplained, like a live video or OBS's preview:
         # [top, bottom, left, right, fails in a row, frame last tried, frame last seen].
         self._failing = []
         self._follow_frame = 0
+        self._last_followed = None  # 'scroll' or 'move', what last frame followed
+        self._follow_deadline = None  # past this, a frame skips its costly follow tries
 
     def _scroll_action(self, rect, image, changed, top, bottom, left, right) -> str:
         """What a scroll of the given area does to a piece of text or a cover."""
@@ -696,10 +742,11 @@ class Detector:
         # match a shifted copy of itself often, by chance, but not that often.
         return moved[textured].mean() < _STAYED_PUT_SHARE - 0.08
 
-    def _scroll_shift(self, image, top, bottom, left, right, greys=None):
+    def _scroll_shift(self, image, top, bottom, left, right, greys=None, reach=None):
         """The whole-row shift that best explains how the area changed, with the grey
         pictures it was found on, or None when no shift explains it better than none.
-        greys, if given, are those pictures already made for this area."""
+        greys, if given, are those pictures already made for this area. reach, if given,
+        is the farthest shift to try."""
         if greys is None:
             now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
             before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
@@ -708,31 +755,13 @@ class Detector:
         now_rows = _row_means(now)
         before_rows = _row_means(before)
         limit = min(self._scroll_max_shift, (bottom - top) // 2)
+        if reach is not None:
+            limit = max(min(limit, reach), 1)
         differences = _shift_differences(now_rows, before_rows, limit)
-        shift = min(
-            (s for s in range(-limit, limit + 1) if s), key=lambda s: differences[s + limit]
-        )
+        shift = _best_shift(differences, limit)
         if differences[shift + limit] >= differences[limit]:
             return None
         return shift, now, before, now_rows, before_rows
-
-    def _separate_changes(self, changed, top, bottom, left, right) -> list[tuple]:
-        """Parts of the change that columns which didn't change keep apart, as (top,
-        bottom, left, right), the most changed first. Empty if nothing stands apart."""
-        counts = changed[top:bottom, left:right].sum(axis=0)
-        columns = np.flatnonzero(counts)
-        gap = 2 * _SCROLL_JOIN_ACROSS * self._scroll_block
-        breaks = np.flatnonzero(np.diff(columns) > gap)
-        if not breaks.size:
-            return []
-        parts = []
-        for run in sorted(
-            np.split(columns, breaks + 1), key=lambda run: -int(counts[run[0]:run[-1] + 1].sum())
-        ):
-            first, last = left + int(run[0]), left + int(run[-1]) + 1
-            rows = np.flatnonzero(changed[top:bottom, first:last].any(axis=1))
-            parts.append((top + int(rows[0]), top + int(rows[-1]) + 1, first, last))
-        return parts
 
     def _scrolling_part(self, changed, estimate, top, bottom, left, right):
         """The part of a changed area that scrolled: (top, bottom, left, right), or None.
@@ -747,12 +776,14 @@ class Detector:
         length = (bottom - top) - abs(shift)
         now_start, before_start = max(shift, 0), max(-shift, 0)  # within the area
         block = self._scroll_block
-        # Compared at half size: each frame is shrunk after it's lined up by the shift, so
-        # a whole-row scroll still matches exactly, and averaging pixels in twos softens
-        # the redrawn text edges of a scroll that lands between pixels.
-        length -= length % 2
-        width = (right - left) // 2 * 2
-        small = width // 2, length // 2
+        # Compared shrunk: each frame is shrunk after it's lined up by the shift, so a
+        # whole-row scroll still matches, and averaging pixels softens the redrawn text
+        # edges of a scroll that lands between pixels. This only finds the pane; every
+        # pixel that moves is still checked at full size by the scroll that follows.
+        factor = _SCROLL_SHRINK * self._pixel_scale
+        length -= length % factor
+        width = (right - left) // factor * factor
+        small = width // factor, length // factor
         down, across = -(-length // block), -(-width // block)
 
         def shrink(picture):
@@ -768,7 +799,8 @@ class Detector:
             difference = cv2.absdiff(current, source)
             difference = cv2.bitwise_and(difference, difference, mask=mask)
             padded = cv2.copyMakeBorder(
-                difference, 0, down * block // 2 - small[1], 0, across * block // 2 - small[0],
+                difference, 0, down * block // factor - small[1], 0,
+                across * block // factor - small[0],
                 cv2.BORDER_CONSTANT, value=0,
             ).astype(np.float32)
             means = cv2.resize(padded, (across, down), interpolation=cv2.INTER_AREA)
@@ -828,41 +860,45 @@ class Detector:
 
         Other things change in the same frame: a video, a meter, a screen preview that
         mirrors the scroll. Their pixels must not stretch the area that scrolls, or the
-        rows held black as they come in land on them instead of on the pane's edge. They
-        can also drown the scroll out, so then each part of the change that stands apart
-        is tried alone.
+        rows held black as they come in land on them instead of on the pane's edge. When
+        they drown the scroll out altogether, _follow_areas and _follow_scroll try the
+        separate areas and the columns that scrolled alone, so this tries only the one.
         """
-        tries = [area]
-        for index in range(1 + _SCROLL_TRIES):
-            if index == 1:
-                tries += self._separate_changes(changed, *area)[:_SCROLL_TRIES]
-            if index >= len(tries):
-                return None
-            top, bottom, left, right = tries[index]
-            if bottom - top < self._scroll_min_height or right - left < self._scroll_part_width:
-                continue
-            estimate = self._scroll_shift(image, top, bottom, left, right)
-            if estimate is None:
-                continue
-            part = self._scrolling_part(changed, estimate, top, bottom, left, right)
-            if part is None:
-                continue
-            if part == tries[index]:
-                return part, estimate
-            if (
-                part[1] - part[0] < self._scroll_min_height
-                or part[3] - part[2] < self._scroll_part_width
-            ):
-                continue
-            # The shift again, on the pane alone: what changed beside it can pull the first
-            # estimate off, and covers moved by a wrong shift would leave their text.
-            inside = slice(part[0] - top, part[1] - top), slice(part[2] - left, part[3] - left)
-            estimate = self._scroll_shift(
-                image, *part, greys=(estimate[1][inside], estimate[2][inside])
-            )
-            if estimate is not None:
-                return part, estimate
-        return None
+        top, bottom, left, right = area
+        if bottom - top < self._scroll_min_height or right - left < self._scroll_part_width:
+            return None
+        estimate = self._scroll_shift(image, top, bottom, left, right)
+        if estimate is None:
+            return None
+        narrow_started = time.monotonic()
+        try:
+            return self._narrowed(image, changed, estimate, area)
+        finally:
+            self.stats['narrow_seconds'] += time.monotonic() - narrow_started
+
+    def _narrowed(self, image, changed, estimate, area):
+        """The part of area that scrolled, with the shift found on it alone, or None."""
+        top, bottom, left, right = area
+        part = self._scrolling_part(changed, estimate, top, bottom, left, right)
+        if part is None:
+            return None
+        if part == area:
+            return part, estimate
+        if (
+            part[1] - part[0] < self._scroll_min_height
+            or part[3] - part[2] < self._scroll_part_width
+        ):
+            return None
+        # The shift again, on the pane alone: what changed beside it can pull the first
+        # estimate off, and covers moved by a wrong shift would leave their text.
+        inside = slice(part[0] - top, part[1] - top), slice(part[2] - left, part[3] - left)
+        # Far enough to catch a first estimate thrown well off, as two windows can: the
+        # pane's true shift is rarely more than the wrong one plus a few lines.
+        estimate = self._scroll_shift(
+            image, *part, greys=(estimate[1][inside], estimate[2][inside]),
+            reach=2 * abs(estimate[0]) + _SCROLL_RECHECK_REACH * self._pixel_scale,
+        )
+        return None if estimate is None else (part, estimate)
 
     def _follow_scroll(self, image, changed):
         """Follow a scroll, even with other things changing elsewhere on the screen.
@@ -888,7 +924,28 @@ class Detector:
         remaining[:, right:] |= changed[:, right:]
         return remaining
 
+    def _in_time(self, kind: str) -> bool:
+        """Whether this frame may still try to follow this kind of motion, scroll or move:
+        always the kind last frame followed, the other only within the budget."""
+        if (
+            self._follow_deadline is None
+            or kind == self._last_followed
+            or time.monotonic() <= self._follow_deadline
+        ):
+            return True
+        self.stats['follow_skipped'] += 1
+        return False
+
     def _scroll_columns(self, image, changed):
+        if not self._in_time('scroll'):
+            return None
+        started = time.monotonic()
+        try:
+            return self._scroll_columns_timed(image, changed)
+        finally:
+            self.stats['columns_seconds'] += time.monotonic() - started
+
+    def _scroll_columns_timed(self, image, changed):
         """Left and right of the widest run of columns that scrolled vertically, or None.
 
         Proposes only: the scroll found there must still pass every check of a clean
@@ -919,9 +976,7 @@ class Detector:
             differences = _shift_differences(
                 _row_means(now[:, part]), _row_means(before[:, part]), limit
             )
-            shift = min(
-                (s for s in range(-limit, limit + 1) if s), key=lambda s: differences[s + limit]
-            )
+            shift = _best_shift(differences, limit)
             if differences[shift + limit] < differences[limit]:
                 guesses[shift] = guesses.get(shift, 0) + part.stop - part.start
         if not guesses:
@@ -970,6 +1025,13 @@ class Detector:
         return run_left, run_right
 
     def _follow_scroll_in(self, image, changed):
+        started = time.monotonic()
+        try:
+            return self._follow_scroll_in_timed(image, changed)
+        finally:
+            self.stats['scroll_seconds'] += time.monotonic() - started
+
+    def _follow_scroll_in_timed(self, image, changed):
         """If the change is a clean vertical scroll, move known text along with it.
 
         The tolerant comparisons here only propose a shift, and never clear a pixel.
@@ -1109,28 +1171,106 @@ class Detector:
         """
         top, bottom, left, right = area
         now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
-        before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
         mask = changed[top:bottom, left:right]
         mask8 = mask.view(np.uint8)
         size = (max((right - left) // _MOVE_COARSE, 8), max((bottom - top) // _MOVE_COARSE, 8))
-        # Blank unchanged pixels and shrink, then subtract each mean at the small size:
-        # shrinking averages, so this is the same as subtracting first. Both pictures and
-        # the changed mask shrink as floats in one three-channel call, about three times
-        # quicker than one call each. Floats matter: rounding to whole levels adds noise
-        # that phase correlation, which evens out every frequency, turns into another guess.
-        layers = [mask8.astype(np.float32)]
+        guess = self._coarse_guess(now, mask8, area, size)
+        return self._checked_move(image, now, mask8, area, guess)
+
+    def _coarse_guess(self, now, mask8, area, size) -> tuple[int, int]:
+        """The shift phase correlation proposes for an area, at full detail."""
+        top, bottom, left, right = area
+        before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        # Blank unchanged pixels, so still content around the move can't vote for no move
+        # at all. Both pictures and the mask then shrink in one three-channel call, about
+        # three times quicker than one call each.
+        layers = [mask8 * np.uint8(255)]
         for gray in (before, now):
-            layers.append(cv2.bitwise_and(gray, gray, mask=mask8).astype(np.float32))
-        coverage, *blanked = cv2.split(
-            cv2.resize(cv2.merge(layers), size, interpolation=cv2.INTER_AREA)
+            layers.append(cv2.bitwise_and(gray, gray, mask=mask8))
+        merged = cv2.merge(layers)
+        # Shrinking by a whole factor takes OpenCV's quick path, several times quicker
+        # than an uneven one. Dropping the last few rows and columns past a multiple of the
+        # factor makes it whole; they're under four pixels at the area's edge, and every
+        # candidate the guess leads to is still checked exactly.
+        exact = (size[0] * _MOVE_COARSE, size[1] * _MOVE_COARSE)
+        if exact[0] <= merged.shape[1] and exact[1] <= merged.shape[0]:
+            merged = merged[: exact[1], : exact[0]]
+        if (bottom - top) * (right - left) >= _MOVE_HALVE_FIRST:
+            # A big area is halved first while still whole levels, which turns most of the
+            # float work into byte work: halving rounds by at most half a level, far below
+            # what the shift guess notices, and every candidate is still checked exactly.
+            half = (max(merged.shape[1] // 2, size[0]), max(merged.shape[0] // 2, size[1]))
+            merged = cv2.resize(merged, half, interpolation=cv2.INTER_AREA)
+        return _phase_guess(merged.astype(np.float32), size)
+
+    def _drag_region(self, changed):
+        """Where a dragged window can be this frame, as a box (top, bottom, left, right),
+        and the changed pixels in it: around where the last move landed, widened by as
+        far as the drag may have gone since, frames dropped in between included."""
+        height, width = changed.shape[:2]
+        top, bottom, left, right = self._drag_area
+        dx, dy = self._last_move
+        scale = self._gap / self._move_gap
+        reach = _MOVE_REPEAT_REACH + 3 * (max(self._gap, self._move_gap) - 1)
+        grow_x = int(abs(dx) * scale) + 2 * reach + self._area_near
+        grow_y = int(abs(dy) * scale) + 2 * reach + self._area_near
+        box = (
+            max(top - grow_y, 0), min(bottom + grow_y, height),
+            max(left - grow_x, 0), min(right + grow_x, width),
         )
-        small = [
-            shrunk - np.float32(cv2.mean(gray, mask=mask8)[0]) * coverage
-            for shrunk, gray in zip(blanked, (before, now))
-        ]
-        window = cv2.createHanningWindow(size, cv2.CV_32F)
-        (sx, sy), _ = cv2.phaseCorrelate(small[0], small[1], window)
-        guess = (round(sx * _MOVE_COARSE), round(sy * _MOVE_COARSE))
+        region = np.zeros_like(changed)
+        region[box[0]:box[1], box[2]:box[3]] = changed[box[0]:box[1], box[2]:box[3]]
+        return box, region
+
+    def _repeat_move(self, image, changed, box):
+        """The shift near last frame's move that changed pixels now match, or None.
+        Changed pixels lie within box (top, bottom, left, right)."""
+        self._repeat_tried = ([], 0)  # the shifts looked around, and how far, for the log
+        found = _changed_box(changed, box)
+        if found is None:
+            return None
+        top, bottom, left, right = found
+        if bottom - top < self._move_min_height or right - left < self._move_min_width:
+            return None
+        now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        mask8 = np.ascontiguousarray(changed[top:bottom, left:right]).view(np.uint8)
+        # Frames dropped while the scanner was busy stretch a drag's shift: two captures
+        # apart, it moved twice as far. So the shift expected is the last one per capture
+        # times the captures since, and where the drag is heading adds its last change in
+        # speed, for a drag that speeds up, slows down or turns.
+        last, gap = self._last_move, self._gap
+        speed = (last[0] / self._move_gap, last[1] / self._move_gap)
+        centres = [(round(speed[0] * gap), round(speed[1] * gap))]
+        before = self._drag_before
+        if before is not None:
+            # Speeds are averages over each move, so they belong to its middle. The change
+            # in speed per capture, carried from the last move's middle across this gap.
+            earlier = (before[0] / self._before_gap, before[1] / self._before_gap)
+            span = (self._move_gap + self._before_gap) / 2
+            reach = gap * (gap + self._move_gap) / 2 / span
+            centres.append((
+                round(speed[0] * gap + (speed[0] - earlier[0]) * reach),
+                round(speed[1] * gap + (speed[1] - earlier[1]) * reach),
+            ))
+        extra = []
+        for centre in centres:
+            if all(max(abs(centre[0] - c[0]), abs(centre[1] - c[1])) > 2 for c in [last, *extra]):
+                extra.append(centre)
+        # The farther back the frame compared against, the farther the drag can stray
+        # from where it was heading: the window widens by two pixels a dropped capture.
+        # A narrow window only: checking it costs about a millisecond and a half. A drag
+        # that strayed farther, as a hand does across dropped frames, is found by the one
+        # search over its region that follows a miss, which costs less than a wide window.
+        reach = _MOVE_REPEAT_REACH
+        self._repeat_tried = ([last, *extra], reach)
+        return self._checked_move(
+            image, now, mask8, (top, bottom, left, right), last, extra, reach
+        )
+
+    def _checked_move(self, image, now, mask8, area, guess, also=(), reach=_MOVE_COARSE):
+        """The candidate shift within reach of guess, or of any shift in also, that
+        nearly all sampled text pixels match."""
+        top, bottom, left, right = area
 
         textured = cv2.bitwise_and(_texture(now).view(np.uint8), mask8)
         # In the same row-by-row order as np.nonzero, several times faster.
@@ -1145,9 +1285,10 @@ class Detector:
         ys, xs = ys + top, xs + left
         now_pixels = image[ys, xs].astype(np.int16)
         candidates = {
-            (guess[0] + ex, guess[1] + ey)
-            for ex in range(-_MOVE_COARSE, _MOVE_COARSE + 1)
-            for ey in range(-_MOVE_COARSE, _MOVE_COARSE + 1)
+            (centre[0] + ex, centre[1] + ey)
+            for centre in [guess, *also]
+            for ex in range(-reach, reach + 1)
+            for ey in range(-reach, reach + 1)
         }
         if self._last_move is not None:
             candidates.add(self._last_move)
@@ -1156,6 +1297,17 @@ class Detector:
         # Every candidate first votes on a few evenly spread samples. The right shift
         # matches nearly all of them, so only the leaders need the full vote.
         step = max(ys.size // _MOVE_SCREEN_SAMPLES, 1)
+        if reach > _MOVE_COARSE:
+            # A wide window first votes on a quarter of the samples, so it costs about
+            # what a narrow one does; its leaders then get the usual screening.
+            wide = step * 4
+            first = _shift_shares(
+                image, self._previous, ys[::wide], xs[::wide], now_pixels[::wide], candidates
+            )
+            keep = np.argsort(-first, kind='stable')[:_MOVE_FINALISTS * 4]
+            candidates = [candidates[i] for i in sorted(keep) if first[i] > 0]
+            if not candidates:
+                return None
         screen = _shift_shares(
             image, self._previous, ys[::step], xs[::step], now_pixels[::step], candidates
         )
@@ -1165,23 +1317,58 @@ class Detector:
             return None
         shares = _shift_shares(image, self._previous, ys, xs, now_pixels, finalists)
         best = int(np.argmax(shares))
-        if shares[best] < _MOVE_MIN_SHARE:
+        shift, share = finalists[best], float(shares[best])
+        # The best candidate may sit at the edge of the shifts tried, a pixel short of the
+        # real one, which lies just outside: text a pixel off still matches a fair share of
+        # samples. So step to any better neighbour, tried or not, until none is better. The
+        # real shift matches nearly every sample and its neighbours far fewer, so this
+        # settles on it.
+        seen = {shift}
+        for _ in range(_MOVE_CLIMB):
+            around = [
+                (shift[0] + ex, shift[1] + ey)
+                for ex in (-1, 0, 1) for ey in (-1, 0, 1)
+                if (shift[0] + ex, shift[1] + ey) not in seen
+                and (shift[0] + ex, shift[1] + ey) != (0, 0)
+            ]
+            if not around:
+                break
+            seen.update(around)
+            scores = _shift_shares(image, self._previous, ys, xs, now_pixels, around)
+            better = int(np.argmax(scores))
+            if scores[better] <= share:
+                break
+            shift, share = around[better], float(scores[better])
+        if share < _MOVE_MIN_SHARE:
             return None
-        return finalists[best]
+        return shift
 
-    def _estimate_move(self, image, changed):
-        """The dx, dy a window moving whole within changed explains best, or None."""
-        rows = np.flatnonzero(changed.any(axis=1))
-        if not rows.size:
+    def _estimate_move(self, image, changed, box=None):
+        started = time.monotonic()
+        try:
+            return self._estimate_move_timed(image, changed, box)
+        finally:
+            self.stats['estimate_seconds'] += time.monotonic() - started
+
+    def _estimate_move_timed(self, image, changed, box=None):
+        """The dx, dy a window moving whole within changed explains best, or None. If
+        box is given, every changed pixel lies within it."""
+        found = _changed_box(changed, box or (0, changed.shape[0], 0, changed.shape[1]))
+        if found is None:
             return None
-        columns = np.flatnonzero(changed.any(axis=0))
-        top, bottom = int(rows[0]), int(rows[-1]) + 1
-        left, right = int(columns[0]), int(columns[-1]) + 1
+        top, bottom, left, right = found
         if bottom - top < self._move_min_height or right - left < self._move_min_width:
             return None
         return self._move_shift(image, changed, (top, bottom, left, right))
 
     def _follow_move(self, image, changed, shift=None):
+        started = time.monotonic()
+        try:
+            return self._follow_move_timed(image, changed, shift)
+        finally:
+            self.stats['move_seconds'] += time.monotonic() - started
+
+    def _follow_move_timed(self, image, changed, shift=None):
         """If a window moved whole, move known text and covers along with it.
 
         Something moved whole when its pixels now show exactly what the previous frame
@@ -1223,6 +1410,15 @@ class Detector:
         self.stats['moves'] += 1
         remaining = changed.copy()
         remaining[inside] &= ~match[inside]
+        # Where the moved content landed: changed pixels the shift explains. A drag that
+        # carries on is looked for around here next frame, not across the whole screen.
+        moved = (changed[inside] & match[inside]).view(np.uint8)
+        rows = np.flatnonzero(cv2.reduce(moved, 1, cv2.REDUCE_MAX))
+        columns = np.flatnonzero(cv2.reduce(moved, 0, cv2.REDUCE_MAX))
+        self._drag_area = (
+            area[0] + int(rows[0]), area[0] + int(rows[-1]) + 1,
+            area[2] + int(columns[0]), area[2] + int(columns[-1]) + 1,
+        )
 
         def action(rect) -> str:
             x1, y1, x2, y2 = rect[:4]
@@ -1273,6 +1469,15 @@ class Detector:
             if shift > 0:
                 first, old = first + 1, old + 1
         length = max(length, 0)
+        # Only the rows the followed strips land on need checking: the rest of the pane
+        # is the scroll's business, checked as ever. Rows outside count as unchecked.
+        rows = self._incoming.rows_after(shift + fraction)
+        if rows is not None:
+            start, stop = max(rows[0], first), min(rows[1], first + length)
+            if stop <= start:
+                start = stop = first
+            old += start - first
+            first, length = start, stop - start
         unexplained = _unexplained(
             image[first:first + length, left:right], self._previous, old, left, right, fraction
         )
@@ -1361,6 +1566,13 @@ class Detector:
         return _outside(self._follow(image, part), part, changed)
 
     def _areas(self, changed):
+        started = time.monotonic()
+        try:
+            return self._areas_timed(changed)
+        finally:
+            self.stats['areas_seconds'] += time.monotonic() - started
+
+    def _areas_timed(self, changed):
         """The separate areas of change: (areas big enough to follow, largest first;
         smaller pieces). Each is top, bottom, left, right. They only steer where to look:
         every follow is still checked pixel by pixel."""
@@ -1447,6 +1659,15 @@ class Detector:
         """
         self._follow_frame += 1
         frame = self._follow_frame
+        out_of_time = time.monotonic() + _FOLLOW_BUDGET
+        # Motion carries on from frame to frame. The costly tries, the window-move and
+        # column searches, run in full for the kind of motion last frame followed; the
+        # other kind stops once a frame has spent its budget, so a big change nothing
+        # explains, like a page swapped whole, doesn't cost several frames' time. Every
+        # few frames everything is tried in full, so a drag or scroll that starts is
+        # still found. What isn't followed is read, as always.
+        full = frame % _FOLLOW_RETRY == 0
+        self._follow_deadline = None if full else time.monotonic() + _FOLLOW_STRICT
         areas, pieces = self._areas(changed)
         left_out, due = [], []
         for area in areas:
@@ -1471,13 +1692,63 @@ class Detector:
         # An area is judged by a try that tells: alone, or any try that followed something.
         # A failed try of several at once proves nothing about each.
         judged = []
-        if len(tried) > 1 or others:
+        drag = (
+            self._last_followed == 'move' and last_move is not None
+            and self._drag_area is not None
+        )
+        drag_missed = False
+        if drag:
+            # A drag carries on about where it was heading. It's looked for only where the
+            # dragged window can be now, so changes elsewhere, like a reply streaming in
+            # another window, neither cost time nor outvote its pixels:
+            # 1. the shifts around the one expected, checked pixel by pixel as always;
+            # 2. if none fits, one search for the shift, over that region alone.
+            # Anything else big changing is checked for a scroll first, without the drag:
+            # a pane scrolling in a second window must be followed to stay covered. A
+            # straight up or down shift isn't taken here, as it may be a scroll. When the
+            # drag stops, nothing fits, and everything is tried as usual.
+            box, region = self._drag_region(part)
+            elsewhere = [area for area in tried if not _overlaps(area, box)] + due
+            if elsewhere:
+                rest = part.copy()
+                rest[box[0]:box[1], box[2]:box[3]] = False
+                scrolled = self._follow_scroll_in(image, rest)
+                if self._scrolled:
+                    self.stats['repeat_crowded'] += 1
+                    remaining = _outside(scrolled, rest, changed)
+            if not self._scrolled:
+                self.stats['repeat_tries'] += 1
+                started = time.monotonic()
+                shift = self._repeat_move(image, region, box)
+                self.stats['repeat_seconds'] += time.monotonic() - started
+                if shift is None:
+                    self._last_move = last_move
+                    shift = self._estimate_move(image, region, box)
+                    self._last_move = last_move
+                    if shift is not None:
+                        self.stats['drag_searched'] += 1
+                if shift is not None and shift[0] == 0:
+                    self.stats['repeat_upright'] += 1
+                    shift = None
+                if shift is not None:
+                    self.stats['moves_repeated'] += 1
+                    remaining = _outside(self._follow_move(image, part, shift), part, changed)
+                else:
+                    self.stats['repeat_missed'] += 1
+                    drag_missed = True
+        if (len(tried) > 1 or others) and not (self._moved or self._scrolled or drag_missed):
             # Only the quick check: each big area gets the full one, alone, next.
             scrolled = self._follow_scroll_in(image, part)
             remaining = _outside(scrolled, part, changed)
 
         for area in tried + due:
             if self._scrolled or self._moved:
+                break
+            if judged and time.monotonic() > out_of_time:
+                # Busy frames can hold many areas no scroll or move explains, and trying
+                # each in full costs a frame's time several times over. The rest are read
+                # as they are, which is always safe, and tried again next frame.
+                self.stats['follow_cut'] += 1
                 break
             near, block = self._area_near, self._area_block
             # The area a block wider, for pixels at its edge that finding it skipped.
@@ -1505,6 +1776,8 @@ class Detector:
 
             # A scroll is checked close. For the few frames before a busy area beside it
             # is left out, the rest of the pane may be read again instead of followed.
+            # Even right after a drag: a pane can scroll inside a window being dragged,
+            # and only following that scroll keeps it covered.
             remaining = _outside(self._follow_scroll(image, close), close, changed)
             if not self._scrolled:
                 # A move is applied wide, each pixel still checked against the shift. With
@@ -1512,8 +1785,13 @@ class Detector:
                 # Beside other changes, like OBS's preview showing a shrunken copy of the
                 # move, it's estimated close first, where those can't spoil it.
                 self._last_move = last_move  # a failed try forgets it; this one may need it
-                shift = self._estimate_move(image, close) if crowded else None
-                if shift is None:
+                shift = (
+                    self._estimate_move(image, close)
+                    if crowded and self._in_time('move') and not drag_missed else None
+                )
+                # The largest area always gets its full move try, so a drag that starts
+                # is followed from its first frame; the budget only stops the rest.
+                if shift is None and (not judged or self._in_time('move')):
                     self._last_move = last_move
                     shift = self._estimate_move(image, wide)
                 if shift is None:
@@ -1522,13 +1800,38 @@ class Detector:
                     remaining = _outside(self._follow_move(image, wide, shift), wide, changed)
             judged.append(area)
 
-        if len(tried) > 1 and not (self._scrolled or self._moved):
+        if drag_missed:
+            # How far the drag's real shift was from the shifts the quick check tried, so
+            # a live run's log tells irregular motion from a check that couldn't decide.
+            if not self._moved:
+                self.stats['miss_lost'] += 1
+            else:
+                found, (centres, reach) = self._last_move, self._repeat_tried
+                off = min(
+                    (max(abs(found[0] - c[0]), abs(found[1] - c[1])) for c in centres),
+                    default=math.inf,
+                )
+                bucket = 'miss_inside' if off <= reach else (
+                    'miss_near' if off <= 3 * reach else 'miss_far'
+                )
+                self.stats[bucket] += 1
+        if len(tried) > 1 and not (self._scrolled or self._moved) and (
+            time.monotonic() <= out_of_time and self._in_time('move')
+        ):
             together = np.zeros_like(changed)
             for top, bottom, left, right in tried:
                 together[top:bottom, left:right] = changed[top:bottom, left:right]
             self._last_move = last_move
             remaining = _outside(self._follow_move(image, together), together, changed)
 
+        # The drag's shift a frame before this one's, for where it's heading next, and the
+        # captures each spanned.
+        carries_on = self._moved and self._last_followed == 'move'
+        self._drag_before = last_move if carries_on else None
+        self._before_gap = self._move_gap if carries_on else 1
+        if self._moved:
+            self._move_gap = self._gap
+        self._last_followed = 'scroll' if self._scrolled else 'move' if self._moved else None
         if self._scrolled or self._moved:
             # Only one scroll or move is followed a frame, so any other area left
             # unexplained has failed for this frame, whether or not it was tried alone.
@@ -1558,6 +1861,7 @@ class Detector:
         if self._previous is None or self._previous.shape != image.shape:
             return [(0, height, 0, width)]
 
+        pixels_started = time.monotonic()
         if self._noise_floor:
             changed = self._changed_blocks(image)
         else:
@@ -1565,6 +1869,7 @@ class Detector:
             changed = cv2.bitwise_or(
                 cv2.bitwise_or(difference[0], difference[1]), difference[2]
             ) > 0
+        self.stats['pixels_seconds'] += time.monotonic() - pixels_started
         if self._incoming.following:
             self._last_changed = changed.copy()  # the steps below mark it up
         if self._noise_floor:
@@ -1602,6 +1907,7 @@ class Detector:
         ]
 
         # Grow until no area cuts through known text or overlaps another area.
+        grow_started = time.monotonic()
         grew = True
         while grew:
             grew = False
@@ -1620,6 +1926,7 @@ class Detector:
                     grew = True
             areas = kept
 
+        self.stats['grow_seconds'] += time.monotonic() - grow_started
         scanned = sum((bottom - top) * (right - left) for top, bottom, left, right in areas)
         if scanned > _FULL_SCAN_SHARE * height * width:
             return [(0, height, 0, width)]
@@ -1670,6 +1977,11 @@ class Detector:
         if isinstance(timings, (list, tuple)) and len(timings) == 3:
             self.stats['det_seconds'] += timings[0] or 0
             self.stats['rec_seconds'] += timings[2] or 0
+        return self._parse(results, top, left)
+
+    @staticmethod
+    def _parse(results, top: int, left: int) -> list[tuple]:
+        """OCR results as text regions in full-frame coordinates. Raises if malformed."""
         regions = []
 
         for polygon, text, _ in results or []:
@@ -1692,14 +2004,30 @@ class Detector:
 
         return regions
 
-    def _groups(self, regions) -> list[list[tuple]]:
-        """Group neighbouring text on the same row, to catch split emails and keys."""
+    def _lines(self, regions, image=None) -> list[tuple[list[tuple], list[str]]]:
+        """Neighbouring text on the same row, as lines read left to right, each with how
+        its pieces meet: TIGHT, SPACE or UNREAD, one for each gap. Lines give each value
+        its label and join secrets OCR split into pieces.
+
+        Gaps are measured against the row's usual text height, not either piece's own
+        box: OCR gives "=" or "." a box a few pixels tall, which would otherwise part a
+        password from its label. Text far apart on a row, as in two windows side by side,
+        stays apart, unless a label ends the piece before and the pixels between show a
+        mark OCR didn't read, as when Vision drops the "=" of "password = hunter2".
+        Pieces that overlap are two readings of the same text, so they go in separate
+        lines instead of being joined into a token neither reading had.
+        """
         rows = []
+        # Text comes top first, so a row ending above this text can't take it or any
+        # after it. Only rows still reaching down this far are compared: the same rows
+        # match, first one first, without comparing every word with every row on screen.
+        active = []
 
         for region in sorted(regions, key=lambda r: (r[1], r[0])):
             _, y1, _, y2, _ = region
+            active = [row for row in active if row[1] >= y1]
 
-            for row in rows:
+            for row in active:
                 overlap = min(row[1], y2) - max(row[0], y1)
                 if overlap >= 0.5 * min(row[1] - row[0], y2 - y1):
                     row[0] = min(row[0], y1)
@@ -1707,25 +2035,48 @@ class Detector:
                     row[2].append(region)
                     break
             else:
-                rows.append([y1, y2, [region]])
+                row = [y1, y2, [region]]
+                rows.append(row)
+                active.append(row)
 
-        groups = []
+        lines = []
 
         for _, _, parts in rows:
             parts.sort(key=lambda r: r[0])
-            group = [parts[0]]
+            heights = sorted(r[3] - r[1] for r in parts if _has_word(r[4]))
+            heights = heights or sorted(r[3] - r[1] for r in parts)
+            height = heights[len(heights) // 2]  # the row's usual height: its median
+            open_lines: list[tuple[list[tuple], list[str]]] = []
 
-            for part in parts[1:]:
-                previous = group[-1]
-                if part[0] - previous[2] <= 2 * (previous[3] - previous[1]):
-                    group.append(part)
-                else:
-                    groups.append(group)
-                    group = [part]
+            for part in parts:
+                placed = False
+                for line in list(open_lines):
+                    last = line[0][-1]
+                    gap = part[0] - last[2]
+                    if gap > _UNREAD_REACH * height:
+                        open_lines.remove(line)  # everything after this is farther still
+                        lines.append(line)
+                        continue
+                    if placed or _alternatives(last, part):
+                        continue
+                    kind = TIGHT if gap < _TIGHT_GAP * height else SPACE
+                    if gap > _TIGHT_GAP * height and (
+                        ends_in_label(last[4])
+                        or gap > _MARK_GAP * height
+                        and any(names_a_secret(p[4]) for p in line[0])
+                    ) and _marked(image, last, part, height):
+                        kind = UNREAD
+                    elif gap > _JOIN_GAP * height:
+                        continue
+                    line[0].append(part)
+                    line[1].append(kind)
+                    placed = True
+                if not placed:
+                    open_lines.append(([part], []))
 
-            groups.append(group)
+            lines.extend(open_lines)
 
-        return [group for group in groups if len(group) > 1]
+        return lines
 
     def _cover(self, part, start: int, end: int) -> tuple[float, float, float, float]:
         """Estimate where characters start to end sit inside a text region.
@@ -1748,39 +2099,156 @@ class Detector:
         right = min(x2, x1 + (end + _CHAR_MARGIN) * width)
         return left, y1, right, y2
 
-    def _find_areas(self, regions) -> set[tuple]:
+    def _find_areas(self, regions, image=None) -> set[tuple]:
+        """What to cover: (category, rect, text hash) for each piece of each secret.
+
+        Each line is judged as a whole, so a value is found with its label ("password:")
+        or turned down by it ("Order number:"). Each piece of text is also judged alone,
+        for values that need no label, in case a neighbour joined onto them breaks their
+        pattern. A rule gives the value's span, and each piece it touches is covered.
+        """
         areas = set()
+        lines = self._lines(regions, image)
+        uncertain = 0
+        self._doubtful = []  # (line's parts, ...) the fast read can't settle
 
-        for region in regions:
-            for category, start, end in find_matches(region[4], self._keywords):
-                areas.add((
-                    category, self._cover(region, start, end), _text_hash(region[4][start:end]),
-                ))
+        def add(span, part, first, last, text):
+            areas.add((span.category, self._cover(part, first, last), _text_hash(text)))
 
-        # Text split across regions, tried with and without spaces.
-        for group in self._groups(regions):
-            for separator in (' ', ''):
-                joined = separator.join(part[4] for part in group)
+        # A line under a label line is judged with it, so "Commit SHA:" over its hash, or
+        # "Password:" over a form's field, gives the value its meaning. The label line is
+        # judged alone too.
+        alone = list(lines)
+        for below, above in _labelled_from_above(alone).items():
+            parts, kinds = alone[above]
+            lines[below] = (parts + alone[below][0], kinds + [NEWLINE] + alone[below][1])
 
-                for category, start, end in find_matches(joined, self._keywords):
+        for parts, kinds in lines:
+            if len(parts) > 1:
+                for region in parts:
+                    for span in find_spans(region[4], self._keywords):
+                        if span.standalone:
+                            add(span, region, span.start, span.end, region[4][span.start:span.end])
+
+            # As the words sit; joined where OCR split one token; and wholly joined, for
+            # strong patterns only, as that loses the spaces a label's meaning needs.
+            joins = [([_SEPARATORS[kind] for kind in kinds], False)]
+            if TIGHT in kinds:
+                joins.append(([_TIGHT_SEPARATORS[kind] for kind in kinds], False))
+            if len(parts) > 1:
+                joins.append(([''] * len(kinds), True))
+
+            settled = False
+            for separators, standalone_only in joins:
+                joined = parts[0][4] + ''.join(
+                    separator + part[4] for separator, part in zip(separators, parts[1:])
+                )
+                spans = find_spans(joined, self._keywords)
+                if not standalone_only and (
+                    self._rescue is None or not _in_doubt(joined, spans)
+                ):
+                    settled = True  # doubts only matter when there's a reread to settle them
+
+                for span in spans:
+                    if standalone_only and not span.standalone:
+                        continue
                     position = 0
                     touched = []
 
-                    for part in group:
-                        first = max(start - position, 0)
-                        last = min(end - position, len(part[4]))
+                    for index, part in enumerate(parts):
+                        first = max(span.start - position, 0)
+                        last = min(span.end - position, len(part[4]))
                         if last > first:
+                            if len(part[4].split()) > 1:
+                                # One box for several words can't place the value's
+                                # first character, so the cover starts at its label.
+                                first = min(first, max(span.anchor - position, 0))
                             touched.append((part, first, last))
-                        position += len(part[4]) + len(separator)
+                        position += len(part[4])
+                        if index < len(separators):
+                            position += len(separators[index])
 
-                    if len(touched) > 1:
-                        for part, first, last in touched:
-                            areas.add((
-                                category, self._cover(part, first, last),
-                                _text_hash(joined[start:end]),
-                            ))
+                    if standalone_only and len(touched) < 2:
+                        continue  # joining without spaces is only for split secrets
 
+                    uncertain += span.uncertain
+                    for part, first, last in touched:
+                        add(span, part, first, last, joined[span.start:span.end])
+
+            if not settled:
+                self._doubtful.append(parts)
+
+        self._uncertain = uncertain
         return areas
+
+    def _rescue_reads(self, image, fresh) -> list[tuple]:
+        """Reread, carefully, lines the fast read left in doubt, and return what it saw.
+
+        A line is in doubt when it names a secret ("password", "card number") but no value
+        was found after it, or holds a value whose check failed. Only lines read this frame
+        are tried, each crop with its whole line and room to the right for a value OCR
+        missed. Neighbouring crops are read as one. The words come back as a second
+        reading beside the first: never joined into it, and never clearing a cover.
+        Answers are kept for the exact pixels they read. A time budget bounds the work.
+        """
+        now = time.monotonic()
+        if self._rescue_clock is not None:
+            self._rescue_allowance = min(
+                _RESCUE_BURST,
+                self._rescue_allowance + (now - self._rescue_clock) * self._rescue_budget,
+            )
+        self._rescue_clock = now
+        height, width = image.shape[:2]
+        crops = []
+        for parts in self._doubtful:
+            if not any(id(part) in fresh for part in parts):
+                continue
+            self.stats['doubtful_lines'] += 1
+            tall = max(float(np.median([p[3] - p[1] for p in parts])), 1.0)
+            top = max(int(min(p[1] for p in parts) - 0.5 * tall), 0)
+            bottom = min(int(math.ceil(max(p[3] for p in parts) + 0.5 * tall)), height)
+            if parts[-1][4].rstrip().endswith(':') or ends_in_label(parts[-1][4]):
+                # A label with nothing after it: its value may be on the next line.
+                bottom = min(int(math.ceil(bottom + 1.5 * tall)), height)
+            left = max(int(min(p[0] for p in parts) - tall), 0)
+            right = min(int(math.ceil(max(p[2] for p in parts) + _RESCUE_REACH * tall)), width)
+            for crop in crops:
+                if top <= crop[1] + tall and bottom >= crop[0] - tall and (
+                    left < crop[3] and right > crop[2]
+                ):
+                    crop[:] = [min(crop[0], top), max(crop[1], bottom),
+                               min(crop[2], left), max(crop[3], right)]
+                    break
+            else:
+                crops.append([top, bottom, left, right])
+        words = []
+        for top, bottom, left, right in crops[:_RESCUE_PER_FRAME]:
+            pixels = np.ascontiguousarray(image[top:bottom, left:right])
+            key = (top, left, pixels.shape, hash(pixels.tobytes()))
+            if key in self._rescued:
+                self.stats['rescue_cached'] += 1
+                words.extend(self._rescued[key])
+                continue
+            if self._rescue_allowance <= 0:
+                self.stats['rescue_skipped'] += 1
+                continue
+            started = time.monotonic()
+            try:
+                found = self._parse(self._rescue(pixels)[0], top, left)
+            except Exception:
+                self.stats['rescue_failed'] += 1  # the fast read still stands
+                continue
+            finally:
+                spent = time.monotonic() - started
+                self._rescue_allowance -= spent
+                self.stats['rescue_seconds'] += spent
+            self.stats['rescues'] += 1
+            self._rescued[key] = found
+            while len(self._rescued) > _RESCUE_CACHE:
+                self._rescued.pop(next(iter(self._rescued)))
+            words.extend(found)
+        self.stats['rescue_skipped'] += max(len(crops) - _RESCUE_PER_FRAME, 0)
+        return words
 
     def _look_ahead(self, key, image) -> None:
         if key is None or not self._looking_ahead:
@@ -1803,7 +2271,7 @@ class Detector:
                 )
             ] if self._incoming.following or strips else []
             cut = None  # where the pane's edges cut lines through; unknown without a pane
-            if self._pane is not None:
+            if self._pane is not None and (strips or self._incoming.following):
                 top, bottom, left, right = self._pane
                 left, right = max(left - self._scroll_edge, 0), right + self._scroll_edge
                 rows_top = self._cut(image, top, 1, left, right)
@@ -1835,7 +2303,12 @@ class Detector:
         since have read them, or None if that frame is no longer known. Forgets it and
         every frame before it. The rows still unread stay as 'unread' boxes."""
         with self._lock:
-            return self._incoming.settled(key)
+            boxes = self._incoming.settled(key)
+            for reason, rows in self._incoming.take_held_rows().items():
+                self.stats[f'held_{reason}'] += rows
+            for reason, rows in self._incoming.take_lost_rows().items():
+                self.stats[f'lost_{reason}'] += rows
+            return boxes
 
     def detect(self, frame, key=None) -> list[Box]:
         """Boxes to cover in this frame. Give each frame a key, in order, to have
@@ -1865,6 +2338,8 @@ class Detector:
                 self._moved = False
                 self._last_changed = self._step = None
                 self._probe, self._uncovered = self._uncovered, None
+                gap = 1 if key is None or self._previous_key is None else key - self._previous_key
+                self._gap = min(max(gap, 1), _MOVE_GAP_MAX)
                 areas = self._changed_areas(snapshot)
                 self.stats['frames'] += 1
                 self.stats['diff_seconds'] += time.monotonic() - diff_started
@@ -1895,10 +2370,12 @@ class Detector:
                     )
                 ]
 
+                kept = len(regions)
                 for top, bottom, left, right in areas:
                     if self._cancelled.is_set():
                         raise RuntimeError('detection cancelled')
                     regions.extend(self._read(snapshot[top:bottom, left:right], top, left))
+                fresh = {id(region) for region in regions[kept:]}
 
                 height, width = snapshot.shape[:2]
                 full = areas == [(0, height, 0, width)]
@@ -1916,7 +2393,13 @@ class Detector:
                 boxes = set()
 
                 find_started = time.monotonic()
-                found = self._find_areas(regions)
+                found = self._find_areas(regions, snapshot)
+                if self._rescue is not None and self._doubtful and fresh:
+                    rescued = self._rescue_reads(snapshot, fresh)
+                    if rescued:
+                        regions.extend(rescued)
+                        found = self._find_areas(regions, snapshot)
+                self.stats['uncertain'] += self._uncertain
                 track_started = time.monotonic()
                 self.stats['find_seconds'] += track_started - find_started
 
@@ -1955,7 +2438,10 @@ class Detector:
                 self._boxes = tuple(sorted(boxes))
                 self._regions = regions
                 self._remember(snapshot, areas)
+                self._previous_key = key
+                ahead_started = time.monotonic()
                 self._look_ahead(key, snapshot)
+                self.stats['ahead_seconds'] += time.monotonic() - ahead_started
 
                 return list(self._boxes)
 

@@ -138,10 +138,14 @@ def _ramp(rest: int, move: int, step) -> list:
 
 
 class Scene:
-    """frame(index) gives (image, secrets) with secrets as (name, x, y, glyph mask)."""
+    """frame(index) gives (image, secrets) with secrets as (name, x, y, glyph mask).
 
-    def __init__(self, name, frames, draw, shape=(HEIGHT, WIDTH)):
+    ids, if given, are each frame's capture id. Gaps stand for frames the pipeline dropped
+    while its scanner was busy, as a live run does when a scan runs long."""
+
+    def __init__(self, name, frames, draw, shape=(HEIGHT, WIDTH), ids=None):
         self.name, self.frames, self._draw, self.shape = name, frames, draw, shape
+        self.ids = ids
 
     def frame(self, index):
         return self._draw(index)
@@ -189,6 +193,78 @@ def _scroll() -> Scene:
         return image, window.draw(image, 300, 150, offsets[index])
 
     return Scene("scroll", len(offsets), draw)
+
+
+def _busy_drag(name: str, drops: float = 0.0) -> Scene:
+    """A sparse window dragged by hand over a busy screen, as on a real desktop.
+
+    Behind it, a chat window keeps adding text a line at a time, as an assistant's reply
+    streams in, and a terminal adds a line now and then: changes no scroll or move
+    explains. The drag speeds up, slows down and turns unevenly, as a hand does, with
+    short pauses. With drops, frames go missing in bursts, as when the scanner falls
+    behind, so the drag moves several frames' worth between frames that are scanned.
+    """
+    rng = np.random.default_rng(11)
+    desktop = _desktop()
+    chat = Window.make(40, width=1500, height=1100, seed=2)
+    terminal = Window.make(12, width=700, height=420, seed=4)
+    notes = Window.make(10, width=1000, height=760, seed=5, every=3)
+    frames = 150
+    # Capture ids: with drops, bursts of frames never reach the scanner.
+    ids, key = [], 0
+    for index in range(frames):
+        ids.append(key)
+        key += 1 + (int(rng.integers(1, 4)) if drops and rng.random() < drops else 0)
+    captures = key
+    # A hand's drag, one step a capture: speed and heading drift, with jitter, and two
+    # short pauses. Frames dropped in between still moved it.
+    path, at, heading, speed = [], np.array([700.0, 300.0]), 0.3, 0.0
+    for capture in range(captures):
+        part = capture / captures
+        if part < 0.08 or 0.47 <= part < 0.53 or part >= 0.93:
+            speed = 0.0
+        else:
+            speed = float(np.clip(speed + rng.normal(4, 6), 6, 70))
+            heading += rng.normal(0, 0.18)
+        step = speed * np.array([np.cos(heading), np.sin(heading)])
+        step += rng.normal(0, 2, 2)
+        at = np.clip(at + step, (0, 0), (WIDTH - 1000, HEIGHT - 760))
+        if at[0] in (0, WIDTH - 1000):
+            heading = np.pi - heading
+        if at[1] in (0, HEIGHT - 760):
+            heading = -heading
+        path.append((int(at[0]), int(at[1])))
+    streamed = [2 + capture // 3 % 25 for capture in range(captures)]  # chat lines shown
+    typed = [3 + capture // 25 for capture in range(captures)]  # terminal lines shown
+
+    def draw(index):
+        capture = ids[index]
+        image = desktop.copy()
+        secrets = []
+        for window, x, y, shown in ((chat, 60, 80, streamed[capture]), (terminal, 1650, 900,
+                                                                         typed[capture])):
+            found = window.draw(image, x, y)
+            # Lines past those shown so far are still blank: the text is arriving.
+            cut = y + TITLE + 16 + shown * 40
+            image[cut : y + window.height, x : x + window.width] = window.page.image[0, 0]
+            secrets += [s for s in found if s[2] + s[3].shape[0] <= cut]
+        x, y = path[capture]
+        # Text the dragged window hides is on no frame, so it can't show: only the part of
+        # each secret behind it outside the window counts.
+        hidden = []
+        for name, sx, sy, mask, key in secrets:
+            h, w = mask.shape
+            visible = mask.copy()
+            top, left = max(y - sy, 0), max(x - sx, 0)
+            bottom, right = min(y + notes.height - sy, h), min(x + notes.width - sx, w)
+            if bottom > top and right > left:
+                visible[top:bottom, left:right] = False
+            if visible.any():
+                hidden.append((name, sx, sy, visible, key))
+        secrets = hidden + notes.draw(image, x, y)
+        return image, secrets
+
+    return Scene(name, frames, draw, ids=ids if drops else None)
 
 
 def _two_windows() -> Scene:
@@ -442,6 +518,8 @@ SCENES = {
     "reversals": _reversals,
     "scroll": _scroll,
     "two_windows": _two_windows,
+    "busy_drag": lambda: _busy_drag("busy_drag"),
+    "busy_drag_drops": lambda: _busy_drag("busy_drag_drops", drops=0.35),
     "duplicates": _duplicates,
     "edit": _edit_in_place,
     "clip": _clip_off,
@@ -478,7 +556,8 @@ def _outputs(scene: Scene, look_ahead: int, scan_ms: list):
     for index in range(scene.frames + look_ahead):
         if index < scene.frames:
             image, secrets = scene.frame(index)
-            frame = Frame(image, time.monotonic(), "screen", index)
+            key = index if scene.ids is None else scene.ids[index]
+            frame = Frame(image, time.monotonic(), "screen", key)
             started = time.monotonic()
             found = detect(frame)
             scan_ms.append((time.monotonic() - started) * 1000)

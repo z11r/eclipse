@@ -57,6 +57,9 @@ class _Strip:
 
     def __post_init__(self) -> None:
         self.rows = np.full(self.h, _WAITING, np.uint8)
+        # Why each waiting row last failed to clear: 0 never checked, 1 still unread,
+        # 2 cut by the pane's edge, 3 doubtful text. For the live log only.
+        self.why = np.zeros(self.h, np.uint8)
 
     @property
     def waiting(self) -> bool:
@@ -68,19 +71,22 @@ class _Strip:
         first = np.floor(place).astype(int)
         return first, np.ceil(place).astype(int)
 
-    def _lose(self, bad_rows: np.ndarray, top: int) -> None:
-        """Lose waiting rows that lie on any bad row; bad_rows starts at row top."""
+    def _lose(self, bad_rows: np.ndarray, top: int) -> int:
+        """Lose waiting rows that lie on any bad row; bad_rows starts at row top.
+        Returns how many were lost."""
         index = np.flatnonzero(self.rows == _WAITING)
         if not index.size:
-            return
+            return 0
         first, last = self._now(index)
         bad = np.ones(index.size, bool)
         inside = (first >= top) & (last < top + bad_rows.size)
         bad[inside] = bad_rows[first[inside] - top] | bad_rows[last[inside] - top]
         self.rows[index[bad]] = _LOST
+        return int(bad.sum())
 
-    def follow(self, changed: np.ndarray, step: ScrollStep | None) -> None:
-        """Account for one more frame. changed is every pixel that differs from the last."""
+    def follow(self, changed: np.ndarray, step: ScrollStep | None, lost: dict) -> None:
+        """Account for one more frame. changed is every pixel that differs from the last.
+        Rows lost are counted in lost by the check that failed, for the live log."""
         height, width = changed.shape
         left, right = max(self.x, 0), min(self.x + self.w, width)
         moved = step is not None and step.left < right and step.right > left
@@ -89,26 +95,32 @@ class _Strip:
         top = math.floor(self.y + self.offset)
         bottom = math.ceil(self.y + self.offset + self.h) + 1
         rows = np.arange(top, bottom)
-        bad = (rows < 0) | (rows >= height)
-        inside = ~bad
+        off = (rows < 0) | (rows >= height)
         if not moved:
             # Nothing scrolled here: any change at all is something unaccounted for.
-            bad[inside] = changed[rows[inside], left:right].any(axis=1)
+            still = np.zeros_like(off)
+            still[~off] = changed[rows[~off], left:right].any(axis=1)
+            checks = (('view', off), ('still', still))
         else:
             low, high = step.view
             checked = step.top + step.unexplained.shape[0]
-            bad |= (rows < max(low, step.top)) | (rows >= min(high, checked))
-            inside = ~bad
-            within = rows[inside]
+            off |= (rows < max(low, step.top)) | (rows >= min(high, checked))
+            within = rows[~off]
             # Columns the scroll check covered, then any of the strip's own beyond them.
             a, b = max(left, step.left), min(right, step.right)
-            bad[inside] = step.unexplained[within - step.top, a - step.left:b - step.left].any(
-                axis=1
-            )
+            unexplained = np.zeros_like(off)
+            unexplained[~off] = step.unexplained[
+                within - step.top, a - step.left:b - step.left
+            ].any(axis=1)
+            edge = np.zeros_like(off)
             for start, stop in ((left, a), (b, right)):
                 if stop > start:
-                    bad[inside] |= changed[within, start:stop].any(axis=1)
-        self._lose(bad, top)
+                    edge[~off] |= changed[within, start:stop].any(axis=1)
+            checks = (('view', off), ('unexplained', unexplained), ('edge', edge))
+        for name, bad in checks:
+            count = self._lose(bad, top)
+            if count:
+                lost[name] = lost.get(name, 0) + count
 
     def settle(
         self, boxes: list[Box], whole_line: int, size: tuple[int, int], held: list,
@@ -126,17 +138,21 @@ class _Strip:
         if not index.size:
             return
         first, last = self._now(index)
-        unread = np.zeros(index.size, bool)
+        # why: 1 still unread in this frame, 2 cut by the pane's edge, 3 doubtful text.
+        why = np.zeros(index.size, np.uint8)
         if not cut_known:
             inside = (first - self.edge) if self.inward > 0 else (self.edge - 1 - last)
-            unread = inside < whole_line
+            why[inside < whole_line] = 2
         right = self.x + self.w
+        for x, y, w, h, *kind in held:
+            if x < right and x + w > self.x:
+                on = (first < y + h) & (last >= y) & (why == 0)
+                why[on] = 3 if kind == ['doubtful'] else 2
         for x, y, w, h, category in boxes:
             if category == 'unread' and x < right and x + w > self.x:
-                unread |= (first < y + h) & (last >= y)
-        for x, y, w, h in held:
-            if x < right and x + w > self.x:
-                unread |= (first < y + h) & (last >= y)
+                why[(first < y + h) & (last >= y)] = 1
+        unread = why > 0
+        self.why[index[unread]] = why[unread]
         read = index[~unread]
         if not read.size:
             return
@@ -188,10 +204,24 @@ class IncomingRows:
     """Follows black incoming rows into later frames. Call record() once per frame, in
     order, and settled() for a frame when it is about to go out."""
 
+    def take_held_rows(self) -> dict:
+        """Rows held since last asked, by why: lost, unread, cut or doubtful."""
+        held, self._held_rows = self._held_rows, {}
+        return held
+
+    def take_lost_rows(self) -> dict:
+        """Rows lost since last asked, by the check that failed: view (left the pane or
+        the rows checked), unexplained (pixels the scroll doesn't reproduce), edge (a
+        change in the strip's columns beside the pane) or still (a change, no scroll)."""
+        lost, self._lost_rows = self._lost_rows, {}
+        return lost
+
     def __init__(self, whole_line: int, keep_frames: int = _KEEP_FRAMES) -> None:
         """whole_line: rows a line needs to be whole, as the detector keeps black after
         reading incoming rows, in case the last line was cut."""
         self._frames: OrderedDict = OrderedDict()
+        self._held_rows: dict = {}
+        self._lost_rows: dict = {}
         self._whole_line = whole_line
         self._keep = keep_frames
 
@@ -202,6 +232,17 @@ class IncomingRows:
 
     def clear(self) -> None:
         self._frames.clear()
+
+    def rows_after(self, shift: float) -> tuple[int, int] | None:
+        """The rows the strips still waiting will lie across once moved by shift, as
+        top and bottom, or None if none wait."""
+        spans = [
+            (strip.y + strip.offset + shift, strip.y + strip.offset + shift + strip.h)
+            for record in self._frames.values() for strip in record.strips if strip.waiting
+        ]
+        if not spans:
+            return None
+        return math.floor(min(a for a, _ in spans)) - 1, math.ceil(max(b for _, b in spans)) + 2
 
     def record(
         self,
@@ -227,13 +268,13 @@ class IncomingRows:
         # one always has once a scroll stops. Earlier frames showing the same pixels, or
         # fewer of them, show nothing more, so at rest the cut line doesn't hold rows.
         at_rest = step is None
-        held = [*doubtful, *([] if at_rest else (cut or []))]
+        held = [(*rect, 'doubtful') for rect in doubtful] + ([] if at_rest else list(cut or []))
         for record in self._frames.values():
             for strip in record.strips:
                 if not strip.waiting:
                     continue
                 if changed is not None:
-                    strip.follow(changed, step)
+                    strip.follow(changed, step, self._lost_rows)
                 strip.settle(boxes, self._whole_line, size, held, at_rest or cut is not None)
         self._frames[key] = _Record(
             [box for box in boxes if box[4] != 'unread'],
@@ -260,10 +301,19 @@ class IncomingRows:
         unread = [box for strip in record.strips for box in strip.boxes() if box[4] == 'unread']
         for strip in record.strips:
             out.extend(box for box in strip.boxes() if box[4] != 'unread')
-        if unread and record.pane is not None:
-            # Rows no later frame could clear: the pane shows its last checked picture
-            # for this frame rather than black over them.
-            out.append((*record.pane, 'held'))
-        else:
-            out.extend(unread)
+        if unread:
+            names = {1: 'unread', 2: 'cut', 3: 'doubtful'}
+            for strip in record.strips:
+                lost = int((strip.rows == _LOST).sum())
+                if lost:
+                    self._held_rows['lost'] = self._held_rows.get('lost', 0) + lost
+                for code, name in names.items():
+                    waiting = strip.rows == _WAITING
+                    count = int((waiting & (np.maximum(strip.why, 1) == code)).sum())
+                    if count:
+                        self._held_rows[name] = self._held_rows.get(name, 0) + count
+        # What no later frame could clear, usually a line at the pane's edge, shows the
+        # last checked picture there rather than black. Only that, not the whole pane:
+        # the rest of the pane moves on, so a scroll doesn't pause for one line.
+        out.extend((x, y, w, h, 'held') for x, y, w, h, _ in unread)
         return out
