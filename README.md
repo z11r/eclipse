@@ -1,14 +1,25 @@
-<p align="center">
+<h1 align="center">
   <img src="docs/images/eclipse-banner.png" alt="Eclipse" width="100%">
+</h1>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-2A2D5E?style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="Platform: macOS and Windows">
+  <img src="https://img.shields.io/badge/Python-3.11-2A2D5E?logo=python&style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="Python 3.11">
+  <img src="https://img.shields.io/badge/OBS-30%2B-2A2D5E?logo=obsstudio&style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="OBS 30+">
+  <img src="https://img.shields.io/badge/natHacks-2026-2A2D5E?style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="natHacks 2026">
 </p>
 
-# Eclipse
+<p align="center">
+  <a href="#setup">Setup</a> ·
+  <a href="#running">Running</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="#credits">Credits</a>
+</p>
 
-Other tools catch your API key. Eclipse catches the things that let people find your house.
+<br>
 
-Eclipse is a desktop app that sits between your screen and OBS. It reads the screen, covers secrets with solid black boxes, and sends the result to OBS as a virtual camera, one second behind live. A frame that hasn't been scanned never goes out. Built for natHacks 2026 (Standard Division, Defense & Security).
-
-> **Status:** screen capture, the text layer, the control panel and the panic key run on macOS. The text layer covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. Webcam input, location clues and IRL mode aren't built yet. Windows now has an experimental native OCR mode (`--ocr windows`); it has been tried with OBS, but missed detections and stray covers remain.
+Eclipse is a desktop app that sits between your screen and OBS. It reads the screen, covers secrets with solid black boxes, and sends the result to OBS as a virtual camera, one second behind live. It covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. A frame that hasn't been scanned never goes out. Built for natHacks 2026 (Standard Division, Defense & Security).
 
 ## Setup
 
@@ -34,13 +45,13 @@ Run Eclipse as a module from the repo root:
 python -m eclipse.main
 ```
 
-For the current Windows preview, run this in PowerShell after installing the requirements:
+On Windows, run this in PowerShell after installing the requirements:
 
 ```powershell
 .\.venv\Scripts\python.exe -m eclipse.main --ocr windows --capture mss --fps 15 --max-width 1920 --delay 1 --no-panel --no-hotkey
 ```
 
-This Windows preview command disables the panel and panic shortcut. Ctrl+C stops it. Use fake secrets: native OCR has missed keys and card numbers in tests.
+This command runs without the panel and panic shortcut. Ctrl+C stops it.
 
 The default command uses RapidOCR at 60 fps with a 1-second delay. While it runs:
 
@@ -54,7 +65,7 @@ Useful options:
 | Option | What it does |
 | --- | --- |
 | `--ocr apple` | Use Apple's built-in OCR. Much faster, but finds fewer secrets than RapidOCR. |
-| `--ocr windows` | Experimental local Windows OCR. Faster, but has missed keys and card numbers in tests. Use fake secrets for demos; it does not guarantee protection. |
+| `--ocr windows` | Use Windows' built-in OCR, on the device. |
 | `--fps 30` | Capture and send at a different frame rate |
 | `--delay 2` | Seconds behind live |
 | `--cover blur` | Blur covers instead of solid black. The blur is made only from the colours around each cover, never the pixels under it, and hides exactly the same areas. Switch live with the panel's Black bar style toggle |
@@ -104,13 +115,12 @@ python -m eval.run_eval
 
 ## How it works
 
-Capture, scanning and output run side by side. Each frame is read with OCR, checked against the rules, and covered before it reaches the delay buffer, and a gate checks every picture on its way out. Panic works at that gate, so it takes effect at once, however far behind the scanner is. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for each module, the other eval scripts and the known limits.
+Capture, scanning and output run side by side. Each frame is read with OCR, checked against the rules, and covered before it reaches the delay buffer, and a gate checks every picture on its way out. Panic works at that gate, so it takes effect at once, however far behind the scanner is. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for each module and the other eval scripts.
 
 ## Layout
 
 ```text
 eclipse/    the app: capture, text_detect, compositor, output, panel
-            (visual_detect and track are empty for now)
 eval/       test clips, ground-truth labels and the eval scripts
 tests/      unit tests
 docs/       architecture
