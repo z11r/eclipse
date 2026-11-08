@@ -357,3 +357,23 @@ def test_retina_scale_keeps_every_rule():
     output = stage.show(now)
     assert reader.hits >= 1
     assert visible_ink(now, output, mask) == 0
+
+
+def busy_beside(scene, image, index):
+    """The side pane changes every frame, like a live OBS preview next to the document."""
+    image = image.copy()
+    left = scene.side[0] + 10 + (index * 7) % 60
+    image[300:330, scene.side[0] : scene.side[1]] = 230
+    image[305:325, left : left + 120] = (40 + index * 9) % 200
+    return image
+
+
+def test_a_scroll_is_followed_while_something_beside_it_keeps_changing():
+    scene = ScrollScene(side_secrets={}, lines=60)
+    stage = Stage(SceneReader(scene))
+    stage.show(busy_beside(scene, scene.image(0), 0))
+    for index, offset in enumerate(range(6, 66, 6), 1):
+        stage.show(busy_beside(scene, scene.image(offset), index))
+    # Before, the change beside the document made the whole area fail the scroll check,
+    # so the document was read again from scratch on every frame.
+    assert stage.detect.stats["scrolls"] == 10
