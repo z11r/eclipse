@@ -359,3 +359,67 @@ def test_retina_scale_keeps_every_rule():
     output = stage.show(now)
     assert reader.hits >= 1
     assert visible_ink(now, output, mask) == 0
+
+
+def busy_beside(scene, image, index):
+    """The side pane changes every frame, like a live OBS preview next to the document."""
+    image = image.copy()
+    left = scene.side[0] + 10 + (index * 7) % 60
+    image[300:330, scene.side[0] : scene.side[1]] = 230
+    image[305:325, left : left + 120] = (40 + index * 9) % 200
+    return image
+
+
+def test_a_scroll_is_followed_while_something_beside_it_keeps_changing():
+    scene = ScrollScene(side_secrets={}, lines=60)
+    stage = Stage(SceneReader(scene))
+    stage.show(busy_beside(scene, scene.image(0), 0))
+    for index, offset in enumerate(range(6, 66, 6), 1):
+        stage.show(busy_beside(scene, scene.image(offset), index))
+    # Before, the change beside the document made the whole area fail the scroll check,
+    # so the document was read again from scratch on every frame.
+    assert stage.detect.stats["scrolls"] == 10
+
+
+def busy_area(scene, image, index):
+    """A big part of the side pane redrawn every frame, like OBS's live preview: never a
+    scroll or a move, and big enough to be an area of its own."""
+    image = image.copy()
+    rng = np.random.default_rng(index)
+    image[150:420, scene.side[0] : scene.side[1]] = rng.integers(
+        60, 200, (270, scene.side[1] - scene.side[0], 1), dtype=np.uint8
+    )
+    return image
+
+
+def test_a_busy_area_is_left_out_of_following_but_still_read():
+    scene = ScrollScene(side_secrets={}, lines=60)
+    reader = ReaderOfPlantedText(SceneReader(scene))
+    stage = Stage(reader)
+    stage.show(busy_area(scene, scene.image(0), 0))
+    frames = 0
+    for index, offset in enumerate(range(6, 78, 6), 1):
+        stage.show(busy_area(scene, scene.image(offset), index))
+        frames += 1
+    assert stage.detect.stats["scrolls"] == frames
+    assert stage.detect.stats["areas_left_out"] > 0
+    # New text in the left-out area is read and covered on the frame it appears.
+    now = busy_area(scene, scene.image(78), 99)
+    mask = ink(now.shape, (scene.side[0] + 10, 300), 0.5)
+    now = painted(now, mask, 120)
+    reader.plant(now, mask)
+    output = stage.show(now)
+    assert reader.hits >= 1
+    assert visible_ink(now, output, mask) == 0
+
+
+def test_a_scroll_is_followed_with_small_changes_far_from_it():
+    scene = ScrollScene(side_secrets={}, lines=60)
+    stage = Stage(SceneReader(scene))
+    stage.show(scene.image(0))
+    for index, offset in enumerate(range(6, 66, 6), 1):
+        image = scene.image(offset)
+        x = scene.side[0] + 20 + index * 9
+        image[440:452, x : x + 8] = 0  # a cursor moving in the side pane
+        stage.show(image)
+    assert stage.detect.stats["scrolls"] == 10

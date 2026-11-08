@@ -22,6 +22,7 @@ import numpy as np
 from eclipse.compositor.compositor import PADDING, Compositor
 from eclipse.platform import AppleVisionReader
 from eclipse.text_detect import TextDetector
+from eclipse.text_detect.detection import _UNREAD_READ_AT_AHEAD
 from eclipse.types import Frame
 from eval.stress_60 import Layer, render_layer
 
@@ -385,9 +386,44 @@ def _notes_beside_obs(name="notes_obs", legs=((30, 44), (14, 0), (24, -36), (10,
     return Scene(name, len(offsets), draw)
 
 
+def _preview(image, index) -> None:
+    """A box beside the windows that changes every frame, like a live OBS preview."""
+    box = image[150:750, 1700:2350]
+    box[:] = (30, 30, 30)
+    for row in range(14):
+        y = 20 + row * 40
+        x = 10 + (index * 7 + row * 13) % 120
+        cv2.putText(box, "preview line of moving text", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (200, 200, 200), 2)
+
+
+def _notes_scroll(name, speeds, preview=False) -> Scene:
+    """A still Notes window whose note scrolls by speeds[i] rows on frame i."""
+    window = Window(_notes_layer(height=2400, repeat=3), 1300, 820 + TITLE)
+    desktop = _desktop()
+    offsets, at = [], 0
+    for speed in speeds:
+        at = max(at + speed, 0)
+        offsets.append(at)
+
+    def draw(index):
+        image = desktop.copy()
+        secrets = window.draw(image, 300, 250, offsets[index])
+        if preview:
+            _preview(image, index)
+        return image, secrets
+
+    return Scene(name, len(offsets), draw)
+
+
+_SCROLL_SPEEDS = [0] * 8 + [6, 12, 20, 28, 34, 34, 28, 20, 12, 6, 3, 1] + [0] * 8 + [-14] * 12 + [0] * 10
+
+
 SCENES = {
     "notes_obs": _notes_beside_obs,
     "notes_obs_slow": lambda: _notes_beside_obs("notes_obs_slow", ((60, 12), (20, 0), (60, -12), (20, 0))),
+    "notes_scroll": lambda: _notes_scroll("notes_scroll", _SCROLL_SPEEDS),
+    "notes_scroll_preview": lambda: _notes_scroll("notes_scroll_preview", _SCROLL_SPEEDS, True),
     "notes_drag": lambda: _notes_drag("notes_drag", [
         (12, 0, 0), (20, 18, 10), (10, 0, 0), (12, -30, 4), (6, 0, 0), (10, 26, -22), (16, 0, 0),
     ]),
@@ -417,12 +453,26 @@ SCENES = {
 
 
 
+EDGE = 3  # black that moved this little is a cover edge wobbling, not a blink
+
+
+def _changed_past_edge(now: np.ndarray, before: np.ndarray) -> int:
+    """Black that appeared or vanished more than EDGE pixels from where black was."""
+    kernel = np.ones((2 * EDGE + 1, 2 * EDGE + 1), np.uint8)
+    grown_now = cv2.dilate(now.astype(np.uint8), kernel) > 0
+    grown_before = cv2.dilate(before.astype(np.uint8), kernel) > 0
+    return int((now & ~grown_before).sum() + (before & ~grown_now).sum())
+
+
 def _outputs(scene: Scene, look_ahead: int, scan_ms: list):
     """Each frame's image, secrets and output, as the pipeline would send them. With
     look_ahead, a frame is drawn only after that many later frames have been scanned."""
     detect = TextDetector(reader=AppleVisionReader(), pixel_scale=2)
     if look_ahead:
         detect.look_ahead()
+    # Live runs read ahead in workers, which makes incoming scroll rows read every frame.
+    # Read in the scan here, so set that the same way.
+    detect._detector._unread_read_at = _UNREAD_READ_AT_AHEAD * 2
     compositor = Compositor(padding=PAD)
     waiting = []
     for index in range(scene.frames + look_ahead):
@@ -483,19 +533,22 @@ def run(scene: Scene, keep: bool = False, look_ahead: int = 0) -> dict:
             box[t - top : b - top, l - left : r - left] = is_black[t:b, l:r]
             rel[key] = box
         exposed.append(shown)
-        jitter.append(sum(int((rel[k] ^ before_rel[k]).sum()) for k in rel if k in before_rel and rel[k].shape == before_rel[k].shape))
+        jitter.append(sum(
+            _changed_past_edge(rel[k], before_rel[k])
+            for k in rel if k in before_rel and rel[k].shape == before_rel[k].shape
+        ))
         stray = is_black & ~near
         stray_area.append(int(stray.sum()))
-        stray_flicker.append(0 if before_stray is None else int((stray ^ before_stray).sum()))
+        stray_flicker.append(0 if before_stray is None else _changed_past_edge(stray, before_stray))
         before_rel, before_stray = rel, stray
     result = {
         "scene": scene.name,
         "frames": scene.frames,
         "exposed_glyph_px": int(sum(exposed)),
         "frames_exposed": int(sum(1 for e in exposed if e)),
-        "cover_jitter_px": int(sum(jitter)),  # black around secrets changing shape as they move
+        "cover_jitter_px": int(sum(jitter)),  # black around secrets changing shape, past edge wobble
         "frames_jitter": int(sum(1 for j in jitter if j > 400)),
-        "stray_flicker_px": int(sum(stray_flicker)),  # black away from secrets turning on or off
+        "stray_flicker_px": int(sum(stray_flicker)),  # black away from secrets on or off, past wobble
         "stray_black_mean_px": int(np.mean(stray_area)),
         "scan_ms_mean": round(float(np.mean(scan_ms)), 1),
         "held_pane_frames": held_frames,  # panes showing an earlier picture: a stutter
