@@ -1892,8 +1892,11 @@ class Detector:
         if self._incoming.following:
             self._last_changed = changed.copy()  # the steps below mark it up
         if self._noise_floor:
-            # A camera's noise never matches exactly, and its pictures aren't windows.
-            changed = self._follow_scroll(image, changed)
+            # Scroll and window following prove moves by exact pixel matches, which a
+            # camera's noise never gives, and a sheet in a hand isn't a window. Each cover
+            # follows its own text instead, checked with the tracks' blurred tolerance.
+            if self._tracks.follow_each(image, changed):
+                self._moved = True
         else:
             changed = self._follow_areas(image, changed)
         self._read_unread(changed)
