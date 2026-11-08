@@ -258,6 +258,19 @@ class Running:
         self.thread.join(timeout=10)
 
 
+def sent_after_switch(sent: list, after: int, old) -> set:
+    """What went out once set_view() returned, less the one frame that may have been in flight.
+
+    The gate can't call back a frame it already allowed and handed to the output when
+    the switch landed (see OutputGate). The output has one thread, so that is at most one
+    frame, it is the first one recorded after the switch, and it shows the old view.
+    """
+    later = sent[after:]
+    if later[:1] == [old]:
+        later = later[1:]
+    return set(later)
+
+
 def test_switching_away_from_the_camera_never_shows_it_again(tmp_path):
     with Running(tmp_path) as run:
         assert wait_until(lambda: run.sink.sent[-1:] == [(CAMERA, SCREEN)])
@@ -265,7 +278,7 @@ def test_switching_away_from_the_camera_never_shows_it_again(tmp_path):
         after = len(run.sink.sent)
         assert state.view == "screen" and state.views == ["screen", "both", "webcam"]
         assert wait_until(lambda: run.sink.sent[-1:] == [(SCREEN, SCREEN)])
-        later = set(run.sink.sent[after:])
+        later = sent_after_switch(run.sink.sent, after, old=(CAMERA, SCREEN))
     # Between the switch and the first screen-only frame, only black.
     assert later <= {(0, 0), (SCREEN, SCREEN)}
 
@@ -276,7 +289,7 @@ def test_switching_to_the_camera_alone_shows_it_full_size(tmp_path):
         run.controller.set_view(ViewConfig(view="webcam"))
         after = len(run.sink.sent)
         assert wait_until(lambda: run.sink.sent[-1:] == [(CAMERA, CAMERA)])
-        later = set(run.sink.sent[after:])
+        later = sent_after_switch(run.sink.sent, after, old=(SCREEN, SCREEN))
     assert later <= {(0, 0), (CAMERA, CAMERA)}  # never the screen again
 
 
@@ -304,6 +317,7 @@ def test_switching_needs_a_webcam_run(tmp_path):
 def test_the_panel_api_switches_views(tmp_path):
     controller = MockPipelineController(config_path=tmp_path / "config.json")
     with TestClient(create_app(controller), base_url="http://127.0.0.1:8000") as client:
+        client.headers["Authorization"] = "Bearer " + client.app.state.panel_token
         assert client.get("/api/state").json()["views"] == ["screen", "both", "webcam"]
         assert client.put("/api/view", json={"view": "webcam"}).json()["view"] == "webcam"
         assert client.put("/api/view", json={"view": "irl"}).status_code == 422
