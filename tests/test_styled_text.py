@@ -136,3 +136,52 @@ def test_adjacent_secret_pieces_survive_overlapping_ocr_alternatives(pieces, cat
     regions = [(10, 20, 100, 40, pieces[0]), (11, 21, 101, 41, pieces[0]),
                (105, 20, 260, 40, pieces[1]), (106, 21, 261, 41, pieces[1])]
     assert any(kind == category for kind, _, _ in detector._find_areas(regions))
+
+
+def test_broad_email_sentence_is_replaced_only_with_confirmed_precise_results():
+    class Reader(AppleVisionReader):
+        def __init__(self, recognize=True):
+            self.recognize = recognize
+
+        def _read_vision(self, pixels, level):
+            assert level == self.ACCURATE
+            text = 'demo@example.com' if self.recognize else 'ordinary words'
+            box = [[180, 8], [380, 8], [380, 28], [180, 28]]
+            return [(box, 'You have not interacted with', .95), (box, text, .95),
+                    (box, 'before.', .95)], None
+
+    pixels = np.zeros((100, 1000, 4), np.uint8)
+    original = [([[20, 20], [950, 20], [950, 40], [20, 40]],
+                 'You have not interacted with demo@example.com before.', .9)]
+    precise = Reader()._refine_email_boxes(pixels, original)
+    assert precise[1][1] == 'demo@example.com'
+    assert precise[0][0][0] == [192, 20]
+    assert precise[0][0][1][0] < 950
+    assert Reader(False)._refine_email_boxes(pixels, original) == original
+
+
+def test_normal_word_box_does_not_trigger_extra_recognition():
+    class Reader(AppleVisionReader):
+        def __init__(self):
+            pass
+
+        def _read_vision(self, *args):
+            raise AssertionError('normal word must not be reread')
+
+    words = [([[20, 20], [220, 20], [220, 40], [20, 40]], 'demo@example.com', .9)]
+    assert Reader()._refine_email_boxes(np.zeros((100, 1000, 4), np.uint8), words) == words
+
+
+def test_line_width_word_box_is_refined_but_missing_other_secret_keeps_fallback():
+    class Reader(AppleVisionReader):
+        def __init__(self):
+            pass
+
+        def _read_vision(self, pixels, level):
+            return [([[50, 8], [250, 8], [250, 28], [50, 28]], 'demo@example.com', .9)], None
+
+    pixels = np.zeros((100, 1000, 4), np.uint8)
+    box = [[20, 20], [950, 20], [950, 40], [20, 40]]
+    assert Reader()._refine_email_boxes(pixels, [(box, 'demo@example.com', .9)])[0][0] != box
+    sentence = [(box, 'demo@example.com PASSWORD=fake-secret-123', .9)]
+    assert Reader()._refine_email_boxes(pixels, sentence) == sentence

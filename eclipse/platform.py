@@ -164,15 +164,65 @@ class AppleVisionReader:
         from eclipse.text_detect.styled_text import colour_regions, contrast_bgra
 
         words, _ = self._read_vision(pixels, self.FAST)
-        words = list(words)
+        words = self._refine_email_boxes(pixels, words)
         for left, top, right, bottom in colour_regions(pixels):
             crop = contrast_bgra(pixels[top:bottom, left:right])
             extra, _ = self._read_vision(crop, self.ACCURATE)
+            extra = self._refine_email_boxes(crop, extra)
             for corners, text, confidence in extra:
                 translated = [[x + left, y + top] for x, y in corners]
                 if not any(text == old[1] and translated == old[0] for old in words):
                     words.append((translated, text, confidence))
         return words, None
+
+    def _refine_email_boxes(self, pixels, words):
+        """Retry overly broad email boxes; discard the broad result only on proof.
+
+        Fast Vision sometimes returns a whole line for a word range, or one
+        failed word range makes the observation fall back to its complete line.
+        An accurate local read can supply a smaller email box. Other matched
+        secrets must also survive before the original observation is replaced.
+        """
+        import math
+        from eclipse.text_detect.detection import find_matches
+
+        height, width = pixels.shape[:2]
+        refined = []
+        for polygon, text, confidence in words:
+            matches = find_matches(text)
+            if not any(category == 'email' for category, _, _ in matches):
+                refined.append((polygon, text, confidence))
+                continue
+            x1 = max(0, math.floor(min(p[0] for p in polygon)) - 8)
+            y1 = max(0, math.floor(min(p[1] for p in polygon)) - 8)
+            x2 = min(width, math.ceil(max(p[0] for p in polygon)) + 8)
+            y2 = min(height, math.ceil(max(p[1] for p in polygon)) + 8)
+            # A normal single-word box needs no second pass. A line-wide box
+            # for a short email is suspicious even if Vision returned one word.
+            broad = ' ' in text or x2-x1 > max(len(text), 1) * max(y2-y1-16, 1)
+            if not broad or x2 <= x1 or y2 <= y1:
+                refined.append((polygon, text, confidence))
+                continue
+            extra, _ = self._read_vision(pixels[y1:y2, x1:x2], self.ACCURATE)
+            wanted = {(kind, text[start:end].casefold()) for kind, start, end in matches}
+            found = {(kind, value[start:end].casefold())
+                     for _, value, _ in extra for kind, start, end in find_matches(value)}
+            email_boxes = [box for box, value, _ in extra
+                           if any(kind == 'email' for kind, _, _ in find_matches(value))]
+            narrow = email_boxes and all(
+                max(p[0] for p in box)-min(p[0] for p in box) < (x2-x1-16)*0.9
+                for box in email_boxes
+            )
+            # Preserve the surrounding text too: configured keyword matching
+            # happens downstream, and the reader does not know those keywords.
+            original_text = re.sub(r"\s+", "", text).casefold()
+            retry_text = re.sub(r"\s+", "", ''.join(value for _, value, _ in extra)).casefold()
+            if wanted <= found and narrow and original_text in retry_text:
+                refined.extend(([[x+x1, y+y1] for x, y in box], value, score)
+                               for box, value, score in extra)
+            else:
+                refined.append((polygon, text, confidence))
+        return refined
 
     def _read_vision(self, pixels, level) -> tuple[list, None]:
         """One native Vision request; errors propagate to the fail-closed pipeline."""

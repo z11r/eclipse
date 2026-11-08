@@ -140,3 +140,20 @@ def test_styled_email_is_recognized_and_covered(style):
     assert any(d.x <= x+10 and d.x+d.w >= x+width-10 for d in emails)
     output = Compositor().process(frame, lambda f: detections)
     assert not output[y-height:y, x:x+width].any()
+
+
+@needs_mac
+def test_email_in_sentence_keeps_surrounding_words_visible():
+    image = np.full((500, 2600, 3), 240, np.uint8)
+    prefix = 'You have not interacted with '
+    email = 'demo@example.com'
+    suffix = ' before. Add this invitation?'
+    x, y, scale, thickness = 50, 250, 1.4, 2
+    cv2.putText(image, prefix+email+suffix, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (20, 20, 20), thickness)
+    prefix_width = cv2.getTextSize(prefix, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
+    email_width = cv2.getTextSize(email, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
+    detections = TextDetector(reader=AppleVisionReader(), pixel_scale=2)(Frame(image, 0, 'screen', 0))
+    boxes = [d for d in detections if d.category == 'email']
+    assert boxes
+    assert all(d.x > x+prefix_width-80 and d.x+d.w < x+prefix_width+email_width+80 for d in boxes)
