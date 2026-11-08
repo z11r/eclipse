@@ -1,6 +1,8 @@
 """The six routes in Max's handoff, plus /api/health, /api/view, /api/cover and GET /."""
+import hashlib
+
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
 from pathlib import Path
 from .schemas import CatchLog, CoverConfig, HealthResponse, ModeConfig, PanelConfig, PanelState, ViewConfig
 
@@ -8,11 +10,29 @@ router = APIRouter(tags=["panel"])
 
 
 _INDEX = Path(__file__).parent / "templates" / "index.html"
+_STATIC = Path(__file__).parent / "static"
+_VERSIONED = ("styles.css", "app.js")
+
+
+def _asset_version() -> str:
+    """Changes whenever the stylesheet or script does.
+
+    Every Eclipse build serves the panel on the same port, so without this a browser can
+    pair a new page with a stylesheet cached from an older build.
+    """
+    digest = hashlib.sha256()
+    for name in _VERSIONED:
+        digest.update((_STATIC / name).read_bytes())
+    return digest.hexdigest()[:12]
 
 
 @router.get("/", response_class=HTMLResponse)
 def index():
-    return FileResponse(_INDEX, media_type="text/html", headers={"Cache-Control": "no-store"})
+    html = _INDEX.read_text(encoding="utf-8")
+    version = _asset_version()
+    for name in _VERSIONED:
+        html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={version}"')
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/api/health", response_model=HealthResponse)

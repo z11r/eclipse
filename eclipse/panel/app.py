@@ -51,6 +51,9 @@ def create_app(controller: PipelineController) -> FastAPI:
         response.headers["Referrer-Policy"] = "no-referrer"
         if request.url.path.startswith("/api/") or request.url.path == "/":
             response.headers["Cache-Control"] = "no-store"
+        elif request.url.path.startswith("/static/"):
+            # Reuse only after asking: another build on this port may have changed it.
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
     app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")

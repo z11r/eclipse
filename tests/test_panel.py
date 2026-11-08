@@ -90,6 +90,19 @@ def test_frontend_served_with_assets(setup):
     assert css.status_code == 200 and ".hero" in css.text
 
 
+def test_page_never_reuses_another_builds_stylesheet(setup):
+    # Every Eclipse build serves the panel on port 8000. A browser that cached an older
+    # build's styles.css must not pair it with this page.
+    client, _ = setup
+    index = client.get("/").text
+    css_url = index.split('href="/static/styles.css', 1)[1].split('"', 1)[0]
+    js_url = index.split('src="/static/app.js', 1)[1].split('"', 1)[0]
+    assert css_url.startswith("?v=") and js_url.startswith("?v=") and css_url == js_url
+    css = client.get("/static/styles.css" + css_url)
+    assert css.status_code == 200 and css.headers["cache-control"] == "no-cache"
+    assert client.get("/").headers["cache-control"] == "no-store"
+
+
 def test_panel_does_not_contain_sample_sensitive_data(setup):
     client, _ = setup
     assert "FAKE_DEMO_STREET" not in client.get("/").text
