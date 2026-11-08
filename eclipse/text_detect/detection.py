@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from eclipse.text_detect.covers import MOVE, REREAD, STAY, CoverTracks, Sighting
+from eclipse.text_detect.incoming import IncomingRows, ScrollStep
 
 Box = tuple[int, int, int, int, str]
 CATEGORIES = frozenset({'email', 'phone', '2fa', 'api_key', 'card', 'keyword'})
@@ -29,12 +30,30 @@ _SCROLL_MAX_SHIFT = 240  # most rows one frame can scroll
 _SCROLL_TOLERANCE = 40  # blurred pixels this close count as the same text
 _SCROLL_MAX_MISMATCH = 0.03  # past this share, it isn't a clean scroll
 _SCROLL_EDGE = 16  # OCR boxes can sit this far outside the text they cover
+_SCROLL_BLOCK = 8  # square of pixels judged together when finding which part scrolled
+_SCROLL_SPLIT = 40  # change, in grey levels summed over a block's width, too small to judge
+_SCROLL_JOIN_DOWN = 6  # blocks of blank lines that still join one pane's text
+_SCROLL_JOIN_ACROSS = 2  # blocks of blank columns that still join; wider gaps part windows
+_SCROLL_EXACT = 0.01  # share of a group's change a scroll may leave unexplained to join it
+_SCROLL_LOOSE = 0.25  # past this share left unexplained, even the best group didn't scroll
+_SCROLL_JOIN_BLOCKS = 16  # smaller groups can match a scroll by chance, so never join
+_SCROLL_PART_WIDTH = 100  # narrowest pane, once it is told apart from what changed beside it
+_SCROLL_TRIES = 3  # parts of a change tried alone when the whole of it isn't a scroll
 _NOISE_FLOOR = 8  # a pixel this close to where it came from hasn't changed
 _CHANGE_BLOCK = 8  # with a sensor noise floor, compare blocks this size, not single pixels
 _WHOLE_PIXEL = 0.05  # a shift this close to a whole number lands text on the same pixels
 _SCROLL_RECHECK = 30  # frames of fractional scrolling between reads of the whole view
 _UNREAD_READ_AT = 96  # rows of incoming text to collect before reading them
 _UNREAD_KEEP = 24  # rows left black after a read, as the last line may be cut off
+_CUT_REACH = 3  # a line cut by a pane edge is looked for this many ordinary lines deep
+_LINE_GAP = 1  # blank rows, beyond this many, part one line from the next
+_UNREAD_MIN_WAIT = 2  # frames between reads of rows that came in whole
+_UNREAD_MIN_NEW = 8  # rows past the kept ones that a read after waiting needs
+_INK_ROW_GAP = 4  # blank rows that still join one line's ink into one cover
+_INK_WORD_GAP = 24  # blank columns that still join words; wider gaps part them
+_INK_BACKGROUND = 0.5  # share of a strip one colour must fill to be its background
+_STAYED_PUT_PIXELS = 40  # text pixels in uncovered rows needed to judge if they moved
+_STAYED_PUT_SHARE = 0.98  # of them unchanged, for a drag over a still background
 # With OCR workers reading every changed row ahead anyway, incoming rows are read on every
 # frame past the kept ones, so the black at the incoming edge stays one steady height
 # instead of growing and snapping back between reads.
@@ -46,6 +65,26 @@ _MOVE_SAMPLES = 4000  # textured pixels that vote on the exact shift
 _MOVE_SCREEN_SAMPLES = 500  # of those, how many first narrow the candidate shifts
 _MOVE_FINALISTS = 4  # candidate shifts that then get the full vote
 _MOVE_MIN_SHARE = 0.25  # share of changed textured pixels the shift must explain
+# Changes this close, sideways or up and down, count as one area. Lines of scrolling text
+# sit closer than the up-and-down gap, so a pane mostly stays one area; windows side by
+# side, like a scrolling note beside OBS's live preview, sit farther apart than the
+# sideways one. Areas only steer the tries: a pane that falls apart is still followed.
+_AREA_JOIN_X = 8
+_AREA_JOIN_Y = 24
+_AREA_BLOCK = 4  # areas are found on blocks this big, as they only steer where to look
+# Small pieces this close to an area are tried with it: a dragged window's edges and
+# shadow sit apart from its text, past blank margins, and must move with it.
+_AREA_NEAR = 40
+# Share of an area's changed pixels a follow must explain for the area to count as
+# followed. Some pixels of a live preview always match by chance.
+_AREA_EXPLAINED = 0.5
+_AREA_FAILS = 3  # frames in a row an area's changes went unexplained before it's left out
+_AREA_RETRY = 10  # frames between tries of an area left out, in case it starts to scroll
+_AREA_FORGET = 120  # frames an area left out can go unseen before it's forgotten
+_AREA_INSIDE = 0.8  # share of an area that must lie in a failing one to count as it
+# and how big it must be beside that failing one: a window dragged off a live preview is
+# a small part of the box the two filled together, and must be tried on its own again.
+_AREA_SIMILAR = 0.5
 _TEXTURE = 40  # a pixel this far from its neighbours' range is part of text or an edge
 
 
@@ -364,6 +403,98 @@ def _shifted_match(image, before, dx: int, dy: int, area) -> np.ndarray:
     return match
 
 
+def _ink(area: np.ndarray) -> np.ndarray | None:
+    """Which pixels of an area aren't its background colour, or None if no one colour
+    fills most of it, so there is no telling background from text."""
+    if area.size == 0:
+        return np.zeros(area.shape[:2], bool)
+    sample = area[::2, ::2].reshape(-1, 3).astype(np.int32)
+    packed = (sample[:, 0] << 16) | (sample[:, 1] << 8) | sample[:, 2]
+    colours, counts = np.unique(packed, return_counts=True)
+    common = int(counts.argmax())
+    if counts[common] < _INK_BACKGROUND * packed.size:
+        return None
+    value = int(colours[common])
+    background = np.empty_like(area)
+    background[:] = (value >> 16, (value >> 8) & 255, value & 255)
+    return _strongest(cv2.absdiff(area, background)) > _NOISE_FLOOR
+
+
+def _cut_line(
+    image, edge: int, inward: int, left: int, right: int, reach: int, scale: int, fallback: int
+) -> int:
+    """How many rows in from a pane's edge the line it cuts through reaches, or 0 if
+    the edge falls in a gap between lines. A line the edge cuts can't be read whole.
+
+    Only blank rows prove the edge cuts nothing. Up to reach rows are looked at, and a
+    line running past them counts as reach. If the background can't be told from text,
+    the answer is fallback, the rows a line of ordinary text takes.
+    """
+    if inward > 0:
+        area = image[edge:edge + reach, left:right]
+    else:
+        area = image[max(edge - reach, 0):edge, left:right][::-1]  # nearest the edge first
+    ink = _ink(area)
+    if ink is None:
+        return fallback
+    rows = ink.any(axis=1)
+    gap = _LINE_GAP * scale
+    if not rows[:gap + 1].any():
+        return 0
+    inked = np.flatnonzero(rows)
+    # The line touching the edge runs on to the first blank rows between lines.
+    band = _runs(inked, gap)[0]
+    return reach if band[1] >= len(rows) else min(band[1] + gap, reach)
+
+
+def _ink_boxes(image, top, bottom, left, right, scale) -> list[tuple[int, int, int, int]]:
+    """Boxes over everything in an area that isn't its background colour, as x, y, w, h.
+
+    Pixels of the background colour can't show anything, so only the rest needs to be
+    covered. If no one colour fills most of the area, there is no telling background
+    from text, and the whole area comes back as one box.
+    """
+    area = image[top:bottom, left:right]
+    if area.size == 0:
+        return []
+    ink = _ink(area)
+    if ink is None:
+        return [(left, top, right - left, bottom - top)]
+    boxes = []
+    for first, last in _runs(np.flatnonzero(ink.any(axis=1)), _INK_ROW_GAP * scale):
+        columns = np.flatnonzero(ink[first:last].any(axis=0))
+        for start, stop in _runs(columns, _INK_WORD_GAP * scale):
+            boxes.append((left + start, top + first, stop - start, last - first))
+    return boxes
+
+
+def _runs(indices: np.ndarray, gap: int) -> list[tuple[int, int]]:
+    """Sorted indices as (first, last + 1) runs, joined across gaps of up to gap."""
+    if not indices.size:
+        return []
+    breaks = np.flatnonzero(np.diff(indices) > gap + 1)
+    starts = np.concatenate(([indices[0]], indices[breaks + 1]))
+    ends = np.concatenate((indices[breaks], [indices[-1]])) + 1
+    return [(int(a), int(b)) for a, b in zip(starts, ends)]
+
+
+@functools.lru_cache(maxsize=4096)
+def _looks_secret(text: str) -> bool:
+    """Text a misread secret could hide in: an @, five or more digits, or a long
+    token mixing digits or cases. Look-ahead won't clear rows on such text unless a
+    cover is on it, as the read may have got a real secret wrong."""
+    if '@' in text or sum(character.isdigit() for character in text) >= 5:
+        return True
+    for token in text.split():
+        if len(token) >= 16 and (
+            sum(character.isdigit() for character in token) >= 2
+            or (any(c.islower() for c in token) and any(c.isupper() for c in token)
+                and not token.isalpha())
+        ):
+            return True
+    return False
+
+
 def _shift_shares(image, before, ys, xs, now, shifts) -> np.ndarray:
     """For each dx, dy in shifts, the share of the sampled pixels ys, xs that show exactly
     what the previous frame showed dx, dy away. now holds image[ys, xs] as int16. Pixels
@@ -376,6 +507,17 @@ def _shift_shares(image, before, ys, xs, now, shifts) -> np.ndarray:
     source = before[np.clip(from_y, 0, height - 1), np.clip(from_x, 0, width - 1)]
     same = (np.abs(source.astype(np.int16) - now[None]).max(axis=2) <= _NOISE_FLOOR) & inside
     return same.sum(axis=1) / ys.size
+
+
+def _outside(result, part, changed):
+    """What still needs reading after following part of changed: what following left,
+    plus everything changed outside part. A follow that found nothing hands part back
+    untouched, and then that's all of changed, without whole-frame arithmetic."""
+    if result is part:
+        return changed
+    if part is changed:
+        return result
+    return result | (changed & ~part)
 
 
 def _text_hash(text: str) -> int:
@@ -400,7 +542,7 @@ class Detector:
             'scanned_share': 0.0, 'diff_seconds': 0.0, 'find_seconds': 0.0,
             'det_seconds': 0.0, 'rec_seconds': 0.0, 'reads': 0, 'lines': 0, 'scrolls': 0,
             'checks': 0, 'copy_seconds': 0.0, 'track_seconds': 0.0, 'cached_frames': 0,
-            'moves': 0,
+            'moves': 0, 'areas_left_out': 0,
         }
         if not isinstance(padding, int) or padding < 0:
             raise ValueError('padding must be a nonnegative integer')
@@ -427,9 +569,17 @@ class Detector:
             _UNREAD_READ_AT_AHEAD if reads_ahead else _UNREAD_READ_AT
         ) * pixel_scale
         self._unread_keep = _UNREAD_KEEP * pixel_scale
+        self._pixel_scale = pixel_scale
+        self._scroll_block = _SCROLL_BLOCK * pixel_scale
+        self._scroll_part_width = _SCROLL_PART_WIDTH * pixel_scale
         self._move_min_height = _MOVE_MIN_HEIGHT * pixel_scale
         self._move_min_width = _MOVE_MIN_WIDTH * pixel_scale
+        self._area_join = (_AREA_JOIN_X * pixel_scale, _AREA_JOIN_Y * pixel_scale)
+        self._area_block = _AREA_BLOCK * pixel_scale
+        self._area_near = _AREA_NEAR * pixel_scale
         self._tracks = CoverTracks(pixel_scale)
+        self._incoming = IncomingRows(_UNREAD_KEEP * pixel_scale)
+        self._looking_ahead = False  # following strips costs time, so only when asked
         self._shape = None
         self._lock = threading.RLock()
         self._cancelled = threading.Event()
@@ -487,11 +637,23 @@ class Detector:
         self._regions = []
         self._boxes = ()
         self._unread = {}  # one strip for each way rows can come in: 1 is down, -1 is up
+        self._unread_waited = {}  # frames each strip has waited since its last read
+        self._strip_ink = {}  # each strip's covers, over its text only
+        self._uncovered = None  # rows a scroll uncovered this frame, to tell a drag apart
+        self._probe = None  # the rows the last frame's scroll uncovered
+        self._pane = None  # the last scrolling pane's edges, which cut lines off where it stops
+        self._incoming.clear()  # strips can only be followed through frames read in order
+        self._last_changed = None  # this frame's changed pixels, while strips are followed
+        self._step = None  # this frame's checked scroll, while strips are followed
         self._scrolled = False
         self._moved = False  # whether known text moved with a window this frame
         self._last_move = None  # the last window move, which the next one likely repeats
         self._view = None  # top and bottom of the area scrolling now
         self._fractional_frames = 0  # frames of this scroll that landed between pixels
+        # Areas whose changes keep going unexplained, like a live video or OBS's preview:
+        # [top, bottom, left, right, fails in a row, frame last tried, frame last seen].
+        self._failing = []
+        self._follow_frame = 0
 
     def _scroll_action(self, rect, image, changed, top, bottom, left, right) -> str:
         """What a scroll of the given area does to a piece of text or a cover."""
@@ -512,6 +674,195 @@ class Detector:
 
         # Text cut by the edge of the scrolling area can't be trusted.
         return REREAD
+
+    def _stayed_put(self, image, uncovered, shift) -> bool:
+        """Whether rows a scroll uncovered last frame are unchanged now, while the area
+        moved again, rather than moved along with it as scrolling text does. Only rows
+        showing something can tell: blank ones look the same either way, so they don't."""
+        top, bottom, left, right, before = uncovered
+        grey = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
+        textured = _texture(grey)
+        if textured.sum() < _STAYED_PUT_PIXELS * self._pixel_scale:
+            return False
+        still = _strongest(cv2.absdiff(image[top:bottom, left:right], before)) <= _NOISE_FLOOR
+        if still[textured].mean() < _STAYED_PUT_SHARE:
+            return False
+        height = image.shape[0]
+        a, b = max(top + shift, 0), min(bottom + shift, height)
+        if b - a < bottom - top:
+            return True  # it would have moved off the frame: it stayed
+        moved = _strongest(cv2.absdiff(image[a:b, left:right], before)) <= _NOISE_FLOOR
+        # Scrolled text matches its shifted self almost exactly; a busy background can
+        # match a shifted copy of itself often, by chance, but not that often.
+        return moved[textured].mean() < _STAYED_PUT_SHARE - 0.08
+
+    def _scroll_shift(self, image, top, bottom, left, right, greys=None):
+        """The whole-row shift that best explains how the area changed, with the grey
+        pictures it was found on, or None when no shift explains it better than none.
+        greys, if given, are those pictures already made for this area."""
+        if greys is None:
+            now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+            before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        else:
+            now, before = greys
+        now_rows = _row_means(now)
+        before_rows = _row_means(before)
+        limit = min(self._scroll_max_shift, (bottom - top) // 2)
+        differences = _shift_differences(now_rows, before_rows, limit)
+        shift = min(
+            (s for s in range(-limit, limit + 1) if s), key=lambda s: differences[s + limit]
+        )
+        if differences[shift + limit] >= differences[limit]:
+            return None
+        return shift, now, before, now_rows, before_rows
+
+    def _separate_changes(self, changed, top, bottom, left, right) -> list[tuple]:
+        """Parts of the change that columns which didn't change keep apart, as (top,
+        bottom, left, right), the most changed first. Empty if nothing stands apart."""
+        counts = changed[top:bottom, left:right].sum(axis=0)
+        columns = np.flatnonzero(counts)
+        gap = 2 * _SCROLL_JOIN_ACROSS * self._scroll_block
+        breaks = np.flatnonzero(np.diff(columns) > gap)
+        if not breaks.size:
+            return []
+        parts = []
+        for run in sorted(
+            np.split(columns, breaks + 1), key=lambda run: -int(counts[run[0]:run[-1] + 1].sum())
+        ):
+            first, last = left + int(run[0]), left + int(run[-1]) + 1
+            rows = np.flatnonzero(changed[top:bottom, first:last].any(axis=1))
+            parts.append((top + int(rows[0]), top + int(rows[-1]) + 1, first, last))
+        return parts
+
+    def _scrolling_part(self, changed, estimate, top, bottom, left, right):
+        """The part of a changed area that scrolled: (top, bottom, left, right), or None.
+
+        A block of pixels scrolled when the shift explains its change far better than no
+        move does, or exactly. The pane is the group of such blocks that the shift explains
+        most, joined across blank lines but not across a wide gap to the side, where other
+        windows sit. Only rows on screen in both frames are compared, so the rows coming
+        in are added back at the pane's incoming edge.
+        """
+        shift, now, before = estimate[:3]
+        length = (bottom - top) - abs(shift)
+        now_start, before_start = max(shift, 0), max(-shift, 0)  # within the area
+        block = self._scroll_block
+        # Compared at half size: each frame is shrunk after it's lined up by the shift, so
+        # a whole-row scroll still matches exactly, and averaging pixels in twos softens
+        # the redrawn text edges of a scroll that lands between pixels.
+        length -= length % 2
+        width = (right - left) // 2 * 2
+        small = width // 2, length // 2
+        down, across = -(-length // block), -(-width // block)
+
+        def shrink(picture):
+            return cv2.resize(picture, small, interpolation=cv2.INTER_AREA)
+
+        current = shrink(now[now_start:now_start + length, :width])
+        rows = slice(top + now_start, top + now_start + length)
+        mask = shrink(changed[rows, left:left + width].view(np.uint8) * 255)
+
+        def unexplained(source_row):
+            """Per block, the summed grey difference where pixels changed."""
+            source = shrink(before[source_row:source_row + length, :width])
+            difference = cv2.absdiff(current, source)
+            difference = cv2.bitwise_and(difference, difference, mask=mask)
+            padded = cv2.copyMakeBorder(
+                difference, 0, down * block // 2 - small[1], 0, across * block // 2 - small[0],
+                cv2.BORDER_CONSTANT, value=0,
+            ).astype(np.float32)
+            means = cv2.resize(padded, (across, down), interpolation=cv2.INTER_AREA)
+            return np.rint(means * (block * block))
+
+        missed = unexplained(before_start)  # what the shift leaves unexplained
+        static = unexplained(now_start)  # what no move at all leaves unexplained
+        scrolled = (static > 0) & (
+            (missed == 0) | ((static > _SCROLL_SPLIT * block) & (missed * 2 < static))
+        )
+        if not scrolled.any():
+            return None
+        joined = cv2.dilate(
+            scrolled.astype(np.uint8),
+            np.ones((2 * _SCROLL_JOIN_DOWN + 1, 2 * _SCROLL_JOIN_ACROSS + 1), np.uint8),
+        )
+        count, labels = cv2.connectedComponents(joined, connectivity=8)
+        groups = []
+        for label in range(1, count):
+            part = scrolled & (labels == label)
+            spanned = np.flatnonzero(part.any(axis=1))
+            groups.append((
+                float((static - missed)[part].sum()), float(missed[part].sum()),
+                float(static[part].sum()), int(spanned[0]), int(spanned[-1]), part,
+            ))
+        best = max(groups, key=lambda group: group[0])
+        if best[1] > _SCROLL_LOOSE * best[2]:
+            return None  # the best match is a poor one, like a mirror of the screen
+        # Other columns of the same page, like a sidebar or a table's, move exactly with
+        # it. Things that only look a little like the scroll, like a preview of the screen
+        # or a meter, are left to be read as they are.
+        pane = np.zeros_like(scrolled)
+        for _, left_over, change, first_block, last_block, part in groups:
+            if part is best[5] or (
+                left_over <= _SCROLL_EXACT * change
+                and part.sum() >= _SCROLL_JOIN_BLOCKS
+                and first_block <= best[4] and last_block >= best[3]
+            ):
+                pane |= part
+        hits = np.argwhere(pane)
+        first = left + int(hits[:, 1].min()) * block
+        last = min(left + (int(hits[:, 1].max()) + 1) * block, right)
+        # The pane's rows: every changed row in its columns. A line coming in after a wide
+        # blank gap is still the pane's, and must be held as incoming, not read while cut.
+        # What changes beside the pane is in other columns, so it stays out.
+        first_row, last_row = top, bottom
+        inside = changed[first_row:last_row, first:last]
+        found_rows = np.flatnonzero(inside.any(axis=1))
+        found_columns = np.flatnonzero(inside.any(axis=0))
+        return (
+            first_row + int(found_rows[0]), first_row + int(found_rows[-1]) + 1,
+            first + int(found_columns[0]), first + int(found_columns[-1]) + 1,
+        )
+
+    def _find_scroll(self, image, changed, area):
+        """The area that scrolled and its shift estimate, or None if nothing did.
+
+        Other things change in the same frame: a video, a meter, a screen preview that
+        mirrors the scroll. Their pixels must not stretch the area that scrolls, or the
+        rows held black as they come in land on them instead of on the pane's edge. They
+        can also drown the scroll out, so then each part of the change that stands apart
+        is tried alone.
+        """
+        tries = [area]
+        for index in range(1 + _SCROLL_TRIES):
+            if index == 1:
+                tries += self._separate_changes(changed, *area)[:_SCROLL_TRIES]
+            if index >= len(tries):
+                return None
+            top, bottom, left, right = tries[index]
+            if bottom - top < self._scroll_min_height or right - left < self._scroll_part_width:
+                continue
+            estimate = self._scroll_shift(image, top, bottom, left, right)
+            if estimate is None:
+                continue
+            part = self._scrolling_part(changed, estimate, top, bottom, left, right)
+            if part is None:
+                continue
+            if part == tries[index]:
+                return part, estimate
+            if (
+                part[1] - part[0] < self._scroll_min_height
+                or part[3] - part[2] < self._scroll_part_width
+            ):
+                continue
+            # The shift again, on the pane alone: what changed beside it can pull the first
+            # estimate off, and covers moved by a wrong shift would leave their text.
+            inside = slice(part[0] - top, part[1] - top), slice(part[2] - left, part[3] - left)
+            estimate = self._scroll_shift(
+                image, *part, greys=(estimate[1][inside], estimate[2][inside])
+            )
+            if estimate is not None:
+                return part, estimate
+        return None
 
     def _follow_scroll(self, image, changed):
         """Follow a scroll, even with other things changing elsewhere on the screen.
@@ -639,19 +990,24 @@ class Detector:
         if height < self._scroll_min_height or right - left < self._scroll_min_width:
             return changed
 
-        now = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
-        before = cv2.cvtColor(self._previous[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
-        now_rows = _row_means(now)
-        before_rows = _row_means(before)
-        limit = min(self._scroll_max_shift, height // 2)
-        differences = _shift_differences(now_rows, before_rows, limit)
-
-        def difference(shift: int) -> float:
-            return float(differences[shift + limit])
-
-        shift = min((s for s in range(-limit, limit + 1) if s), key=difference)
-
-        if difference(shift) >= difference(0):
+        # Taken once a frame, as this can be tried on several areas of one frame.
+        uncovered = self._probe
+        found = self._find_scroll(image, changed, (top, bottom, left, right))
+        if found is None:
+            return changed
+        (top, bottom, left, right), estimate = found
+        height = bottom - top
+        shift, now, before, now_rows, before_rows = estimate
+        if uncovered is not None and self._stayed_put(image, uncovered, shift):
+            # What last frame's move uncovered didn't move with this one: a window dragged
+            # up or down over a still background, not a pane scrolling text in at its edge.
+            # Nothing scrolls in, so nothing is held black; the window move follows it,
+            # and what it uncovers is read where it stays.
+            if shift > 0:
+                rows = top, min(top + shift, bottom)
+            else:
+                rows = max(bottom + shift, top), bottom
+            self._uncovered = (*rows, left, right, image[rows[0]:rows[1], left:right].copy())
             return changed
 
         length = height - abs(shift)
@@ -675,7 +1031,9 @@ class Detector:
             length -= 1
             if shift > 0:
                 first_row, old_row = first_row + 1, old_row + 1
-        remaining = np.zeros_like(changed)
+        # Changes beside the scrolling area are read as they are.
+        remaining = changed.copy()
+        remaining[top:bottom, left:right] = False
         # A pixel that didn't change at all stays cleared, even if it doesn't match the
         # shift: that is what still content beside a moving pane looks like.
         remaining[first_row:first_row + length, left:right] = changed[
@@ -696,7 +1054,10 @@ class Detector:
         else:
             top_of_view, bottom_of_view = top, bottom
         self._view = top_of_view, bottom_of_view
+        self._pane = top_of_view, bottom_of_view, left, right
         exact_shift = shift + fraction
+        if self._incoming.following:
+            self._step = self._checked_step(image, shift, fraction, left, right)
 
         if abs(fraction) >= _WHOLE_PIXEL:
             self._fractional_frames += 1
@@ -729,7 +1090,14 @@ class Detector:
         self._regions = moved
         self.stats['scrolls'] += 1
         self._scrolled = True
-        self._collect_unread(shift, left, right, first_row, length, remaining)
+        self._collect_unread(image, shift, left, right, first_row, length, remaining)
+        incoming = (top_of_view, first_row) if shift > 0 else (
+            first_row + length, bottom_of_view
+        )
+        if incoming[1] > incoming[0]:
+            self._uncovered = (
+                *incoming, left, right, image[incoming[0]:incoming[1], left:right].copy()
+            )
         return remaining
 
     def _move_shift(self, image, changed, area):
@@ -801,13 +1169,26 @@ class Detector:
             return None
         return finalists[best]
 
-    def _follow_move(self, image, changed):
+    def _estimate_move(self, image, changed):
+        """The dx, dy a window moving whole within changed explains best, or None."""
+        rows = np.flatnonzero(changed.any(axis=1))
+        if not rows.size:
+            return None
+        columns = np.flatnonzero(changed.any(axis=0))
+        top, bottom = int(rows[0]), int(rows[-1]) + 1
+        left, right = int(columns[0]), int(columns[-1]) + 1
+        if bottom - top < self._move_min_height or right - left < self._move_min_width:
+            return None
+        return self._move_shift(image, changed, (top, bottom, left, right))
+
+    def _follow_move(self, image, changed, shift=None):
         """If a window moved whole, move known text and covers along with it.
 
         Something moved whole when its pixels now show exactly what the previous frame
         showed one fixed dx, dy away. Known text moves only if every pixel of its new
         place matches; anything else is read again, as is every pixel the move doesn't
-        explain, so a wrong shift only costs time. Returns what still needs reading.
+        explain, so a wrong shift only costs time. The shift is estimated from changed,
+        unless one is given. Returns what still needs reading.
         """
         rows = np.flatnonzero(changed.any(axis=1))
         if not rows.size:
@@ -818,7 +1199,8 @@ class Detector:
         if bottom - top < self._move_min_height or right - left < self._move_min_width:
             return changed
 
-        shift = self._move_shift(image, changed, (top, bottom, left, right))
+        if shift is None:
+            shift = self._move_shift(image, changed, (top, bottom, left, right))
         if shift is None:
             self._last_move = None
             return changed
@@ -837,6 +1219,7 @@ class Detector:
             return changed
         self._last_move = shift
         self._moved = True
+        self._moved_area = area  # top, bottom, left, right of what moved, and where to
         self.stats['moves'] += 1
         remaining = changed.copy()
         remaining[inside] &= ~match[inside]
@@ -879,7 +1262,30 @@ class Detector:
         self._regions = moved
         return remaining
 
-    def _collect_unread(self, shift, left, right, first, length, remaining):
+    def _checked_step(self, image, shift, fraction, left, right) -> ScrollStep:
+        """This scroll, for following black incoming rows into later frames: every
+        pixel of the pane's view that the shift doesn't reproduce, changed or not."""
+        top_of_view, bottom_of_view = self._view
+        length = bottom_of_view - top_of_view - abs(shift)
+        first, old = top_of_view + max(shift, 0), top_of_view + max(-shift, 0)
+        if abs(fraction) >= _WHOLE_PIXEL:
+            length -= 1  # the row at the incoming edge is partly one not seen yet
+            if shift > 0:
+                first, old = first + 1, old + 1
+        length = max(length, 0)
+        unexplained = _unexplained(
+            image[first:first + length, left:right], self._previous, old, left, right, fraction
+        )
+        return ScrollStep(shift + fraction, left, right, first, unexplained, self._view)
+
+    def _cut(self, image, edge, inward, left, right) -> int:
+        """Rows in from a pane edge that the line it cuts through takes, if any."""
+        return _cut_line(
+            image, edge, inward, left, min(right, image.shape[1]),
+            _CUT_REACH * self._unread_keep, self._pixel_scale, self._unread_keep,
+        )
+
+    def _collect_unread(self, image, shift, left, right, first, length, remaining):
         """Track rows new to the screen. They stay black until they can be read.
 
         A line coming onto the screen can't be read until enough of it shows, so
@@ -909,15 +1315,28 @@ class Detector:
             else:
                 strips[way] = moved  # a reversal left these rows at the other edge
 
-        if incoming[1] - incoming[0] >= self._unread_read_at:
+        waited = self._unread_waited.get(direction, 0) + 1
+        rows_in = incoming[1] - incoming[0]
+        # What can't be read yet: the line the edge cuts through, if it cuts one.
+        edge = top_of_view if shift > 0 else bottom_of_view
+        keep = self._cut(image, edge, direction, incoming[2], incoming[3])
+        if rows_in >= self._unread_read_at or (
+            # Read what came in once it holds more than the line the edge cuts through:
+            # a whole line came in. A slow scroll gets there long before 96 rows do.
+            waited >= _UNREAD_MIN_WAIT
+            and rows_in >= keep + _UNREAD_MIN_NEW * self._pixel_scale
+        ):
+            waited = 0
             remaining[incoming[0]:incoming[1], incoming[2]:incoming[3]] = True
             if shift > 0:
-                incoming = (incoming[0], incoming[0] + self._unread_keep, *incoming[2:])
+                incoming = (incoming[0], incoming[0] + keep, *incoming[2:])
             else:
-                incoming = (incoming[1] - self._unread_keep, incoming[1], *incoming[2:])
+                incoming = (incoming[1] - keep, incoming[1], *incoming[2:])
 
-        strips[direction] = incoming
+        if incoming[1] > incoming[0]:
+            strips[direction] = incoming
         self._unread = strips
+        self._unread_waited = {direction: waited}
 
     def _read_unread(self, changed) -> None:
         """Scrolling has stopped, so read whatever is still covered."""
@@ -925,8 +1344,212 @@ class Detector:
             for top, bottom, left, right in self._unread.values():
                 changed[top:bottom, left:right] = True
             self._unread = {}
+            self._unread_waited = {}
             self._view = None
             self._fractional_frames = 0
+
+    def _follow(self, image, changed):
+        """Follow a scroll, or else a moved window, across everything in changed."""
+        changed = self._follow_scroll(image, changed)
+        if not self._scrolled:
+            changed = self._follow_move(image, changed)
+        return changed
+
+    def _follow_part(self, image, changed, part):
+        """Follow within part of changed only. Returns what still needs reading: what
+        following part left, plus everything changed outside it."""
+        return _outside(self._follow(image, part), part, changed)
+
+    def _areas(self, changed):
+        """The separate areas of change: (areas big enough to follow, largest first;
+        smaller pieces). Each is top, bottom, left, right. They only steer where to look:
+        every follow is still checked pixel by pixel."""
+        block = self._area_block
+        height, width = changed.shape
+        rows, columns = height // block, width // block
+        if not rows or not columns:
+            return [], []
+        # Every other pixel, and whole blocks only so the shrink takes OpenCV's fast path:
+        # a third of the time. What this misses, a one-pixel line or the last few rows
+        # and columns, just isn't part of any area, so it's followed with the rest.
+        blocks = cv2.resize(
+            changed[:rows * block:2, :columns * block:2].view(np.uint8) * np.uint8(255),
+            (columns, rows), interpolation=cv2.INTER_AREA,
+        ) > 0
+        join_x, join_y = (-(-join // (2 * block)) for join in self._area_join)
+        joined = cv2.dilate(
+            blocks.view(np.uint8), np.ones((2 * join_y + 1, 2 * join_x + 1), np.uint8)
+        )
+        count, labels, boxes, _ = cv2.connectedComponentsWithStats(joined, connectivity=4)
+        areas, pieces = [], []
+        for label in range(1, count):
+            x, y, w, h = (int(v) for v in boxes[label, :4])
+            loose = (y * block, (y + h) * block, x * block, (x + w) * block)
+            # Joining grew each area by up to its margins; too small even so, it's a piece.
+            if h * block < self._move_min_height or w * block < self._move_min_width:
+                pieces.append(loose)
+                continue
+            inside = (labels[y:y + h, x:x + w] == label) & blocks[y:y + h, x:x + w]
+            ys, xs = np.nonzero(inside)
+            top, bottom = (int(ys.min()) + y) * block, (int(ys.max()) + y + 1) * block
+            left, right = (int(xs.min()) + x) * block, (int(xs.max()) + x + 1) * block
+            if bottom - top >= self._move_min_height and right - left >= self._move_min_width:
+                areas.append((top, bottom, left, right))
+            else:
+                pieces.append(loose)
+        areas.sort(key=lambda a: (a[1] - a[0]) * (a[3] - a[2]), reverse=True)
+        return areas, pieces
+
+    @staticmethod
+    def _overlap(box, entry) -> int:
+        return (
+            max(min(box[1], entry[1]) - max(box[0], entry[0]), 0)
+            * max(min(box[3], entry[3]) - max(box[2], entry[2]), 0)
+        )
+
+    def _failing_entry(self, area):
+        """The remembered failing area this one is: mostly inside it, and not much
+        smaller. None if there isn't one."""
+        size = (area[1] - area[0]) * (area[3] - area[2])
+        for entry in self._failing:
+            entry_size = (entry[1] - entry[0]) * (entry[3] - entry[2])
+            if (
+                self._overlap(area, entry) >= _AREA_INSIDE * size
+                and size >= _AREA_SIMILAR * entry_size
+            ):
+                return entry
+        return None
+
+    def _in_failing(self, piece) -> bool:
+        """Whether a small piece of change lies in an area left out for failing, like
+        the cursor's copy in OBS's preview."""
+        size = (piece[1] - piece[0]) * (piece[3] - piece[2])
+        return any(
+            entry[4] >= _AREA_FAILS and self._overlap(piece, entry) >= _AREA_INSIDE * size
+            for entry in self._failing
+        )
+
+    def _follow_areas(self, image, changed):
+        """Follow scrolls and moved windows, even beside changes that can't be followed.
+
+        Changes fall in separate areas. In this order, until something is followed:
+        1. The quick scroll check across all of them together, as one pane's lines can
+           fall apart. When every change is small, like a cursor and its copy in the
+           preview, that's all: windows that move change a big area, their frame.
+        2. Each area big enough to follow, alone and largest first, with every check, so
+           a note still scrolls, or a window still moves, beside OBS's live preview,
+           whose shrunken copy of the move would otherwise compete with it.
+        3. A move across the big areas together, for a window whose change fell apart.
+        An area whose changes went unexplained several frames running is left out of the
+        tries, with the small pieces inside it, and only tried again now and then. Left
+        out never means skipped: its changes, like every change no follow explains, are
+        all read again.
+        """
+        self._follow_frame += 1
+        frame = self._follow_frame
+        areas, pieces = self._areas(changed)
+        left_out, due = [], []
+        for area in areas:
+            entry = self._failing_entry(area)
+            if entry is not None and entry[4] >= _AREA_FAILS:
+                entry[6] = frame
+                (due if frame - entry[5] >= _AREA_RETRY else left_out).append(area)
+        tried = [area for area in areas if area not in left_out and area not in due]
+        hidden = [piece for piece in pieces if self._in_failing(piece)]
+        visible = [piece for piece in pieces if piece not in hidden]
+        others = bool(visible)
+
+        part = changed
+        if left_out or due or hidden:
+            self.stats['areas_left_out'] += 1
+            part = changed.copy()
+            for top, bottom, left, right in left_out + due + hidden:
+                part[top:bottom, left:right] = False
+        last_move = self._last_move
+        crowded = len(tried) > 1 or bool(left_out or due or hidden)
+        remaining = changed
+        # An area is judged by a try that tells: alone, or any try that followed something.
+        # A failed try of several at once proves nothing about each.
+        judged = []
+        if len(tried) > 1 or others:
+            # Only the quick check: each big area gets the full one, alone, next.
+            scrolled = self._follow_scroll_in(image, part)
+            remaining = _outside(scrolled, part, changed)
+
+        for area in tried + due:
+            if self._scrolled or self._moved:
+                break
+            near, block = self._area_near, self._area_block
+            # The area a block wider, for pixels at its edge that finding it skipped.
+            grown = (
+                max(area[0] - block, 0), area[1] + block, max(area[2] - block, 0),
+                area[3] + block,
+            )
+            # Wide: everything but the other big areas, so the rest of a pane or window
+            # comes along, however far from this area. Close: the area and the pieces
+            # right by it, as farther changes, like the cursor, can spoil a check.
+            wide = part.copy()
+            for top, bottom, left, right in tried:
+                if (top, bottom, left, right) != area:
+                    wide[top:bottom, left:right] = False
+            wide[grown[0]:grown[1], grown[2]:grown[3]] = changed[
+                grown[0]:grown[1], grown[2]:grown[3]
+            ]
+            close = np.zeros_like(changed)
+            for top, bottom, left, right in [grown] + [
+                piece for piece in visible
+                if piece[0] < area[1] + near and piece[1] > area[0] - near
+                and piece[2] < area[3] + near and piece[3] > area[2] - near
+            ]:
+                close[top:bottom, left:right] = changed[top:bottom, left:right]
+
+            # A scroll is checked close. For the few frames before a busy area beside it
+            # is left out, the rest of the pane may be read again instead of followed.
+            remaining = _outside(self._follow_scroll(image, close), close, changed)
+            if not self._scrolled:
+                # A move is applied wide, each pixel still checked against the shift. With
+                # nothing else big changing, the shift is estimated wide too, as before.
+                # Beside other changes, like OBS's preview showing a shrunken copy of the
+                # move, it's estimated close first, where those can't spoil it.
+                self._last_move = last_move  # a failed try forgets it; this one may need it
+                shift = self._estimate_move(image, close) if crowded else None
+                if shift is None:
+                    self._last_move = last_move
+                    shift = self._estimate_move(image, wide)
+                if shift is None:
+                    self._last_move = None
+                else:
+                    remaining = _outside(self._follow_move(image, wide, shift), wide, changed)
+            judged.append(area)
+
+        if len(tried) > 1 and not (self._scrolled or self._moved):
+            together = np.zeros_like(changed)
+            for top, bottom, left, right in tried:
+                together[top:bottom, left:right] = changed[top:bottom, left:right]
+            self._last_move = last_move
+            remaining = _outside(self._follow_move(image, together), together, changed)
+
+        if self._scrolled or self._moved:
+            # Only one scroll or move is followed a frame, so any other area left
+            # unexplained has failed for this frame, whether or not it was tried alone.
+            judged = list(dict.fromkeys(judged + tried))
+        for area in judged:
+            top, bottom, left, right = area
+            entry = self._failing_entry(area)
+            inside = changed[top:bottom, left:right]
+            explained = inside & ~remaining[top:bottom, left:right]
+            share = cv2.countNonZero(explained.view(np.uint8)) / max(
+                cv2.countNonZero(inside.view(np.uint8)), 1
+            )
+            if share >= _AREA_EXPLAINED:
+                if entry is not None:
+                    self._failing.remove(entry)
+            elif entry is not None:
+                entry[:4], entry[4], entry[5], entry[6] = area, entry[4] + 1, frame, frame
+            else:
+                self._failing.append([*area, 1, frame, frame])
+        self._failing = [e for e in self._failing if frame - e[6] <= _AREA_FORGET]
+        return remaining
 
     def _changed_areas(self, image) -> list[tuple[int, int, int, int]]:
         """Areas to read again, each grown to hold whole pieces of known text."""
@@ -942,6 +1565,8 @@ class Detector:
             changed = cv2.bitwise_or(
                 cv2.bitwise_or(difference[0], difference[1]), difference[2]
             ) > 0
+        if self._incoming.following:
+            self._last_changed = changed.copy()  # the steps below mark it up
         if self._noise_floor:
             # Scroll and window following prove moves by exact pixel matches, which a
             # camera's noise never gives, and a sheet in a hand isn't a window. Each cover
@@ -949,9 +1574,7 @@ class Detector:
             if self._tracks.follow_each(image, changed):
                 self._moved = True
         else:
-            changed = self._follow_scroll(image, changed)
-            if not self._scrolled:
-                changed = self._follow_move(image, changed)
+            changed = self._follow_areas(image, changed)
         self._read_unread(changed)
 
         for place in self._tracks.due():
@@ -1162,7 +1785,64 @@ class Detector:
 
         return areas
 
-    def detect(self, frame) -> list[Box]:
+    def _look_ahead(self, key, image) -> None:
+        if key is None or not self._looking_ahead:
+            self._incoming.clear()  # frames without keys can't be followed
+        else:
+            strips = []
+            if self._unread:
+                height, width = self._shape[:2]
+                top_of_view, bottom_of_view = self._view
+                for way, (top, bottom, left, right) in self._unread.items():
+                    box = (left, top, min(right, width) - left, bottom - top, 'unread')
+                    edge = top_of_view if way > 0 else bottom_of_view
+                    strips.append((box, edge, way, self._strip_ink.get(way, [])))
+            covered = [box for box in self._boxes if box[4] != 'unread']
+            doubtful = [
+                (x1, y1, x2 - x1, y2 - y1)
+                for x1, y1, x2, y2, text in self._regions
+                if _looks_secret(text) and not any(
+                    x < x2 and x + w > x1 and y < y2 and y + h > y1 for x, y, w, h, _ in covered
+                )
+            ] if self._incoming.following or strips else []
+            cut = None  # where the pane's edges cut lines through; unknown without a pane
+            if self._pane is not None:
+                top, bottom, left, right = self._pane
+                left, right = max(left - self._scroll_edge, 0), right + self._scroll_edge
+                rows_top = self._cut(image, top, 1, left, right)
+                rows_bottom = self._cut(image, bottom, -1, left, right)
+                width = right - left
+                cut = [
+                    (left, top, width, rows_top),
+                    (left, bottom - rows_bottom, width, rows_bottom),
+                ]
+                cut = [rect for rect in cut if rect[3] > 0]
+            pane = None
+            if strips and self._pane is not None:
+                top, bottom, left, right = self._pane
+                left = max(left - self._scroll_edge, 0)
+                right = min(right + self._scroll_edge, self._shape[1])
+                pane = (left, top, right - left, bottom - top)
+            self._incoming.record(
+                key, list(self._boxes), strips, self._last_changed, self._step,
+                self._shape[:2], doubtful, cut, pane,
+            )
+
+    def look_ahead(self) -> None:
+        """Follow black incoming rows into later frames from now on, for settled()."""
+        with self._lock:
+            self._looking_ahead = True
+
+    def settled(self, key) -> list[Box] | None:
+        """The boxes for an earlier frame, with its incoming rows cleared where frames
+        since have read them, or None if that frame is no longer known. Forgets it and
+        every frame before it. The rows still unread stay as 'unread' boxes."""
+        with self._lock:
+            return self._incoming.settled(key)
+
+    def detect(self, frame, key=None) -> list[Box]:
+        """Boxes to cover in this frame. Give each frame a key, in order, to have
+        settled() clear its incoming rows later, once following frames have read them."""
         try:
             if (
                 not isinstance(frame, np.ndarray)
@@ -1186,6 +1866,8 @@ class Detector:
                 self.stats['copy_seconds'] += diff_started - copy_started
                 self._scrolled = False
                 self._moved = False
+                self._last_changed = self._step = None
+                self._probe, self._uncovered = self._uncovered, None
                 areas = self._changed_areas(snapshot)
                 self.stats['frames'] += 1
                 self.stats['diff_seconds'] += time.monotonic() - diff_started
@@ -1193,6 +1875,7 @@ class Detector:
                 self.stats['cached_frames'] += self.reused_read
 
                 if not areas and not self._scrolled and not self._moved:
+                    self._look_ahead(key, snapshot)
                     return list(self._boxes)
 
                 if self._reader is None:
@@ -1222,6 +1905,11 @@ class Detector:
 
                 height, width = snapshot.shape[:2]
                 full = areas == [(0, height, 0, width)]
+                if self._pane is not None and (
+                    (full and not self._scrolled)
+                    or (self._moved and _overlaps(self._moved_area, self._pane))
+                ):
+                    self._pane = None  # its window moved, or everything changed: stale edges
                 if areas:
                     self.stats['full_scans' if full else 'partial_scans'] += 1
                 self.stats['scan_seconds'] += time.monotonic() - started
@@ -1242,7 +1930,7 @@ class Detector:
                     )
                     for category, rect, text_hash in found
                     if category in self._enabled
-                ], areas)
+                ], areas, self._pane)
 
                 for category, (x1, y1, x2, y2) in self._tracks.covers():
                     left = max(0, min(width, math.floor(x1) - self.padding))
@@ -1255,14 +1943,22 @@ class Detector:
                     if right > left:
                         boxes.add((left, top, right - left, bottom - top, category))
 
-                for top, bottom, left, right in self._unread.values():
-                    boxes.add((left, top, min(right, width) - left, bottom - top, 'unread'))
+                # Unread rows are covered where they show something, not their whole width.
+                self._strip_ink = {
+                    way: _ink_boxes(
+                        snapshot, top, bottom, left, min(right, width), self._pixel_scale
+                    )
+                    for way, (top, bottom, left, right) in self._unread.items()
+                }
+                for ink in self._strip_ink.values():
+                    boxes.update((x, y, w, h, 'unread') for x, y, w, h in ink)
 
                 self.stats['track_seconds'] += time.monotonic() - track_started
                 # Save results only after the whole scan succeeds.
                 self._boxes = tuple(sorted(boxes))
                 self._regions = regions
                 self._remember(snapshot, areas)
+                self._look_ahead(key, snapshot)
 
                 return list(self._boxes)
 

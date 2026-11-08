@@ -1,5 +1,6 @@
 import typing
 
+import cv2
 import numpy as np
 import pytest
 
@@ -404,6 +405,15 @@ def scroll_to(detect, reader, lines, offsets):
     return found
 
 
+def uncovered_ink(image, boxes, top, bottom, left, right, background=40):
+    """Pixels between those rows and columns that show something and no box covers."""
+    ink = (image[top:bottom, left:right] != background).any(axis=2)
+    for d in boxes:
+        rows = slice(max(d.y - top, 0), max(d.y + d.h - top, 0))
+        ink[rows, max(d.x - left, 0):max(d.x + d.w - left, 0)] = False
+    return int(ink.sum())
+
+
 def test_incoming_rows_stay_covered_while_scrolling():
     lines = scroll_lines()
     reader = ScrollReader(lines)
@@ -411,21 +421,86 @@ def test_incoming_rows_stay_covered_while_scrolling():
     detect(page_frame(scrolling_page(lines, 0)))
     found = scroll_to(detect, reader, lines, [6])
     bars = [d for d in found if d.category == "unread"]
-    assert len(bars) == 1
-    assert bars[0].y + bars[0].h >= 494
-    assert bars[0].w >= 500
+    assert bars
+    assert uncovered_ink(scrolling_page(lines, 6), bars, 494, 500, 40, 640) == 0
+    assert all(bar.y >= 494 and bar.y + bar.h <= 500 for bar in bars)
 
 
-def test_scrolling_needs_no_ocr_until_enough_rows_have_come_in():
+def test_incoming_rows_are_covered_over_their_text_only():
+    """Plain background coming in can't show anything, so it needs no black."""
+    lines = [("plain text", 20 + 80 * index) for index in range(12)]  # a blank line between
+    reader = ScrollReader(lines)
+    detect = TextDetector(reader=reader)
+    detect(page_frame(scrolling_page(lines, 0)))
+    found = scroll_to(detect, reader, lines, [2])  # rows 498-500 come in, all blank
+    assert not [d for d in found if d.category == "unread"]
+    found = scroll_to(detect, reader, lines, [10])  # now the next line's top shows
+    bars = [d for d in found if d.category == "unread"]
+    assert bars and uncovered_ink(scrolling_page(lines, 10), bars, 480, 500, 40, 640) == 0
+    assert sum(d.w * d.h for d in bars) < 0.5 * 600 * 20
+
+
+def test_incoming_rows_stay_on_the_pane_when_something_beside_it_changes_too():
+    """A screen preview and a level meter beside the pane change on every frame it
+    scrolls, as OBS does in a live test. The rows held black must stay on the pane's own
+    edge, not stretch over them or land below the pane, which ends at row 500."""
+    lines = scroll_lines()
+    reader = ScrollReader(lines)
+    detect = TextDetector(reader=reader)
+    rng = np.random.default_rng(3)
+    last = np.full((700, 1100, 3), 90, np.uint8)
+
+    def screen(offset):
+        nonlocal last
+        image = np.full((700, 1100, 3), 90, np.uint8)
+        image[:500] = scrolling_page(lines, offset, height=500, width=1100)
+        image[40:300, 760:1060] = cv2.resize(last, (300, 260), interpolation=cv2.INTER_AREA)
+        image[400:680, 700:720] = 60
+        image[int(rng.integers(420, 680)):680, 700:720] = 200  # the meter
+        last = image
+        return image
+
+    detect(page_frame(screen(0)))
+    for offset in (6, 12):
+        reader.offset = offset
+        image = screen(offset)
+        found = detect(page_frame(image))
+    bars = [d for d in found if d.category == "unread"]
+    assert detect.stats["scrolls"] == 2
+    assert bars
+    assert all(bar.y >= 480 and bar.y + bar.h <= 500 for bar in bars)
+    assert all(bar.x + bar.w <= 640 + 16 for bar in bars)
+    assert uncovered_ink(image, bars, 488, 500, 40, 640) == 0
+
+
+def test_scrolling_reads_incoming_rows_only_once_a_whole_line_has_come_in():
+    """No OCR on every frame of a scroll: incoming rows are read once a whole line is in
+    past the one the edge cuts, at most every other frame, and only those rows."""
     lines = scroll_lines()
     reader = ScrollReader(lines)
     detect = TextDetector(reader=reader)
     detect(page_frame(scrolling_page(lines, 0)))
     reads = len(reader.heights)
-    scroll_to(detect, reader, lines, [6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90])
-    assert len(reader.heights) == reads
-    scroll_to(detect, reader, lines, [96, 102, 108])
-    assert len(reader.heights) > reads
+    scroll_to(detect, reader, lines, [6])
+    assert len(reader.heights) == reads  # part of one line: nothing to read yet
+    offsets = list(range(12, 96, 6))
+    scroll_to(detect, reader, lines, offsets)
+    assert len(reader.heights) - reads <= (len(offsets) + 1) // 2
+    assert all(height < 200 for height in reader.heights[reads:])
+
+
+def test_a_slow_scroll_does_not_hold_rows_black_until_many_have_come_in():
+    lines = scroll_lines()
+    reader = ScrollReader(lines)
+    detect = TextDetector(reader=reader)
+    detect(page_frame(scrolling_page(lines, 0)))
+    tallest = 0
+    for offset in range(2, 80, 2):
+        found = scroll_to(detect, reader, lines, [offset])
+        bars = [d for d in found if d.category == "unread"]
+        if bars:
+            tallest = max(tallest, max(d.y + d.h for d in bars) - min(d.y for d in bars))
+    assert tallest <= 24 + 8 + 2 * 6  # what's kept, what a read needs, and a few frames
 
 
 def test_covers_still_move_on_frames_with_no_ocr():
@@ -529,3 +604,25 @@ def test_keyword_still_ignores_different_words():
 
     assert "keyword" not in classify_text("Demo Oak Avenue", ["Demo Maple Avenue"])
     assert "keyword" not in classify_text("hello world", ["", "   ", "\t"])
+
+
+def test_a_window_dragged_up_or_down_gets_no_strip_over_what_it_uncovers():
+    """The background a dragged window uncovers stays where it is. It isn't text
+    scrolling in at a pane's edge, so it is read where it shows instead of held black."""
+    rng = np.random.default_rng(5)
+    desktop = rng.integers(0, 2, (700, 900, 1), dtype=np.uint8) * 200 + 30
+    desktop = np.repeat(desktop, 3, axis=2)  # a busy, still background
+    window = np.full((300, 500, 3), 40, np.uint8)
+    for index, row in enumerate(range(20, 300, 40)):
+        # Each row its own pattern, as text is, so no shift but the real one fits.
+        window[row:row + 14, 30:470:(index * 37 % 90 + 30)] = 230
+        window[row:row + 14, 30 + index * 3:30 + index * 61 % 120 + 40] = 230
+    detect = TextDetector(reader=PageReader([]))
+    strips = []
+    for step in range(12):
+        image = desktop.copy()
+        top = 100 + 12 * step
+        image[top:top + 300, 200:700] = window
+        found = detect(page_frame(image))
+        strips.append(sum(d.w * d.h for d in found if d.category == "unread"))
+    assert sum(strips[2:]) == 0  # at most the drag's first frame looks like a scroll

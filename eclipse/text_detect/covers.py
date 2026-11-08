@@ -257,13 +257,20 @@ class CoverTracks:
         return None if shift == (0, 0) else shift
 
     def update(
-        self, image: np.ndarray, sightings: list[Sighting], read: list[tuple[int, int, int, int]]
+        self,
+        image: np.ndarray,
+        sightings: list[Sighting],
+        read: list[tuple[int, int, int, int]],
+        pane: tuple[int, int, int, int] | None = None,
     ) -> None:
         """Bring the tracks up to date with a finished scan.
 
         read is the areas OCR saw this frame, as top, bottom, left, right. A track
-        counts as checked only if it lies wholly inside one of them.
+        counts as checked only if it lies wholly inside one of them. pane is a pane
+        scrolling now, the same way: a track its top or bottom edge cuts through can't
+        be checked at all, as no read sees the whole line.
         """
+        self._pane = pane
         seen: dict[int, list[Sighting]] = {}
         spare = []
         for sighting in sightings:
@@ -352,7 +359,7 @@ class CoverTracks:
         checked = any(
             area[2] <= left and area[0] <= top and area[3] >= right and area[1] >= bottom
             for area in read
-        )
+        ) and not self._cut_by_pane(track)
         if self._unchanged(track, image):
             # The secret is still there and OCR just didn't see it. Keep trying.
             track.clear_reads = 0
@@ -371,6 +378,16 @@ class CoverTracks:
                 return False
         track.check_at = self._now + 1
         return True
+
+    def _cut_by_pane(self, track: _Track) -> bool:
+        """Whether the scrolling pane's top or bottom edge cuts through its text."""
+        pane = getattr(self, '_pane', None)
+        if pane is None:
+            return False
+        top, bottom, left, right = pane
+        x1, y1, x2, y2 = track.cover
+        across = x1 < right and x2 > left
+        return across and (y1 < top < y2 or y1 < bottom < y2)
 
     def _grab(self, rect: Rect, image: np.ndarray) -> tuple[np.ndarray, tuple[int, float]]:
         height, width = image.shape[:2]

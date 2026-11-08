@@ -206,3 +206,31 @@ def test_pipeline_never_sends_the_fake_secret():
     for image in sink.images:
         # The secret is the only white text below the middle of the frame.
         assert not (image[180:] == white).all(axis=2).any()
+
+
+def held(x=20, y=10, w=60, h=30, frame_id=0):
+    return Detection(x, y, w, h, "held", 1.0, 0, frame_id)
+
+
+def test_a_held_area_shows_the_last_safe_picture_there_not_black():
+    compositor = Compositor(padding=0)
+    first = noise_frame(0.0, 0)
+    shown = compositor.process(first, nothing)
+    second = noise_frame(0.1, 1)
+    output = compositor.process(second, lambda frame: [held(frame_id=1)])
+    assert (output[10:40, 20:80] == shown[10:40, 20:80]).all()  # what already went out
+    assert (output[50:, :] == second.image[50:, :]).all()  # the rest is live
+    assert compositor.held_areas == 1
+
+
+def test_a_held_area_keeps_the_covers_the_last_safe_picture_had():
+    compositor = Compositor(padding=0)
+    compositor.process(noise_frame(0.0, 0), lambda frame: [box(x=30, y=15, w=20, h=10)])
+    output = compositor.process(noise_frame(0.1, 1), lambda frame: [held(frame_id=1)])
+    assert is_hidden(output, x=30, y=15, w=20, h=10)
+
+
+def test_a_held_area_with_no_safe_picture_yet_is_black():
+    compositor = Compositor(padding=0)
+    output = compositor.process(noise_frame(0.0, 0), lambda frame: [held()])
+    assert not output[10:40, 20:80].any()

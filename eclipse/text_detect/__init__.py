@@ -73,19 +73,37 @@ class TextDetector:
             self._source = frame.source
         if self._read_ahead is not None:
             self._read_ahead.begin_frame(frame.frame_id)
-        return [
-            Detection(
-                x,
-                y,
-                w,
-                h,
-                _CATEGORY_NAMES.get(category, category),
-                1.0,
-                UNREAD_TTL_MS if category == "unread" else TTL_MS,
-                frame.frame_id,
-            )
-            for x, y, w, h, category in self._detector.detect(frame.image)
-        ]
+        return _detections(self._detector.detect(frame.image, frame.frame_id), frame)
+
+    def look_ahead(self) -> None:
+        """Start following rows that scroll in, so settled() can clear them later."""
+        self._detector.look_ahead()
+
+    def settled(self, frame: Frame) -> list[Detection] | None:
+        """This frame's detections again, with its incoming rows cleared where frames
+        scanned since have read them. Rows still unread stay covered. None if the frame
+        is no longer known, as after a failed scan; then use what it first reported.
+        Ask in frame order: it forgets every frame before this one."""
+        if frame.source != self._source:
+            return None
+        boxes = self._detector.settled(frame.frame_id)
+        return None if boxes is None else _detections(boxes, frame)
+
+
+def _detections(boxes, frame: Frame) -> list[Detection]:
+    return [
+        Detection(
+            x,
+            y,
+            w,
+            h,
+            _CATEGORY_NAMES.get(category, category),
+            1.0,
+            UNREAD_TTL_MS if category in ("unread", "held") else TTL_MS,
+            frame.frame_id,
+        )
+        for x, y, w, h, category in boxes
+    ]
 
 
 detect = TextDetector()

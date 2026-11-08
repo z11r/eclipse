@@ -347,6 +347,45 @@ def _notes_drag(name, legs) -> Scene:
     return Scene(name, len(path), draw)
 
 
+def _momentum(legs) -> list[int]:
+    """Scroll offsets that speed up and coast to a stop, as a trackpad flick does.
+    legs: (frames, peak rows per frame), negative peaks scrolling back up."""
+    out, at = [], 0
+    for frames, peak in legs:
+        for frame in range(frames):
+            at = max(at + round(peak * (1 - frame / frames) ** 2) // 2 * 2, 0)
+            out.append(at)
+    return out
+
+
+def _notes_beside_obs(name="notes_obs", legs=((30, 44), (14, 0), (24, -36), (10, 0), (30, 60), (14, 0))) -> Scene:
+    """A Notes pane scrolled with flicks while OBS sits beside it, as in a live test.
+    OBS's preview mirrors the screen, so it changes on every frame the pane scrolls,
+    and its audio meter moves on its own. Neither is part of the scroll."""
+    window = Window(_notes_layer(height=2400, repeat=3), 1300, 820 + TITLE)
+    desktop = _desktop()
+    offsets = [0] * 10 + _momentum(legs)
+    preview = (1640, 180, 720, 450)  # x, y, width, height of OBS's mirror of the screen
+    meter = (1580, 1050, 26, 300)
+    rng = np.random.default_rng(7)
+    last = desktop.copy()
+
+    def draw(index):
+        nonlocal last
+        image = desktop.copy()
+        secrets = window.draw(image, 200, 160, offsets[index])
+        x, y, w, h = preview
+        image[y : y + h, x : x + w] = cv2.resize(last, (w, h), interpolation=cv2.INTER_AREA)
+        x, y, w, h = meter
+        level = int(h * rng.uniform(0.2, 0.9))
+        image[y : y + h, x : x + w] = (40, 40, 40)
+        image[y + h - level : y + h, x : x + w] = (60, 200, 60)
+        last = image.copy()
+        return image, secrets
+
+    return Scene(name, len(offsets), draw)
+
+
 def _preview(image, index) -> None:
     """A box beside the windows that changes every frame, like a live OBS preview."""
     box = image[150:750, 1700:2350]
@@ -381,6 +420,8 @@ _SCROLL_SPEEDS = [0] * 8 + [6, 12, 20, 28, 34, 34, 28, 20, 12, 6, 3, 1] + [0] * 
 
 
 SCENES = {
+    "notes_obs": _notes_beside_obs,
+    "notes_obs_slow": lambda: _notes_beside_obs("notes_obs_slow", ((60, 12), (20, 0), (60, -12), (20, 0))),
     "notes_scroll": lambda: _notes_scroll("notes_scroll", _SCROLL_SPEEDS),
     "notes_scroll_preview": lambda: _notes_scroll("notes_scroll_preview", _SCROLL_SPEEDS, True),
     "notes_drag": lambda: _notes_drag("notes_drag", [
@@ -423,19 +464,59 @@ def _changed_past_edge(now: np.ndarray, before: np.ndarray) -> int:
     return int((now & ~grown_before).sum() + (before & ~grown_now).sum())
 
 
-def run(scene: Scene, keep: bool = False) -> dict:
+def _outputs(scene: Scene, look_ahead: int, scan_ms: list):
+    """Each frame's image, secrets and output, as the pipeline would send them. With
+    look_ahead, a frame is drawn only after that many later frames have been scanned."""
     detect = TextDetector(reader=AppleVisionReader(), pixel_scale=2)
+    if look_ahead:
+        detect.look_ahead()
     # Live runs read ahead in workers, which makes incoming scroll rows read every frame.
     # Read in the scan here, so set that the same way.
     detect._detector._unread_read_at = _UNREAD_READ_AT_AHEAD * 2
     compositor = Compositor(padding=PAD)
+    waiting = []
+    for index in range(scene.frames + look_ahead):
+        if index < scene.frames:
+            image, secrets = scene.frame(index)
+            frame = Frame(image, time.monotonic(), "screen", index)
+            started = time.monotonic()
+            found = detect(frame)
+            scan_ms.append((time.monotonic() - started) * 1000)
+            waiting.append((frame, secrets, found))
+        if len(waiting) > look_ahead or index >= scene.frames:
+            frame, secrets, found = waiting.pop(0)
+            settled = detect.settled(frame) if look_ahead else None
+            boxes = found if settled is None else settled
+            output = compositor.process(frame, lambda _: boxes)
+            held = np.zeros(frame.image.shape[:2], bool)
+            for d in boxes:
+                if d.category == "held":
+                    held[max(d.y, 0) : d.y + d.h, max(d.x, 0) : d.x + d.w] = True
+            yield frame.image, secrets, output, held
+
+
+def _scored(image, output, held):
+    """Held areas show the picture already sent, and already scored, in an earlier frame.
+    Scored again here, old text landing where a secret is now would count as shown."""
+    if not held.any():
+        return image, output
+    output = output.copy()
+    output[held] = image[held] ^ 1  # never equal to the frame: not shown, not black
+    return image, output
+
+
+def run(scene: Scene, keep: bool = False, look_ahead: int = 0) -> dict:
     exposed, jitter, stray_area, stray_flicker, scan_ms = [], [], [], [], []
+    held_frames, held_run, held_longest = 0, 0, 0
     before_rel, before_stray = {}, None
-    for index in range(scene.frames):
-        image, secrets = scene.frame(index)
-        started = time.monotonic()
-        output = compositor.process(Frame(image, time.monotonic(), "screen", index), detect)
-        scan_ms.append((time.monotonic() - started) * 1000)
+    for image, secrets, output, held in _outputs(scene, look_ahead, scan_ms):
+        if held.any():
+            held_frames += 1
+            held_run += 1
+            held_longest = max(held_longest, held_run)
+        else:
+            held_run = 0
+        image, output = _scored(image, output, held)
         is_black = (output == 0).all(axis=2) & ~(image == 0).all(axis=2)
         height, width = is_black.shape
         near = np.zeros_like(is_black)
@@ -470,6 +551,8 @@ def run(scene: Scene, keep: bool = False) -> dict:
         "stray_flicker_px": int(sum(stray_flicker)),  # black away from secrets on or off, past wobble
         "stray_black_mean_px": int(np.mean(stray_area)),
         "scan_ms_mean": round(float(np.mean(scan_ms)), 1),
+        "held_pane_frames": held_frames,  # panes showing an earlier picture: a stutter
+        "longest_hold": held_longest,
     }
     if keep:
         result["per_frame"] = list(zip(range(len(exposed)), exposed, jitter, stray_flicker))
@@ -481,10 +564,14 @@ def main(argv=None) -> int:
     parser.add_argument("--scene", choices=[*SCENES, "all"], default="all", nargs="?")
     parser.add_argument("--scenes", help="comma-separated scene names")
     parser.add_argument("--frames", action="store_true", help="print every frame's numbers")
+    parser.add_argument(
+        "--look-ahead", type=int, default=0,
+        help="frames scanned before each frame is drawn, as the pipeline's look-ahead does",
+    )
     args = parser.parse_args(argv)
     names = args.scenes.split(",") if args.scenes else (list(SCENES) if args.scene == "all" else [args.scene])
     for name in names:
-        print(json.dumps(run(SCENES[name](), args.frames)), flush=True)
+        print(json.dumps(run(SCENES[name](), args.frames, args.look_ahead)), flush=True)
     return 0
 
 
