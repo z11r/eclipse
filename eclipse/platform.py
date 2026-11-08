@@ -155,35 +155,32 @@ class AppleVisionReader:
         return self.read_bgra(cv2.cvtColor(image, cv2.COLOR_BGR2BGRA))
 
     def read_bgra(self, pixels) -> tuple[list, None]:
-        """Fast screen read, plus accurate color and contrast reads of colored areas.
+        """Fast screen read, plus accurate contrast-normalized reads of colored areas.
 
-        Keep the observations from each pass: a retry is supplementary and must not
+        Keep both sets of observations: a retry is supplementary and must not
         discard a secret found by the fast pass. Coordinates stay in input pixels.
         Both direct calls and shared-memory OCR workers enter through this method.
         """
         from eclipse.text_detect.styled_text import colour_regions, contrast_bgra
 
         words, _ = self._read_vision(pixels, self.FAST)
-        words = self._refine_secret_boxes(pixels, words)
+        words = self._refine_email_boxes(pixels, words)
         for left, top, right, bottom in colour_regions(pixels):
-            original = pixels[top:bottom, left:right]
-            # A single selected channel may lose some foreground/background
-            # combinations. Keep accurate original-color observations as well.
-            for crop in (original, contrast_bgra(original)):
-                extra, _ = self._read_vision(crop, self.ACCURATE)
-                extra = self._refine_secret_boxes(crop, extra)
-                for corners, text, confidence in extra:
-                    translated = [[x + left, y + top] for x, y in corners]
-                    if not any(text == old[1] and translated == old[0] for old in words):
-                        words.append((translated, text, confidence))
+            crop = contrast_bgra(pixels[top:bottom, left:right])
+            extra, _ = self._read_vision(crop, self.ACCURATE)
+            extra = self._refine_email_boxes(crop, extra)
+            for corners, text, confidence in extra:
+                translated = [[x + left, y + top] for x, y in corners]
+                if not any(text == old[1] and translated == old[0] for old in words):
+                    words.append((translated, text, confidence))
         return words, None
 
-    def _refine_secret_boxes(self, pixels, words):
-        """Retry overly broad email/credential boxes; replace only on confirmation.
+    def _refine_email_boxes(self, pixels, words):
+        """Retry overly broad email boxes; discard the broad result only on proof.
 
         Fast Vision sometimes returns a whole line for a word range, or one
         failed word range makes the observation fall back to its complete line.
-        An accurate local read can supply a smaller credential box. Other matched
+        An accurate local read can supply a smaller email box. Other matched
         secrets must also survive before the original observation is replaced.
         """
         import math
@@ -193,7 +190,7 @@ class AppleVisionReader:
         refined = []
         for polygon, text, confidence in words:
             matches = find_matches(text)
-            if not any(category in {'email', 'api_key'} for category, _, _ in matches):
+            if not any(category == 'email' for category, _, _ in matches):
                 refined.append((polygon, text, confidence))
                 continue
             x1 = max(0, math.floor(min(p[0] for p in polygon)) - 8)
@@ -210,11 +207,11 @@ class AppleVisionReader:
             wanted = {(kind, text[start:end].casefold()) for kind, start, end in matches}
             found = {(kind, value[start:end].casefold())
                      for _, value, _ in extra for kind, start, end in find_matches(value)}
-            secret_boxes = [box for box, value, _ in extra
-                           if any(kind in {'email', 'api_key'} for kind, _, _ in find_matches(value))]
-            narrow = secret_boxes and all(
+            email_boxes = [box for box, value, _ in extra
+                           if any(kind == 'email' for kind, _, _ in find_matches(value))]
+            narrow = email_boxes and all(
                 max(p[0] for p in box)-min(p[0] for p in box) < (x2-x1-16)*0.9
-                for box in secret_boxes
+                for box in email_boxes
             )
             # Preserve the surrounding text too: configured keyword matching
             # happens downstream, and the reader does not know those keywords.

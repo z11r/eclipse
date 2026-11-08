@@ -50,24 +50,3 @@ groups. Structured key formats and split emails still run on both forms.
 This intentionally trades detection of an unlabelled generic token split across
 multiple OCR words for fewer prose false positives; known key formats remain
 covered. Restart Eclipse after updating to clear previously retained covers.
-
-## Credential boundaries and numeric charts
-
-Compact joining no longer enlarges an already located API-key/password field
-into surrounding prose. Numeric matching uses original observations and the
-space-preserving grouped text, so separate chart cells are not concatenated
-into manufactured codes or phone numbers. Single observed 6–8 digit strings
-remain eligible as verification codes; an OCR engine that returns a chart as
-one such string can still produce a false positive. This is inherently
-ambiguous without additional context, and no blanket numeric exclusion was added.
-
-Broad native OCR boxes now receive the same conservative accurate refinement
-for labeled credentials as for emails. Colored crops are read in accurate mode
-both in original color and contrast-normalized form. This costs an additional
-request per colored crop and needs macOS latency/accuracy validation.
-
-The synthetic fields password=INVALID_DEMO_8842 and API_KEY=DEMO_UNUSED_219B
-are valid tests of labeled-field matching. A public pk_ identifier is not a
-private credential, and INVALID_PRIVATE_KEY_NOT_USABLE is not a real private
-key format. Such arbitrary placeholders can be covered using custom keywords;
-they are not grounds for matching every underscore-delimited string.

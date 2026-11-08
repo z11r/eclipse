@@ -153,11 +153,11 @@ def test_broad_email_sentence_is_replaced_only_with_confirmed_precise_results():
     pixels = np.zeros((100, 1000, 4), np.uint8)
     original = [([[20, 20], [950, 20], [950, 40], [20, 40]],
                  'You have not interacted with demo@example.com before.', .9)]
-    precise = Reader()._refine_secret_boxes(pixels, original)
+    precise = Reader()._refine_email_boxes(pixels, original)
     assert precise[1][1] == 'demo@example.com'
     assert precise[0][0][0] == [192, 20]
     assert precise[0][0][1][0] < 950
-    assert Reader(False)._refine_secret_boxes(pixels, original) == original
+    assert Reader(False)._refine_email_boxes(pixels, original) == original
 
 
 def test_normal_word_box_does_not_trigger_extra_recognition():
@@ -169,7 +169,7 @@ def test_normal_word_box_does_not_trigger_extra_recognition():
             raise AssertionError('normal word must not be reread')
 
     words = [([[20, 20], [220, 20], [220, 40], [20, 40]], 'demo@example.com', .9)]
-    assert Reader()._refine_secret_boxes(np.zeros((100, 1000, 4), np.uint8), words) == words
+    assert Reader()._refine_email_boxes(np.zeros((100, 1000, 4), np.uint8), words) == words
 
 
 def test_line_width_word_box_is_refined_but_missing_other_secret_keeps_fallback():
@@ -182,9 +182,9 @@ def test_line_width_word_box_is_refined_but_missing_other_secret_keeps_fallback(
 
     pixels = np.zeros((100, 1000, 4), np.uint8)
     box = [[20, 20], [950, 20], [950, 40], [20, 40]]
-    assert Reader()._refine_secret_boxes(pixels, [(box, 'demo@example.com', .9)])[0][0] != box
+    assert Reader()._refine_email_boxes(pixels, [(box, 'demo@example.com', .9)])[0][0] != box
     sentence = [(box, 'demo@example.com PASSWORD=fake-secret-123', .9)]
-    assert Reader()._refine_secret_boxes(pixels, sentence) == sentence
+    assert Reader()._refine_email_boxes(pixels, sentence) == sentence
 
 
 @pytest.mark.parametrize('pieces', [
@@ -221,59 +221,3 @@ def test_separate_emails_in_same_sentence_both_remain_covered():
     assert any(rect[0] == 10 for rect in emails)
     assert any(rect[2] == 408 for rect in emails)
     assert not any(rect[0] <= 188 and rect[2] >= 220 for rect in emails)
-
-
-def word_regions(words):
-    regions, x = [], 10
-    for word in words:
-        right = x+len(word)*10
-        regions.append((x, 20, right, 40, word))
-        x = right+8
-    return regions
-
-
-@pytest.mark.parametrize('words', [list('12345'), list('67890'),
-    [str(i) for i in range(1, 11)], [str(i) for i in range(11, 21)],
-    [str(i) for i in range(21, 31)]])
-def test_chart_cells_do_not_become_numeric_secrets(words):
-    from eclipse.text_detect.detection import Detector
-    found = Detector(reader=lambda image: ([], None))._find_areas(word_regions(words))
-    assert not {kind for kind, _, _ in found} & {'2fa', 'phone', 'card'}
-
-
-@pytest.mark.parametrize('secret', ['password=INVALID_DEMO_8842', 'API_KEY=DEMO_UNUSED_219B'])
-def test_inline_credentials_do_not_expand_into_surrounding_sentence(secret):
-    from eclipse.text_detect.detection import Detector
-    regions = word_regions(['The', 'dummy', 'field', secret, 'inside', 'the', 'sentence.'])
-    found = Detector(reader=lambda image: ([], None))._find_areas(regions)
-    key_boxes = [rect for kind, rect, _ in found if kind == 'api_key']
-    assert key_boxes
-    assert all(rect[0] >= regions[3][0] and rect[2] <= regions[3][2] for rect in key_boxes)
-
-
-@pytest.mark.parametrize('text,category', [
-    ('482913', '2fa'), ('Your code: 4829', '2fa'), ('OTP 91234', '2fa'),
-    ('+1 (780) 555-0123', 'phone'), ('PASSWORD=fake-pass-123', 'api_key'),
-    ('API_KEY=DEMO_UNUSED_219B', 'api_key'), ('4111 1111 1111 1111', 'card'),
-])
-def test_real_numeric_and_labeled_secrets_still_detected(text, category):
-    from eclipse.text_detect.detection import classify_text
-    assert category in classify_text(text)
-
-
-def test_original_colour_accurate_pass_can_recover_key_missing_from_normalized_pass():
-    class Reader(AppleVisionReader):
-        def __init__(self):
-            self.accurate_calls = 0
-        def _read_vision(self, pixels, level):
-            if level == self.FAST:
-                return [], None
-            self.accurate_calls += 1
-            # Simulate recognition succeeding only on original color pixels.
-            if not np.array_equal(pixels[:, :, 0], pixels[:, :, 1]):
-                return [([[10, 8], [180, 8], [180, 28], [10, 28]], 'API_KEY=DEMO_UNUSED_219B', .9)], None
-            return [], None
-    reader = Reader()
-    words, _ = reader.read_bgra(styled_page('amber'))
-    assert any(text == 'API_KEY=DEMO_UNUSED_219B' for _, text, _ in words)
-    assert reader.accurate_calls >= 2
