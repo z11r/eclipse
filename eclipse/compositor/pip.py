@@ -29,7 +29,7 @@ from typing import NamedTuple
 import numpy as np
 
 from eclipse.capture.dual import DualFrame
-from eclipse.compositor.compositor import PADDING, Compositor, Detector
+from eclipse.compositor.compositor import BLACK, PADDING, Compositor, Detector
 from eclipse.types import Detection, Frame
 
 # How far the corner may fall behind the screen before the screen waits for it.
@@ -292,8 +292,10 @@ class PictureInPictureCompositor(Compositor):
     older than the frame's own. Pass the same detector the pipeline scans with.
     """
 
-    def __init__(self, camera: PictureInPictureDetector, padding: int = PADDING) -> None:
-        super().__init__(padding)
+    def __init__(
+        self, camera: PictureInPictureDetector, padding: int = PADDING, style: str = BLACK
+    ) -> None:
+        super().__init__(padding, style)
         self._camera = camera
 
     def forget(self) -> None:

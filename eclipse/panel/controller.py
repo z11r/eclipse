@@ -13,7 +13,7 @@ from typing import Callable, Iterable, Protocol
 from fastapi import HTTPException
 from .schemas import (
     ALL_CATEGORIES, TEXT_CATEGORIES, VISUAL_CATEGORIES, CatchLog,
-    DetectorHealth, ModeConfig, PanelConfig, PanelState, ViewConfig,
+    CoverConfig, DetectorHealth, ModeConfig, PanelConfig, PanelState, ViewConfig,
 )
 from .events import EventHistory
 from eclipse.capture.dual import drops_a_source
@@ -81,6 +81,7 @@ class PipelineController(Protocol):
     def resume(self) -> PanelState: ...
     def set_mode(self, mode: ModeConfig) -> PanelState: ...
     def set_view(self, view: ViewConfig) -> PanelState: ...
+    def set_cover(self, cover: CoverConfig) -> PanelState: ...
 
 
 _VIEWS = ["screen", "both", "webcam"]
@@ -110,6 +111,11 @@ class MockPipelineController:
     def set_view(self, view: ViewConfig) -> PanelState:
         with self._lock:
             self._state.view = view.view
+            return self._state.model_copy(deep=True)
+
+    def set_cover(self, cover: CoverConfig) -> PanelState:
+        with self._lock:
+            self._state.cover_style = cover.style
             return self._state.model_copy(deep=True)
 
     def set_config(self, config: PanelConfig) -> PanelState:
@@ -157,6 +163,9 @@ class LivePipelineController:
     or None for a run with one source. A switch that drops a source cuts the output at
     once: black goes out until the new view's first frame has been scanned, about the
     delay later, so nothing of the dropped source shows after the switch.
+
+    compositor is the one painting covers, for switching how they look. Only the look
+    changes, never what is covered, so a switch needs no cut and no settings change.
     """
     pipeline_mode = "live"
 
@@ -167,7 +176,9 @@ class LivePipelineController:
         config_path: Path | None = None,
         apply_wait: float = APPLY_WAIT_SECONDS,
         views=None,
+        compositor=None,
     ):
+        self._compositor = compositor
         self._pipeline = pipeline
         self._views = views
         self._view_lock = Lock()  # one switch at a time; panic never takes this
@@ -210,6 +221,7 @@ class LivePipelineController:
             irl_available=False,
             view=self._views.view if self._views is not None else None,
             views=self.views,
+            cover_style=self._compositor.style if self._compositor is not None else "black",
             enabled=enabled,
             keywords=keywords,
             held_frames=pipeline.stats.rendered_held,
@@ -309,6 +321,13 @@ class LivePipelineController:
             if view.view != old:
                 cut = self._gate.cut if drops_a_source(old, view.view) else None
                 self._views.set_view(view.view, cut)
+        return self.get_state()
+
+    def set_cover(self, cover: CoverConfig) -> PanelState:
+        """Change how covers look, from the next frame scanned. Panic is never affected."""
+        if self._compositor is None:
+            raise HTTPException(status_code=409, detail="This run has no cover style to change")
+        self._compositor.style = cover.style
         return self.get_state()
 
     def next_view(self) -> PanelState:
