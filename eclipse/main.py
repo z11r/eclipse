@@ -28,6 +28,7 @@ from eclipse.panel.controller import LivePipelineController
 from eclipse.panel.hotkey import PANIC_KEYS, PanicHotkey
 from eclipse.platform import (
     AppleVisionReader,
+    WindowsOCRReader,
     screen_capture_allowed,
     screen_capture_kit_available,
 )
@@ -270,9 +271,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--retina", action="store_true", help="capture every Retina pixel")
     parser.add_argument(
         "--ocr",
-        choices=["rapid", "apple"],
+        choices=["rapid", "apple", "windows"],
         default="rapid",
-        help="apple is much faster on macOS, finds fewer secrets, and scans Retina frames",
+        help="rapid is portable; apple uses macOS Vision; windows uses native Windows OCR",
     )
     parser.add_argument(
         "--capture",
@@ -327,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
                     print("OCR workers didn't start, so reading one area at a time")
             detect = TextDetector(reader=reader, pixel_scale=2)
             padding = PADDING * 2
+        elif args.ocr == "windows":
+            source = screen_source(args.capture, args.max_width, args.retina, args.fps)
+            detect = TextDetector(reader=WindowsOCRReader())
         else:
             source = screen_source(args.capture, args.max_width, args.retina, args.fps)
             detect = TextDetector()

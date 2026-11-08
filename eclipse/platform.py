@@ -8,6 +8,7 @@ import re
 import sys
 
 IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
 
 
 def screen_capture_kit_available() -> bool:
@@ -206,3 +207,30 @@ class AppleVisionReader:
                     found = [(corners(observation.boundingBox()), text, confidence)]
                 words.extend(found)
         return words, None
+
+
+class WindowsOCRReader:
+    """Read local screen text with Windows OCR and return each word's box."""
+
+    def __init__(self) -> None:
+        if not IS_WINDOWS:
+            raise RuntimeError('Windows OCR requires Windows')
+
+    def __call__(self, image) -> tuple[list, None]:
+        import asyncio
+        import winocr
+
+        async def read():
+            result = await winocr.recognize_cv2(image)
+            words = []
+            for line in result.lines:
+                for word in line.words:
+                    box = word.bounding_rect
+                    left, top = float(box.x), float(box.y)
+                    right, bottom = left + float(box.width), top + float(box.height)
+                    corners = [[left, top], [right, top], [right, bottom], [left, bottom]]
+                    # Windows OCR exposes no confidence score; don't use this as a threshold.
+                    words.append((corners, str(word.text), 1.0))
+            return words, None
+
+        return asyncio.run(read())

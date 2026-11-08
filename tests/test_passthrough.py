@@ -237,3 +237,23 @@ def test_to_bgr_keeps_odd_retina_sizes_even_without_a_resize():
     image = to_bgr(raw, max_width=6016)
     assert image.shape == (100, 200, 3)
     assert tuple(image[0, 0]) == (1, 2, 3)
+
+
+def test_windows_mode_uses_native_reader_without_changing_rapid_default(monkeypatch, tmp_path):
+    reader = object()
+    seen = []
+    monkeypatch.setattr(app, 'WindowsOCRReader', lambda: reader)
+    monkeypatch.setattr(app, 'screen_capture_allowed', lambda: True)
+    monkeypatch.setattr(app, 'screen_capture_kit_available', lambda: False)
+    monkeypatch.setattr(app, 'ScreenCapture', lambda **kwargs: TestPattern(320, 240))
+    monkeypatch.setattr(app, 'VirtualCam', FakeSink)
+
+    def detector(**kwargs):
+        seen.append(kwargs)
+        return lambda frame: []
+
+    monkeypatch.setattr(app, 'TextDetector', detector)
+    for index, extra in enumerate([['--ocr', 'windows'], []]):
+        assert app.main(extra + ['--max-frames', '3', '--delay', '0.05',
+                                 '--log', str(tmp_path / f'run-{index}.log')]) == 0
+    assert seen == [{'reader': reader}, {}]

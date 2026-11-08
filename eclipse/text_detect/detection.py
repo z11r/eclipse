@@ -50,6 +50,8 @@ _EMAIL = re.compile(
 _PHONE = re.compile(
     r'(?<!\w)(?:\+\d{1,3}[ .\-]?)?(?:\(\d{3}\)|\d{3})[ .\-]?\d{3}[ .\-]?\d{4}(?!\w)'
 )
+# A labeled phone remains private even when OCR misreads some area-code digits.
+_PHONE_LABEL = re.compile(r'\b(?:phone|telephone|mobile|tel)\s*[:=]\s*([^\r\n:;]{7,40})', re.I)
 # A bare 6-8 digit number can be a code. 4-5 digits are too common (ports, years),
 # so they only count next to a word like "code".
 _CODE_ALONE = re.compile(r'(?<![\w.:/\-])(?:\d{6,8}|\d{3}[ \-]\d{3})(?![\w.:/\-])')
@@ -159,6 +161,9 @@ def _match_text(text: str, keywords: Iterable[str] = ()) -> list[tuple[str, int,
 
     add('email', _EMAIL)
     add('phone', _PHONE)
+    for match in _PHONE_LABEL.finditer(text):
+        if sum(char.isdecimal() for char in match.group(1)) >= 7:
+            place('phone', match.start(), match.end())
     add('2fa', _CODE_ALONE)
 
     if _CODE_HINT.search(text):
