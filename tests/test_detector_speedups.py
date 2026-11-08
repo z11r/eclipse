@@ -174,4 +174,5 @@ def test_screened_search_picks_the_full_searchs_shift(monkeypatch, dx, dy):
         for image in drag(dx, dy):
             detector.detect(image)
         picks[finalists] = seen
-    assert picks[detection._MOVE_FINALISTS] == picks[10_000] == [(dx, dy)]
+        assert detector.stats["moves"] == 1 and detector._last_move == (dx, dy)
+    assert picks[detection._MOVE_FINALISTS] == picks[10_000]
