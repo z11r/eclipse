@@ -23,6 +23,7 @@ real run's log.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import sys
 import time
 
@@ -33,7 +34,8 @@ from eclipse.capture.dual import PIP_SIZE, DualFrame, pip_layout
 from eclipse.compositor.compositor import Compositor
 from eclipse.compositor.pip import PictureInPictureCompositor, PictureInPictureDetector
 from eclipse.main import WEBCAM_NOISE_FLOOR, WEBCAM_OCR_THREADS
-from eclipse.platform import camera_backend
+from eclipse.platform import IS_MAC, camera_backend
+from eclipse.text_detect.apple_process import AppleProcessReader
 from eclipse.text_detect import TextDetector
 from eclipse.types import Frame
 
@@ -141,18 +143,33 @@ def main(argv: list[str] | None = None) -> int:
                         help="the screen's scan time per frame, from a screen-only run's log")
     parser.add_argument("--screen", default="1920x1080",
                         help="output size, for where the camera goes; 3024x1964 for a Retina run")
+    parser.add_argument("--webcam-ocr", choices=["rapid", "apple"], default="rapid")
+    parser.add_argument("--webcam-scan", choices=["output", "capture"], default="capture")
     args = parser.parse_args(argv)
+    if args.webcam_ocr == "apple" and not IS_MAC:
+        parser.error("Apple webcam OCR needs macOS")
+    with ExitStack() as resources:
+        reader = None
+        if args.webcam_ocr == "apple":
+            reader = AppleProcessReader()
+            resources.callback(reader.close)
+        return measure(args, reader)
+
+
+def measure(args, reader):
     width, height = (int(n) for n in args.screen.split("x"))
     screen = np.full((height, width, 3), 230, np.uint8)
     base = camera_picture(args.camera)
-    at, shown, scanned = pip_layout(screen.shape, base.shape, PIP_SIZE)
+    at, shown, scanned = pip_layout(screen.shape, base.shape, PIP_SIZE,
+                                    (1920,1080) if args.webcam_scan == "output" else None)
     print(
         f"camera {base.shape[1]}x{base.shape[0]}, scanned at {scanned[0]}x{scanned[1]}, "
         f"shown at {shown[0]}x{shown[1]}; screen scan {args.screen_ms:.1f} ms per frame"
     )
     print(f"{'motion':<8} {'scan ms':>8} {'p95':>7} {'reads':>6} {'area':>5}  corner fps")
     for name, make in scenes(base).items():
-        detect = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR, ocr_threads=WEBCAM_OCR_THREADS)
+        detect = TextDetector(reader=reader, noise_floor=WEBCAM_NOISE_FLOOR,
+                              ocr_threads=WEBCAM_OCR_THREADS)
         pictures = [
             cv2.resize(make(i), scanned, interpolation=cv2.INTER_AREA)
             for i in range(_PICTURES + 1)
@@ -178,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     extra = corner_extra_ms(screen, scan, pip, at)
     print(
         f"corner extra per frame {extra:.2f} ms, so the screen runs at "
-        f"{screen_fps(args.screen_ms, extra):.0f} fps whatever the camera does"
+        f"{screen_fps(args.screen_ms, extra):.0f} fps before CPU contention/stale-camera waits"
     )
     return 0
 

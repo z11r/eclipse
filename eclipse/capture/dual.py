@@ -64,13 +64,16 @@ class DualFrame(Frame):
 
 
 def pip_layout(
-    screen_shape: tuple[int, ...], camera_shape: tuple[int, ...], size: float
+    screen_shape: tuple[int, ...], camera_shape: tuple[int, ...], size: float,
+    output_size: tuple[int, int] | None = None,
 ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
     """Where the camera goes, at what size, and at what size to scan it.
 
     Returns ((left, top), (width, height) shown, (width, height) scanned). The
     camera sits in the bottom right corner and keeps its own shape.
     """
+    if output_size is not None and min(output_size) <= 0:
+        raise ValueError("output_size dimensions must be positive")
     screen_h, screen_w = screen_shape[:2]
     camera_h, camera_w = camera_shape[:2]
     shown_w = max(min(int(screen_w * size), screen_w), 2)
@@ -81,8 +84,13 @@ def pip_layout(
     margin = int(screen_w * _MARGIN)
     left = max(screen_w - shown_w - margin, 0)
     top = max(screen_h - shown_h - margin, 0)
-    scan_w = min(camera_w, shown_w * _SCAN_OVER_SHOWN)
-    scan_h = min(camera_h, round(scan_w * camera_h / camera_w))
+    # Only the final virtual-camera pixels need oversampling. Retina capture
+    # dimensions can be much larger than that output. None retains old sizing.
+    output_scale = 1.0 if output_size is None else min(
+        1.0, output_size[0] / screen_w, output_size[1] / screen_h
+    )
+    scan_w = min(camera_w, max(2, math.ceil(shown_w * output_scale * _SCAN_OVER_SHOWN)))
+    scan_h = min(camera_h, max(2, round(scan_w * camera_h / camera_w)))
     return (left, top), (shown_w, shown_h), (scan_w, scan_h)
 
 
@@ -160,13 +168,15 @@ class DualCapture:
     views = VIEWS
 
     def __init__(
-        self, screen, webcam, pip_size: float = PIP_SIZE, fps: int = 60, view: View = "both"
+        self, screen, webcam, pip_size: float = PIP_SIZE, fps: int = 60, view: View = "both",
+        *, scan_output_size: tuple[int, int] | None = None,
     ) -> None:
         if not 0 < pip_size <= 1:
             raise ValueError("pip_size must be above 0 and at most 1")
         if view not in VIEWS:
             raise ValueError(f"view must be one of {', '.join(VIEWS)}")
         self._pip_size = pip_size
+        self._scan_output_size = scan_output_size
         self._view: View = view
         self._refresh = False  # send the current pictures once, even with no news
         self._refresh_from = -math.inf  # the earliest time the cut allows
@@ -293,7 +303,7 @@ class DualCapture:
         shapes = (screen.image.shape, camera.image.shape)
         if shapes != self._layout_for:
             self._layout_for = shapes
-            self._layout = pip_layout(*shapes, self._pip_size)
+            self._layout = pip_layout(*shapes, self._pip_size, self._scan_output_size)
             self._camera_for = -1
             at, shown, scanned = self._layout
             print(

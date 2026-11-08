@@ -12,6 +12,7 @@ import signal
 import threading
 import time
 from collections import deque
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Callable
 
@@ -27,17 +28,19 @@ from eclipse.capture.webcam import WebcamCapture
 from eclipse.compositor.compositor import PADDING, Compositor
 from eclipse.compositor.delay import DelayedPipeline
 from eclipse.compositor.pip import PictureInPictureCompositor, PictureInPictureDetector
-from eclipse.output.virtual_cam import DiscardingCam, VirtualCam
+from eclipse.output.virtual_cam import OUTPUT_HEIGHT, OUTPUT_WIDTH, DiscardingCam, VirtualCam
 from eclipse.panel.app import PANEL_HOST, PANEL_PORT, start_panel
 from eclipse.panel.controller import LivePipelineController
 from eclipse.panel.hotkey import PANIC_KEYS, VIEW_KEYS, PanicHotkey
 from eclipse.platform import (
     AppleVisionReader,
+    IS_MAC,
     WindowsOCRReader,
     screen_capture_allowed,
     screen_capture_kit_available,
 )
 from eclipse.text_detect import TextDetector
+from eclipse.text_detect.apple_process import AppleProcessReader
 from eclipse.text_detect.read_ahead import OcrPool, ReadAhead, ReadError
 from eclipse.types import Frame
 
@@ -152,6 +155,12 @@ class StatsLog:
                 f"ms/scan {ms('detect.webcam_scan_seconds', webcam_scans):.1f} "
                 f"camera {fps('capture.webcam_frames'):.1f}fps "
                 f"screen {fps('capture.screen_frames'):.1f}fps | "
+            )
+        if "webcam_read.jobs" in now:
+            webcam += (
+                f"camera-worker jobs {count('webcam_read.jobs')} "
+                f"failed {count('webcam_read.failed_reads')} "
+                f"work-ms {ms('webcam_read.work_seconds', count('webcam_read.jobs')):.1f} | "
             )
         age = -1.0
         if stats.last_presented_at is not None:
@@ -390,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="seconds of the delay each frame waits for later frames to read the rows "
         f"scrolling into it, which then need no black strip; 0 turns it off. Default "
-        f"{LOOK_AHEAD} s, at most {LOOK_AHEAD_SHARE:.0%} of the delay",
+        f"{LOOK_AHEAD} s, at most {LOOK_AHEAD_SHARE * 100:.0f} percent of the delay",
     )
     parser.add_argument("--max-width", type=int, default=1920)
     parser.add_argument("--retina", action="store_true", help="capture every Retina pixel")
@@ -398,7 +407,7 @@ def main(argv: list[str] | None = None) -> int:
         "--ocr",
         choices=["rapid", "apple", "windows"],
         default="rapid",
-        help="rapid is portable; apple uses macOS Vision; windows uses native Windows OCR",
+        help="screen OCR engine; cameras use --webcam-ocr. Apple/Windows engines are platform-specific",
     )
     parser.add_argument(
         "--capture",
@@ -429,7 +438,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-hotkey", action="store_true", help="no panic key, as with --max-frames"
     )
+    parser.add_argument(
+        "--webcam-ocr", choices=["rapid", "apple"], default="rapid",
+        help="OCR for camera inputs only; apple uses an isolated macOS process",
+    )
+    parser.add_argument(
+        "--webcam-scan", choices=["output", "capture"], default="capture",
+        help="PIP scan sizing: capture preserves current detail; output is experimental and can miss small text",
+    )
     args = parser.parse_args(argv)
+    camera_input_selected = (args.webcam is not None or args.with_webcam is not None
+                             or (args.clip is not None and args.clip_source == "webcam"))
+    if args.webcam_ocr == "apple" and not camera_input_selected:
+        parser.error("--webcam-ocr apple needs a webcam or --clip-source webcam")
+    if args.webcam_ocr == "apple" and not IS_MAC:
+        parser.error("--webcam-ocr apple needs macOS")
     chosen = [args.test_pattern, args.webcam is not None, args.clip is not None]
     if sum(chosen) > 1:
         parser.error("pick one of --test-pattern, --webcam and --clip")
@@ -439,8 +462,27 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--with-webcam adds a camera to the screen or a --clip")
     if not 0 < args.pip_size <= 1:
         parser.error("--pip-size must be above 0 and at most 1")
+    if args.look_ahead is None:
+        args.look_ahead = min(LOOK_AHEAD, max(args.delay, 0) * LOOK_AHEAD_SHARE)
+    elif not 0 <= args.look_ahead < args.delay:
+        parser.error("--look-ahead must be at least 0 and less than --delay")
     cv2.setNumThreads(2)  # leave the cores to OBS
 
+    with ExitStack() as resources:
+        return run_app(args, resources)
+
+
+def run_app(args, resources):
+    # Readers are registered as soon as created, including startup failures.
+    camera_reader = None
+    camera_input_selected = (args.webcam is not None or args.with_webcam is not None
+                             or (args.clip is not None and args.clip_source == "webcam"))
+    if camera_input_selected:
+        if args.webcam_ocr == "apple":
+            camera_reader = AppleProcessReader()
+            resources.callback(camera_reader.close)
+        print(f"Webcam OCR: {args.webcam_ocr}" + (" (isolated worker)" if camera_reader else ""))
+    camera_options = {"reader": camera_reader} if camera_reader is not None else {}
     padding = PADDING
     read_ahead = None
     if args.test_pattern:
@@ -448,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         detect = source.detect
     elif args.webcam is not None:
         source = WebcamCapture(args.webcam)
-        detect = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR)
+        detect = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR, **camera_options)
     elif args.clip is not None:
         if not Path(args.clip).is_file():
             print(f"No clip at {args.clip}")
@@ -456,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         source = LiveClip(args.clip, args.clip_source, args.loop)
         # A webcam recording carries sensor noise, so it needs the webcam's noise floor.
         noise = WEBCAM_NOISE_FLOOR if args.clip_source == "webcam" else 0
-        detect = TextDetector(noise_floor=noise)
+        detect = TextDetector(noise_floor=noise, **camera_options)
     else:
         if not screen_capture_allowed():
             print(
@@ -472,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.ocr_workers > 0:
                 try:
                     reader = read_ahead = ReadAhead(OcrPool(args.ocr_workers))
+                    resources.callback(read_ahead.close)
                 except ReadError:
                     print("OCR workers didn't start, so reading one area at a time")
             # Careful rereads are opt-in, so the default detector is built exactly as before.
@@ -493,20 +536,19 @@ def main(argv: list[str] | None = None) -> int:
         except FileNotFoundError:
             print(f"No camera clip at {args.with_webcam}")
             return 1
-        source = views = DualCapture(source, camera, args.pip_size, args.fps, args.view)
-        # RapidOCR for the camera even with Apple OCR on the screen: Vision allows one
-        # read per process, and misses small text on a camera's lower resolution.
-        corner = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR, ocr_threads=WEBCAM_OCR_THREADS)
-        alone = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR)  # the camera at full size
+        source = views = DualCapture(
+            source, camera, args.pip_size, args.fps, args.view,
+            scan_output_size=(OUTPUT_WIDTH, OUTPUT_HEIGHT) if args.webcam_scan == "output" else None,
+        )
+        # Camera Apple reads share one dedicated process, separate from screen OCR.
+        corner = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR,
+                              ocr_threads=WEBCAM_OCR_THREADS, **camera_options)
+        alone = TextDetector(noise_floor=WEBCAM_NOISE_FLOOR, **camera_options)  # the camera at full size
         detect = PictureInPictureDetector(detect, corner, alone)
         compositor = PictureInPictureCompositor(detect, padding=padding)
         warm_up(corner)
         warm_up(alone)
     sink = (DiscardingCam if args.no_output else VirtualCam)(fps=args.fps)
-    if args.look_ahead is None:
-        args.look_ahead = min(LOOK_AHEAD, max(args.delay, 0) * LOOK_AHEAD_SHARE)
-    elif not 0 <= args.look_ahead < args.delay:
-        parser.error("--look-ahead must be at least 0 and less than --delay")
     pipeline = DelayedPipeline(
         source, sink, detect, compositor, args.delay, args.fps, args.max_frames,
         look_ahead=args.look_ahead,
@@ -519,15 +561,14 @@ def main(argv: list[str] | None = None) -> int:
         controller, not (args.no_panel or measuring), not (args.no_hotkey or measuring)
     )
     allow_sigterm = _stop_on_sigterm()
-    parts = {"capture": source, "detect": detect, "output": sink, "read": read_ahead}
+    parts = {"capture": source, "detect": detect, "output": sink, "read": read_ahead,
+             "webcam_read": camera_reader}
     try:
         with StatsLog(args.log, pipeline, parts):
             stats = pipeline.run()
     finally:
         allow_sigterm()
         stop_controls(server, keys)
-        if read_ahead is not None:
-            read_ahead.close()
     if stats.latencies:
         print(
             f"Captured {stats.captured / stats.capture_seconds:.1f} fps "

@@ -4,7 +4,7 @@ Other tools catch your API key. Eclipse catches the things that let people find 
 
 Eclipse is a desktop app that sits between your screen and OBS. It reads the screen, covers secrets with solid black boxes, and sends the result to OBS as a virtual camera, one second behind live. A frame that hasn't been scanned never goes out. Built for natHacks 2026 (Standard Division, Defense & Security).
 
-> **Status:** screen capture, the text layer, the control panel and the panic key run on macOS. The text layer covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. Webcam input, location clues and IRL mode aren't built yet. Windows now has an experimental native OCR mode (`--ocr windows`); it has been tried with OBS, but missed detections and stray covers remain.
+> **Status:** screen capture, the text layer, the control panel and the panic key run on macOS. The text layer covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. Webcam-only and screen-plus-webcam text detection are available. Visual location clues and IRL mode aren't built yet. Windows now has an experimental native OCR mode (`--ocr windows`); it has been tried with OBS, but missed detections and stray covers remain.
 
 ## Setup
 
@@ -49,7 +49,9 @@ Useful options:
 
 | Option | What it does |
 | --- | --- |
-| `--ocr apple` | Use Apple's built-in OCR. Much faster, but finds fewer secrets than RapidOCR. |
+| `--ocr apple` | Apple's screen OCR; camera OCR is selected separately. |
+| `--webcam-ocr apple` | Experimental native camera OCR on macOS, in an isolated worker process. RapidOCR remains the default. |
+| `--webcam-scan output` | Experimental smaller PIP scan based on final output; can miss small text. Default `capture` preserves existing sizing. |
 | `--ocr windows` | Experimental local Windows OCR. Faster, but has missed keys and card numbers in tests. Use fake secrets for demos; it does not guarantee protection. |
 | `--fps 30` | Capture and send at a different frame rate |
 | `--delay 2` | Seconds behind live |
@@ -73,6 +75,10 @@ To stream the screen and a webcam together, add the camera's index. It goes in t
 ```bash
 python -m eclipse.main --with-webcam 0
 ```
+
+For a native Apple camera OCR comparison on macOS, use `--webcam-ocr apple`
+(with `--webcam 0`, or alongside `--with-webcam 0`). See
+[webcam OCR testing](docs/WEBCAM_OCR.md) for the experiment and accuracy limits.
 
 The screen and the camera are each scanned on their own, side by side, and joined only after both are covered. A face moving in the corner never makes the screen be read again, and a camera picture that hasn't changed since the last frame isn't read at all. A video file path in place of the index stands in for the camera, looped, and it works with `--clip` too.
 
