@@ -21,6 +21,7 @@ Category = Literal[
     "card",
     "keyword",
     "unread",  # text coming onto the screen, kept covered until it can be read
+    "held",  # a pane not yet checked: it shows its last checked picture instead
     # Visual layer
     "street_sign",
     "house_number",

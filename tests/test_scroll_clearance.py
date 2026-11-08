@@ -282,7 +282,9 @@ def test_a_still_pane_is_not_read_again_just_because_one_beside_it_scrolls():
     for offset in range(6, 42, 6):
         stage.show(scene.image(offset))
     assert stage.detect.stats["scrolls"] > 0
-    assert stage_reader.calls == reads
+    # Only the rows scrolling in are read, once whole lines are in: never the still pane.
+    assert stage_reader.calls - reads <= 3
+    assert all(height < 120 for height, _ in stage_reader.read_sizes[reads:])
 
 
 def shrink(image, scale):
