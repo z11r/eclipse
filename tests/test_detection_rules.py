@@ -80,3 +80,13 @@ def test_short_keyword_matches_whole_words_only():
 def test_keyword_with_symbols_is_matched_literally():
     assert "keyword" in classify_text("user c++dev here", ["c++dev"])
     assert "keyword" not in classify_text("user cdev here", ["c++dev"])
+
+
+@pytest.mark.parametrize('text', ['Phone: +1 (7g\u00f8) 555-0123', 'Phone:+1(780)555-01239'])
+def test_labeled_phone_is_covered_despite_ocr_digit_errors(text):
+    assert 'phone' in classify_text(text)
+
+
+@pytest.mark.parametrize('text', ['Phone: unavailable', 'Phone settings', 'Mobile: version 2'])
+def test_phone_labels_without_numbers_do_not_match(text):
+    assert 'phone' not in classify_text(text)

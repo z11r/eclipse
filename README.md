@@ -4,7 +4,7 @@ Other tools catch your API key. Eclipse catches the things that let people find 
 
 Eclipse is a desktop app that sits between your screen and OBS. It reads the screen, covers secrets with solid black boxes, and sends the result to OBS as a virtual camera, one second behind live. A frame that hasn't been scanned never goes out. Built for natHacks 2026 (Standard Division, Defense & Security).
 
-> **Status:** screen capture, the text layer, the control panel and the panic key run on macOS. The text layer covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. Webcam input, location clues and IRL mode aren't built yet, and the app doesn't start on Windows yet.
+> **Status:** screen capture, the text layer, the control panel and the panic key run on macOS. The text layer covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. Webcam input, location clues and IRL mode aren't built yet. Windows now has an experimental native OCR mode (`--ocr windows`); it has been tried with OBS, but missed detections and stray covers remain.
 
 ## Setup
 
@@ -30,7 +30,15 @@ Run Eclipse as a module from the repo root:
 python -m eclipse.main
 ```
 
-This uses RapidOCR at 60 fps with a 1-second delay. While it runs:
+For the current Windows preview, run this in PowerShell after installing the requirements:
+
+```powershell
+.\.venv\Scripts\python.exe -m eclipse.main --ocr windows --capture mss --fps 15 --max-width 1920 --delay 1 --no-panel --no-hotkey
+```
+
+This Windows preview command disables the panel and panic shortcut. Ctrl+C stops it. Use fake secrets: native OCR has missed keys and card numbers in tests.
+
+The default command uses RapidOCR at 60 fps with a 1-second delay. While it runs:
 
 - Open the **Open authorized panel** link printed in the terminal. Turn categories on or off, add keywords, see what was caught, and panic or resume. Each launch generates a new private token; after restarting Eclipse, open the new link. The browser removes the token from the address bar and keeps it for refreshes in that tab. Do not share the launch link or include it in demo recordings. Opening the plain localhost URL in a new tab does not authorize controls.
 - Control+Option+B blacks out the output, including frames already waiting to go out. Resume from the panel.
@@ -42,6 +50,7 @@ Useful options:
 | Option | What it does |
 | --- | --- |
 | `--ocr apple` | Use Apple's built-in OCR. Much faster, but finds fewer secrets than RapidOCR. |
+| `--ocr windows` | Experimental local Windows OCR. Faster, but has missed keys and card numbers in tests. Use fake secrets for demos; it does not guarantee protection. |
 | `--fps 30` | Capture and send at a different frame rate |
 | `--delay 2` | Seconds behind live |
 | `--test-pattern` | Send a moving pattern with a fake secret instead of your screen, to check OBS |
