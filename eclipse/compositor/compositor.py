@@ -36,6 +36,7 @@ class Compositor:
         self._held: list[tuple[int, int, int, int]] = []  # this frame's held areas
         self._last_safe: Rendered | None = None
         self.held_frames = 0
+        self.unchecked_frames = 0  # frames still unchecked when due: the last safe went out
         self.held_areas = 0  # areas shown as the last safe picture had them: a local stutter
 
     def process(self, frame: Frame, detect: Detector) -> np.ndarray:
@@ -56,6 +57,14 @@ class Compositor:
             image, state, frame.source, frame.frame_id, frame.ts, generation
         )
         return self._last_safe
+
+    def hold(self, frame: Frame, generation: int = 0) -> Rendered:
+        """Send the last safe picture instead of this frame, which isn't fully checked:
+        a repeated frame, not a cover. Black if nothing safe has been drawn yet."""
+        self.unchecked_frames += 1
+        if self._last_safe is not None:
+            return replace(self._last_safe, state="held")
+        return Rendered(np.zeros_like(frame.image), "blackout", None, -1, frame.ts, generation)
 
     def forget(self) -> None:
         """Stop holding the last safe image, as it may no longer be safe to show."""
@@ -103,9 +112,6 @@ class Compositor:
     def _redact(self, frame: Frame) -> np.ndarray:
         output = self._canvas(frame)
         height, width = output.shape[:2]
-        for left, top, right, bottom in self.covered_areas(height, width):
-            # A solid fill, because blurred text can sometimes be recovered.
-            output[top:bottom, left:right] = FILL
         if self._held:
             # Not checked yet, so it shows what the last safe picture showed there: that
             # went out already, so nothing new can. With no such picture, black.
@@ -119,6 +125,10 @@ class Compositor:
                     last.image[top:bottom, left:right] if usable else FILL
                 )
             self.held_areas += len(self._held)
+        # Covers last, so an older picture shown in a held area can never paint over one.
+        for left, top, right, bottom in self.covered_areas(height, width):
+            # A solid fill, because blurred text can sometimes be recovered.
+            output[top:bottom, left:right] = FILL
         return output
 
     def _hold(self, frame: Frame, error: Exception, generation: int) -> Rendered:

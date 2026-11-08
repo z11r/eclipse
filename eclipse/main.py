@@ -49,8 +49,10 @@ WEBCAM_NOISE_FLOOR = 8
 # OCR threads for the camera when it runs beside the screen. Its reads are small, and
 # the screen's reader keeps its six, so together they still leave cores for OBS.
 WEBCAM_OCR_THREADS = 2
-# Seconds of the delay a scanned frame waits for later frames to read the rows scrolling
-# into it. Never more of the delay than the share, leaving the rest for slow scans.
+# Seconds of the delay kept for later frames to read the rows scrolling into a frame, and
+# to trace secrets they find back onto it: frames are scanned at least this long before
+# they are due. Each frame then waits, unfinished, until just before it is due. Never
+# more of the delay than the share, leaving the rest for slow scans.
 LOOK_AHEAD = 0.3
 LOOK_AHEAD_SHARE = 0.3
 
@@ -216,6 +218,13 @@ class StatsLog:
             f"work-ms {ms('read.work_seconds', count('read.jobs')):.1f} "
             f"wait-ms {ms('read.wait_seconds', count('read.jobs')):.1f} | "
             f"composite-ms {ms('pipeline.composite_seconds', scanned):.1f} | "
+            f"traced {count('pipeline.traced_covers')} "
+            f"onto-frames {count('pipeline.traced_frames')} "
+            f"too-late {count('pipeline.traced_too_late')} "
+            f"waiting-peak {now.get('pipeline.retained_peak', 0)} "
+            f"unchecked-at-deadline {count('pipeline.unchecked_at_deadline')} "
+            f"finish-ms {ms('pipeline.finish_seconds', scanned):.1f} "
+            f"reserve-ms {now.get('pipeline.finish_reserve_ms', 0):.1f} | "
             f"output-ms fit {ms('output.fit_seconds', fits):.1f} "
             f"send {ms('output.send_seconds', sends):.1f} late {count('output.late_ticks')} | "
             f"scans full {count('detect.full_scans')} partial {count('detect.partial_scans')} "
@@ -388,8 +397,9 @@ def main(argv: list[str] | None = None) -> int:
         "--look-ahead",
         type=float,
         default=None,
-        help="seconds of the delay each frame waits for later frames to read the rows "
-        f"scrolling into it, which then need no black strip; 0 turns it off. Default "
+        help="seconds of the delay kept for later frames to read the rows scrolling into "
+        "each frame and cover secrets they find in it; frames wait, unfinished, until "
+        f"just before they are due. 0 turns it off. Default "
         f"{LOOK_AHEAD} s, at most {LOOK_AHEAD_SHARE:.0%} of the delay",
     )
     parser.add_argument("--max-width", type=int, default=1920)

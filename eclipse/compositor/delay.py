@@ -14,6 +14,13 @@ Every picture passes the OutputGate on its way out. Nothing the gate turns down 
 ever sent: black goes out instead. Panic and new settings work through the gate, so
 they take effect at the output, however far behind the scanner is.
 
+With a detector that can settle earlier frames (look_ahead), a scanned frame isn't drawn
+when its scan ends. It waits, unfinished, until just before it is due out (retain.py):
+later frames can still settle its incoming rows, and a secret found in a later frame is
+traced back onto it. A separate finisher thread draws each one as its deadline nears,
+leaving the measured time drawing takes. A frame that isn't scanned by then never goes
+out; the last safe frame stays up instead.
+
 Shutting down closes the gate first, and sends black while the output still works.
 Python can't stop a thread stuck inside a native OCR call. If a worker doesn't finish
 in time, it is left behind as a daemon, reported in stats.stalled_workers, and the
@@ -32,6 +39,7 @@ import numpy as np
 
 from eclipse.compositor.compositor import Compositor, Detector
 from eclipse.compositor.gate import OutputGate
+from eclipse.compositor.retain import Retained, RetainedFrames
 from eclipse.telemetry import Distribution
 from eclipse.types import Detection, Frame, Rendered
 
@@ -50,6 +58,11 @@ _SAMPLES_KEPT = 4096  # timing samples held until the stats log collects them
 _JOIN_SECONDS = 5.0  # how long shutdown waits for the workers
 _LONGEST_IDLE = 0.01  # seconds the output waits between looks while it has nothing to send
 _NO_FRAME_YET = (1080, 1920, 3)  # the shape of black if a panic beats the first frame
+_FINISH_GUESS = 0.005  # seconds to draw a frame, until drawing has been timed
+_FINISH_MARGIN = 2.0  # times the drawing estimate left before a frame is due
+# Output ticks left before a frame is due, on top. One was too few live: under load the
+# drawing thread can wait its turn, and frames were drawn up to 14 ms late.
+_FINISH_TICKS = 2
 
 
 def _samples() -> deque:
@@ -59,21 +72,6 @@ def _samples() -> deque:
 class _Queued(NamedTuple):
     frame: Frame
     fresh: bool  # its pixels differ from the frame captured before it
-
-
-class _Scanned(NamedTuple):
-    """A frame the detector has read, waiting for later frames before it is drawn."""
-
-    frame: Frame
-    fresh: bool
-    size: int
-    found: list[Detection]
-    generation: int  # the settings it was read under
-    started: float  # when its scan started
-    spent: float  # seconds its scan took
-
-
-_IDLE = object()  # no frame came, but a waiting one may be due to be drawn
 
 
 class _SafeFrame(NamedTuple):
@@ -140,6 +138,13 @@ class PipelineStats:
     rendered_cached: int = 0  # results that reused earlier reads
     rendered_held: int = 0  # results that fell back on an older safe image
     rendered_blackout: int = 0  # results with nothing safe to show
+    traced_covers: int = 0  # covers found later and traced back onto waiting frames
+    traced_frames: int = 0  # waiting frames that gained one
+    traced_too_late: int = 0  # covers that would have reached a frame already drawn
+    retained_peak: int = 0  # most scanned frames waiting to be drawn at once
+    unchecked_at_deadline: int = 0  # frames with rows unread when due: last safe sent again
+    finish_seconds: float = 0.0  # drawing retained frames, on the finisher thread
+    finish_reserve_ms: float = 0.0  # time left before the deadline for drawing, latest
     sends: int = 0  # every picture handed to the output, repeats and black included
     black_sends: int = 0  # the ones that were black
     distinct_presented: int = 0  # how many different source frames viewers have seen
@@ -212,8 +217,10 @@ class DelayedPipeline:
         join_seconds: float = _JOIN_SECONDS,
         look_ahead: float = 0.0,
     ) -> None:
-        """look_ahead: seconds of the delay a scanned frame waits before it is drawn, so a
-        detector with settled() can use later frames, as for rows scrolling into view."""
+        """look_ahead: above 0, a detector with settled() keeps each scanned frame
+        unfinished until just before it is due, so later frames can settle its incoming
+        rows and trace secrets they find back onto it. Frames are scanned early enough
+        to leave at least look_ahead seconds of later frames for that."""
         if not 0 <= look_ahead < delay:
             raise ValueError("look_ahead must be at least 0 and less than the delay")
         self.stats = PipelineStats()
@@ -229,9 +236,12 @@ class DelayedPipeline:
         settle = getattr(detect, "settled", None) if look_ahead > 0 else None
         if settle is not None and hasattr(detect, "look_ahead"):
             detect.look_ahead()
-        self._settle: Callable[[Frame], list[Detection] | None] | None = settle
+        self._settle: Callable[..., list[Detection] | None] | None = settle
         self._look_ahead = look_ahead
-        self._ahead: deque[_Scanned] = deque()  # scanned, not drawn yet; scan thread only
+        # Scanned, not drawn yet: the scan thread adds, the finisher thread draws.
+        self._retained = RetainedFrames() if settle is not None else None
+        self._finish_estimate = _FINISH_GUESS  # seconds to draw a frame, smoothed
+        self._finish_done = threading.Event()
         self._compositor = compositor
         self._delay = delay
         self._interval = 1 / fps
@@ -427,25 +437,16 @@ class DelayedPipeline:
                     return self._waiting.popleft()
                 if self._capture_done.is_set():
                     return None
-                if self._ahead:
-                    wait = self._ahead[0].frame.ts + self._look_ahead - time.monotonic()
-                    if wait <= 0:
-                        return _IDLE
-                    self._frame_ready.wait(min(wait, 0.1))
-                    continue
                 self._frame_ready.wait(0.1)
 
     def _scan(self) -> None:
         try:
             while True:
                 queued = self._next_to_scan()
-                if queued is _IDLE:
-                    self._draw_due()
-                    continue
                 if queued is None:
-                    if not self._stop.is_set():
-                        self._draw_due(everything=True)
-                    return
+                    if self._retained is not None and not self._stop.is_set():
+                        self._retained.flush()  # no frame comes to confirm the last finds
+                    return  # the finisher draws what is still waiting, as it comes due
                 frame, fresh = queued
                 size = frame.image.nbytes
 
@@ -463,32 +464,24 @@ class DelayedPipeline:
                         self._note_in_flight(-1, -size)
                     continue
 
-                invalidations = self.gate.invalidations
-                if invalidations != self._invalidations_seen:
-                    # Don't let a failed scan fall back on something no longer allowed.
-                    self._invalidations_seen = invalidations
-                    self._compositor.forget()
-
                 started = time.monotonic()
                 self.stats.scan_ages.append((started - frame.ts) * 1000)
-                if self._settle is None:
+                if self._retained is None:
+                    self._forget_if_invalidated()
                     detect_before = self.stats.detect_seconds
                     rendered = self._compositor.render(frame, self._timed, self._generation)
                     if not self._keep(frame, fresh, size, rendered, started, detect_before):
                         return
                     continue
-                if not self._scan_ahead(frame, fresh, size, started):
+                if not self._scan_and_retain(frame, fresh, size, started):
                     return
-                self._draw_due()
         except BaseException as error:
             self._error = error
             self._stop.set()
         finally:
-            with self._lock:
-                for scanned in self._ahead:  # nobody is left to show them
-                    self._note_in_flight(-1, -scanned.size)
-                self._ahead.clear()
             self._scan_done.set()
+            with self._frame_ready:
+                self._frame_ready.notify_all()
 
     def _keep(
         self, frame: Frame, fresh: bool, size: int, rendered: Rendered, started: float,
@@ -516,52 +509,149 @@ class DelayedPipeline:
         self.stats.slack.append((frame.ts + self._delay - time.monotonic()) * 1000)
         return True
 
-    def _scan_ahead(self, frame: Frame, fresh: bool, size: int, started: float) -> bool:
-        """Read a frame now and draw it later. A failed read draws everything waiting with
-        what it first reported, then holds the last safe frame for this one."""
+    def _forget_if_invalidated(self) -> None:
+        """Call from the thread that draws. Don't let a failed scan fall back on something
+        no longer allowed."""
+        invalidations = self.gate.invalidations
+        if invalidations != self._invalidations_seen:
+            self._invalidations_seen = invalidations
+            self._compositor.forget()
+
+    def _scan_and_retain(self, frame: Frame, fresh: bool, size: int, started: float) -> bool:
+        """Read a frame and keep it waiting, unfinished. Then let it settle and cover
+        what the frames waiting before it showed. False if the pipeline is stopping."""
+        retained = self._retained
+        motions = reads = sightings = None
         try:
             found = self._timed(frame)
-        except Exception as error:
-            if not self._draw_due(everything=True, settle=False):
-                return False
-
-            def failed(_frame: Frame) -> list[Detection]:
-                raise error
-
-            detect_before = self.stats.detect_seconds
-            rendered = self._compositor.render(frame, failed, self._generation)
-            return self._keep(frame, fresh, size, rendered, time.monotonic(), detect_before)
-        spent = time.monotonic() - started
-        self._ahead.append(
-            _Scanned(frame, fresh, size, found, self._generation, started, spent)
+        except Exception:
+            found = None  # drawn as the last safe picture; the frames waiting keep theirs
+        else:
+            motions = self._ask("motions")  # unknown: only unmoved text is traced
+            reads = self._ask("reads")  # unknown: every cover is traced
+            sightings = self._ask("sightings")  # unknown: kept covers confirm new ones
+        record = Retained(
+            frame, fresh, size, found, self._generation, time.monotonic() - started, motions,
+            reads, sightings,
         )
+        with self._frame_ready:
+            if self._stop.is_set():
+                self._note_in_flight(-1, -size)  # nobody is left to show it
+                return False
+            retained.add(record)
+            self.stats.retained_peak = max(self.stats.retained_peak, len(retained))
+        if found is not None:
+            retained.refresh(self._peek)
+            retained.trace(record)
+            oldest = retained.oldest()
+            forget_before = getattr(self._detect, "forget_before", None)
+            if oldest is not None and forget_before is not None:
+                try:
+                    forget_before(oldest.frame)
+                except Exception:
+                    pass  # only memory: it forgets old frames on its own too
+        stats = self.stats
+        stats.traced_covers = retained.traced
+        stats.traced_frames = retained.traced_frames
+        stats.traced_too_late = retained.too_late
+        work = time.monotonic() - started
+        self._scan_estimate += _SCAN_SMOOTHING * (work - self._scan_estimate)
+        self.last_scan_at = time.monotonic()
+        stats.scanned += 1
+        stats.scan_seconds += work
+        with self._frame_ready:
+            self._frame_ready.notify_all()
         return True
 
-    def _draw_due(self, everything: bool = False, settle: bool = True) -> bool:
-        """Draw waiting frames whose look-ahead is up, oldest first, with the best boxes
-        known for each now. False if the pipeline is stopping."""
-        while self._ahead:
-            scanned = self._ahead[0]
-            if not everything and time.monotonic() < scanned.frame.ts + self._look_ahead:
-                return True
-            self._ahead.popleft()
-            boxes = None
-            if settle:
-                try:
-                    boxes = self._settle(scanned.frame)
-                except Exception:
-                    boxes = None  # what it first reported still covers everything
-            found = scanned.found if boxes is None else boxes
-            started = time.monotonic()
-            rendered = self._compositor.render(
-                scanned.frame, lambda _frame: found, scanned.generation
-            )
-            if not self._keep(
-                scanned.frame, scanned.fresh, scanned.size, rendered, started,
-                self.stats.detect_seconds, scanned.spent,
-            ):
-                return False
-        return True
+    def _ask(self, name: str):
+        """A hint the detector may give about the frame it just scanned, or None."""
+        method = getattr(self._detect, name, None)
+        if method is None:
+            return None
+        try:
+            return method()
+        except Exception:
+            return None
+
+    def _peek(self, frame: Frame) -> list[Detection] | None:
+        """What later frames have settled for a waiting frame so far, without making the
+        detector forget it. None if not known."""
+        try:
+            return self._settle(frame, forget=False)
+        except Exception:
+            return None  # it keeps the last answer, or what its scan reported
+
+    def _finish_reserve(self) -> float:
+        """Seconds before a frame is due that it must start being drawn."""
+        return _FINISH_TICKS * self._interval + _FINISH_MARGIN * self._finish_estimate
+
+    def _next_to_finish(self) -> Retained | None:
+        """The next waiting frame once its time to be drawn comes, or None at the end."""
+        retained = self._retained
+        with self._frame_ready:
+            while not self._stop.is_set():
+                oldest = retained.oldest()
+                if oldest is None:
+                    if self._scan_done.is_set():
+                        return None
+                    self._frame_ready.wait(0.1)
+                    continue
+                due = time.monotonic() - self._delay + self._finish_reserve()
+                record = retained.take(due)
+                if record is not None:
+                    return record
+                self._frame_ready.wait(min(max(oldest.frame.ts - due, 0.0), 0.1))
+        return None
+
+    def _finish(self) -> None:
+        """Draw each waiting frame as its deadline nears, oldest first."""
+        try:
+            while True:
+                record = self._next_to_finish()
+                if record is None:
+                    return
+                self._forget_if_invalidated()
+                started = time.monotonic()
+                boxes = record.drawing()
+                if record.found is None:
+
+                    def draw(_frame: Frame) -> list[Detection]:
+                        raise RuntimeError("scan failed")
+
+                    rendered = self._compositor.render(record.frame, draw, record.generation)
+                elif boxes is None:
+                    # Rows still unread at the deadline: never drawn black, as black is
+                    # only for secrets. The last safe picture goes out once more instead.
+                    rendered = self._compositor.hold(record.frame, record.generation)
+                else:
+                    rendered = self._compositor.render(
+                        record.frame, lambda _frame: boxes, record.generation
+                    )
+                spent = time.monotonic() - started
+                self._finish_estimate += _SCAN_SMOOTHING * (spent - self._finish_estimate)
+                stats = self.stats
+                stats.finish_seconds += spent
+                stats.composite_seconds += spent
+                stats.finish_reserve_ms = self._finish_reserve() * 1000
+                stats.held = self._compositor.held_frames
+                stats.held_panes = getattr(self._compositor, "held_areas", 0)
+                stats.unchecked_at_deadline = getattr(self._compositor, "unchecked_frames", 0)
+                self._count_result(rendered)
+                with self._lock:
+                    if self._stop.is_set():
+                        self._note_in_flight(-1, -record.size)
+                        return
+                    self._safe.append(_SafeFrame(record.frame.ts, rendered, record.fresh, record.size))
+                stats.slack.append((record.frame.ts + self._delay - time.monotonic()) * 1000)
+        except BaseException as error:
+            self._error = error
+            self._stop.set()
+        finally:
+            if self._retained is not None:
+                with self._lock:
+                    for record in self._retained.drain():  # nobody is left to show them
+                        self._note_in_flight(-1, -record.size)
+            self._finish_done.set()
 
     def _count_result(self, rendered: Rendered) -> None:
         name = f"rendered_{rendered.state}"
@@ -685,7 +775,8 @@ class DelayedPipeline:
 
     def _finished(self) -> bool:
         with self._lock:
-            return self._scan_done.is_set() and not self._safe
+            drawn = self._retained is None or self._finish_done.is_set()
+            return self._scan_done.is_set() and drawn and not self._safe
 
     def _drop_queued(self) -> None:
         """Call with the lock held. Work nobody will see is only in the way now."""
@@ -696,6 +787,9 @@ class DelayedPipeline:
             self._note_in_flight(-1, -safe.size)
         self._waiting.clear()
         self._safe.clear()
+        if self._retained is not None:
+            for record in self._retained.drain():
+                self._note_in_flight(-1, -record.size)
 
     def _send_final_black(self) -> None:
         """Leave black up, while the output still works. Never raises."""
@@ -740,6 +834,10 @@ class DelayedPipeline:
             threading.Thread(target=self._capture, name="eclipse-capture", daemon=True),
             threading.Thread(target=self._scan, name="eclipse-scan", daemon=True),
         ]
+        if self._retained is not None:
+            self._threads.append(
+                threading.Thread(target=self._finish, name="eclipse-finish", daemon=True)
+            )
         current = None
         with self._sink:
             self._started.set()
