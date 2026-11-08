@@ -21,7 +21,7 @@ Category = Literal[
 Source = Literal["screen", "webcam", "irl"]
 Mode = Literal["desktop", "irl"]
 View = Literal["screen", "both", "webcam"]  # what goes out: see eclipse/capture/dual.py
-CoverStyle = Literal["black", "blur"]  # how covers look: see eclipse/compositor/compositor.py
+CoverStyle = Literal["black", "blur", "blur_text"]  # how covers look: see eclipse/compositor/compositor.py
 
 
 class PanelConfig(BaseModel):

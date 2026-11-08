@@ -223,7 +223,7 @@
             <div class="section-heading">
               <h3 id="cover-title">Cover style</h3>
             </div>
-            <p>How covers look on stream. Both styles hide exactly the same areas.</p>
+            <p>How covers look on stream. Every style hides exactly the same areas.</p>
             <label class="category-row">
               <div>
                 <div class="category-name">Blur covers</div>
@@ -231,6 +231,16 @@
               </div>
               <span class="switch"><input id="cover-blur" type="checkbox" aria-label="Blur covers" disabled /><span
                   class="switch-track"></span></span>
+            </label>
+            <label class="category-row cover-look-row">
+              <div>
+                <div class="category-name">Blur look</div>
+                <div class="category-sub">What shows through the blur</div>
+              </div>
+              <select id="cover-look" class="cover-look" aria-label="Blur look" disabled>
+                <option value="blur">Word shapes</option>
+                <option value="blur_text">Scrambled characters</option>
+              </select>
             </label>
           </section>
           <section class="panel mode-panel" aria-labelledby="mode-title">

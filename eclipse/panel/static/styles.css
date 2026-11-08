@@ -1315,3 +1315,27 @@ footer {
     transition: none !important;
   }
 }
+
+/* Blur look picker, beside the blur switch. Styled as the keyword field. */
+.cover-look {
+  flex-shrink: 0;
+  max-width: 55%;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--control-edge);
+  border-radius: var(--radius-field);
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--voice);
+  font-size: 14px;
+}
+
+.cover-look:focus-visible {
+  outline: 2px solid var(--flare);
+  outline-offset: 2px;
+}
+
+.cover-look:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}

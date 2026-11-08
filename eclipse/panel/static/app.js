@@ -76,7 +76,7 @@ function setConnection(value) {
     $('panic-button').disabled=true;$('resume-button').disabled=true;
     $('save-settings').disabled=true;$('save-keywords').disabled=true;
     $('add-keyword').disabled=true;
-    $('cover-blur').disabled=true;
+    $('cover-blur').disabled=true;$('cover-look').disabled=true;
     $('settings-status').textContent='Disconnected';
     $('metric-output').textContent='Unknown';
     $('metric-held').textContent='—';
@@ -130,14 +130,15 @@ function renderState(state) {
   renderCategories(state);renderKeywords();renderCover(state);
 }
 function renderCover(state){
-  const blur=state.cover_style==='blur';
-  if(!coverPending)$('cover-blur').checked=blur;
+  const blur=state.cover_style!=='black';
+  if(!coverPending){$('cover-blur').checked=blur;if(blur)$('cover-look').value=state.cover_style;}
   $('cover-blur').disabled=!connected||coverPending;
-  $('cover-sub').textContent=blur?'Blurred from the colours around each cover':'Solid black';
+  $('cover-look').disabled=!connected||coverPending;
+  $('cover-sub').textContent=blur?'Blurred, made only from what is around each cover':'Solid black';
 }
 async function setCover(style){
   if(coverPending||!connected)return;
-  coverPending=true;$('cover-blur').disabled=true;
+  coverPending=true;$('cover-blur').disabled=true;$('cover-look').disabled=true;
   try{const state=await api('/api/cover',{method:'PUT',body:JSON.stringify({style})});coverPending=false;renderState(state);}
   catch(e){notice('Could not change the cover style: '+e.message);coverPending=false;await refreshState();}
   finally{coverPending=false;if(serverState&&connected)renderCover(serverState);}
@@ -287,7 +288,9 @@ $('keyword-form').addEventListener('submit',e=>{
 });
 $('save-keywords').addEventListener('click',()=>saveConfig('keywords'));
 $('panic-button').addEventListener('click',()=>sendSafety('/api/panic'));
-$('cover-blur').addEventListener('change',e=>setCover(e.target.checked?'blur':'black'));
+$('cover-blur').addEventListener('change',e=>setCover(e.target.checked?$('cover-look').value:'black'));
+// Picking a look turns blur on with it, so the choice is seen at once.
+$('cover-look').addEventListener('change',e=>setCover(e.target.value));
 $('resume-button').addEventListener('click',()=>sendSafety('/api/resume'));
 refreshState().then(refreshEvents);
 setInterval(refreshState,1000);
