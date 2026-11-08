@@ -364,9 +364,13 @@ def _shifted_match(image, before, dx: int, dy: int, area) -> np.ndarray:
     return match
 
 
-def _ink(area: np.ndarray) -> np.ndarray | None:
+def _ink(area: np.ndarray, floor: int = _NOISE_FLOOR) -> np.ndarray | None:
     """Which pixels of an area aren't its background colour, or None if no one colour
-    fills most of it, so there is no telling background from text."""
+    fills most of it, so there is no telling background from text.
+
+    floor is how far from the background a pixel may be and still count as background.
+    It only allows for sensor noise: on an exact screen capture, pass 0, as a pixel that
+    differs at all may be faint text, and only a blank area can be shown unread."""
     if area.size == 0:
         return np.zeros(area.shape[:2], bool)
     # The background is most of the area, so a few thousand evenly spread pixels find it.
@@ -380,11 +384,12 @@ def _ink(area: np.ndarray) -> np.ndarray | None:
     value = int(colours[common])
     background = np.empty_like(area)
     background[:] = (value >> 16, (value >> 8) & 255, value & 255)
-    return _strongest(cv2.absdiff(area, background)) > _NOISE_FLOOR
+    return _strongest(cv2.absdiff(area, background)) > floor
 
 
 def _cut_line(
-    image, edge: int, inward: int, left: int, right: int, reach: int, scale: int, fallback: int
+    image, edge: int, inward: int, left: int, right: int, reach: int, scale: int, fallback: int,
+    floor: int = _NOISE_FLOOR,
 ) -> int:
     """How many rows in from a pane's edge the line it cuts through reaches, or 0 if
     the edge falls in a gap between lines. A line the edge cuts can't be read whole.
@@ -397,7 +402,7 @@ def _cut_line(
         area = image[edge:edge + reach, left:right]
     else:
         area = image[max(edge - reach, 0):edge, left:right][::-1]  # nearest the edge first
-    ink = _ink(area)
+    ink = _ink(area, floor)
     if ink is None:
         return fallback
     # Columns inked in nearly every row are rails, not text: a pane's border, the pane
@@ -416,7 +421,9 @@ def _cut_line(
     return reach if band[1] >= len(rows) else min(band[1] + gap, reach)
 
 
-def _ink_boxes(image, top, bottom, left, right, scale) -> list[tuple[int, int, int, int]]:
+def _ink_boxes(
+    image, top, bottom, left, right, scale, floor: int = _NOISE_FLOOR
+) -> list[tuple[int, int, int, int]]:
     """Boxes over everything in an area that isn't its background colour, as x, y, w, h.
 
     Pixels of the background colour can't show anything, so only the rest needs to be
@@ -426,7 +433,7 @@ def _ink_boxes(image, top, bottom, left, right, scale) -> list[tuple[int, int, i
     area = image[top:bottom, left:right]
     if area.size == 0:
         return []
-    ink = _ink(area)
+    ink = _ink(area, floor)
     if ink is None:
         return [(left, top, right - left, bottom - top)]
     boxes = []
@@ -711,6 +718,9 @@ class Detector:
         self._previous_key = None
         self._gap = self._move_gap = self._before_gap = 1
         self._drag_area = None  # top, bottom, left, right of what the last move carried
+        self._motions = None  # what this frame's follows moved; None: not known
+        self._reads = None  # where this frame was read, as top, bottom, left, right
+        self._sighted = None  # secrets this frame's reads found, as (category, x, y, w, h)
         self._view = None  # top and bottom of the area scrolling now
         self._fractional_frames = 0  # frames of this scroll that landed between pixels
         # Areas whose changes keep going unexplained, like a live video or OBS's preview:
@@ -1171,6 +1181,11 @@ class Detector:
         self._regions = moved
         self.stats['scrolls'] += 1
         self._scrolled = True
+        edge = self._scroll_edge
+        self._motions.append((
+            max(left - edge, 0), top_of_view, right + edge - max(left - edge, 0),
+            bottom_of_view - top_of_view, 0, exact_shift,
+        ))
         self._collect_unread(image, shift, left, right, first_row, length, remaining)
         incoming = (top_of_view, first_row) if shift > 0 else (
             first_row + length, bottom_of_view
@@ -1426,6 +1441,7 @@ class Detector:
         self._last_move = shift
         self._moved = True
         self._moved_area = area  # top, bottom, left, right of what moved, and where to
+        self._motions.append((area[2], area[0], area[3] - area[2], area[1] - area[0], dx, dy))
         self.stats['moves'] += 1
         remaining = changed.copy()
         remaining[inside] &= ~match[inside]
@@ -1507,6 +1523,7 @@ class Detector:
         return _cut_line(
             image, edge, inward, left, min(right, image.shape[1]),
             _CUT_REACH * self._unread_keep, self._pixel_scale, self._unread_keep,
+            self._noise_floor,
         )
 
     def _collect_unread(self, image, shift, left, right, first, length, remaining):
@@ -2399,17 +2416,46 @@ class Detector:
         with self._lock:
             self._looking_ahead = True
 
-    def settled(self, key) -> list[Box] | None:
+    def settled(self, key, forget=True) -> list[Box] | None:
         """The boxes for an earlier frame, with its incoming rows cleared where frames
         since have read them, or None if that frame is no longer known. Forgets it and
-        every frame before it. The rows still unread stay as 'unread' boxes."""
+        every frame before it, unless forget is False. The rows still unread stay as
+        'unread' boxes."""
         with self._lock:
-            boxes = self._incoming.settled(key)
+            boxes = self._incoming.settled(key, forget)
             for reason, rows in self._incoming.take_held_rows().items():
                 self.stats[f'held_{reason}'] += rows
             for reason, rows in self._incoming.take_lost_rows().items():
                 self.stats[f'lost_{reason}'] += rows
             return boxes
+
+    def forget_before(self, key) -> None:
+        """Stop following frames before this one: nothing more of them will be asked."""
+        with self._lock:
+            self._incoming.forget_before(key)
+
+    def motions(self):
+        """How the last frame scanned moved pixels it had in common with the frame scanned
+        before it, as followed and checked here: (x, y, w, h, dx, dy) per follow, the area
+        in the later frame's pixels where content moved dx, dy. An empty list if nothing
+        was followed, and None if not known, as after a failed scan. Only a hint: anyone
+        using it must check pixels themselves."""
+        with self._lock:
+            return None if self._motions is None else list(self._motions)
+
+    def sightings(self):
+        """Secrets the last frame's own reads found, as (category, x, y, w, h): read from its
+        pixels, not carried over from an earlier read. None if not known."""
+        with self._lock:
+            return None if self._sighted is None else list(self._sighted)
+
+    def reads(self):
+        """Where the last frame scanned was read, as (x, y, w, h). Covers elsewhere were
+        carried from earlier frames, not found in this one. None if not known."""
+        with self._lock:
+            if self._reads is None:
+                return None
+            return [(left, top, right - left, bottom - top) for top, bottom, left, right in self._reads]
 
     def detect(self, frame, key=None) -> list[Box]:
         """Boxes to cover in this frame. Give each frame a key, in order, to have
@@ -2437,11 +2483,14 @@ class Detector:
                 self.stats['copy_seconds'] += diff_started - copy_started
                 self._scrolled = False
                 self._moved = False
+                self._motions = []
                 self._last_changed = self._step = None
                 self._probe, self._uncovered = self._uncovered, None
                 gap = 1 if key is None or self._previous_key is None else key - self._previous_key
                 self._gap = min(max(gap, 1), _MOVE_GAP_MAX)
                 areas = self._changed_areas(snapshot)
+                self._reads = list(areas)
+                self._sighted = []
                 self.stats['frames'] += 1
                 self.stats['diff_seconds'] += time.monotonic() - diff_started
                 self.reused_read = not areas
@@ -2519,7 +2568,7 @@ class Detector:
                 track_started = time.monotonic()
                 self.stats['find_seconds'] += track_started - find_started
 
-                self._tracks.update(snapshot, [
+                sightings = [
                     Sighting(
                         category, rect, text_hash,
                         any(_overlaps((rect[1], rect[3], rect[0], rect[2]), a) for a in areas),
@@ -2527,7 +2576,13 @@ class Detector:
                     )
                     for category, rect, text_hash in found
                     if category in self._enabled
-                ], areas, self._pane)
+                ]
+                self._sighted = [
+                    (s.category, math.floor(s.rect[0]), math.floor(s.rect[1]),
+                     math.ceil(s.rect[2] - s.rect[0]), math.ceil(s.rect[3] - s.rect[1]))
+                    for s in sightings if s.fresh
+                ]
+                self._tracks.update(snapshot, sightings, areas, self._pane)
 
                 for category, (x1, y1, x2, y2) in self._tracks.covers():
                     left = max(0, min(width, math.floor(x1) - self.padding))
@@ -2543,7 +2598,8 @@ class Detector:
                 # Unread rows are covered where they show something, not their whole width.
                 self._strip_ink = {
                     way: _ink_boxes(
-                        snapshot, top, bottom, left, min(right, width), self._pixel_scale
+                        snapshot, top, bottom, left, min(right, width), self._pixel_scale,
+                        self._noise_floor,
                     )
                     for way, (top, bottom, left, right) in self._unread.items()
                 }
@@ -2568,6 +2624,7 @@ class Detector:
             # Known secrets are still on screen, so a failed scan keeps their covers.
             with self._lock:
                 self._forget_scan()
+                self._motions = self._reads = self._sighted = None
 
             raise DetectionError('Text detection failed; black out this frame.') from None
 

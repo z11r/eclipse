@@ -83,15 +83,40 @@ class TextDetector:
         """Start following rows that scroll in, so settled() can clear them later."""
         self._detector.look_ahead()
 
-    def settled(self, frame: Frame) -> list[Detection] | None:
+    def settled(self, frame: Frame, forget: bool = True) -> list[Detection] | None:
         """This frame's detections again, with its incoming rows cleared where frames
         scanned since have read them. Rows still unread stay covered. None if the frame
         is no longer known, as after a failed scan; then use what it first reported.
-        Ask in frame order: it forgets every frame before this one."""
+        Ask in frame order: it forgets every frame before this one, and this one too
+        unless forget is False, so it can be asked again after later frames."""
         if frame.source != self._source:
             return None
-        boxes = self._detector.settled(frame.frame_id)
+        boxes = self._detector.settled(frame.frame_id, forget)
         return None if boxes is None else _detections(boxes, frame)
+
+    def forget_before(self, frame: Frame) -> None:
+        """Stop following frames before this one, as none of them will be asked again."""
+        if frame.source == self._source:
+            self._detector.forget_before(frame.frame_id)
+
+    def motions(self) -> list[tuple] | None:
+        """How the last frame scanned moved content since the one scanned before it:
+        (x, y, w, h, dx, dy) per followed scroll or window move, the area in the later
+        frame's pixels. Empty if nothing was followed; None if not known. A hint only."""
+        return self._detector.motions()
+
+    def sightings(self) -> list[tuple] | None:
+        """Secrets the last frame's own reads found, as (category, x, y, w, h), with the
+        detector's category names. None if not known."""
+        found = self._detector.sightings()
+        if found is None:
+            return None
+        return [(_CATEGORY_NAMES.get(c, c), x, y, w, h) for c, x, y, w, h in found]
+
+    def reads(self) -> list[tuple] | None:
+        """Where the last frame scanned was read, as (x, y, w, h). A cover elsewhere was
+        carried from earlier frames, so it says nothing new about them. None if not known."""
+        return self._detector.reads()
 
 
 def _detections(boxes, frame: Frame) -> list[Detection]:

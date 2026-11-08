@@ -292,14 +292,16 @@ class LookAheadDetector:
     def __init__(self, fail_on=None):
         self.fail_on = fail_on
         self.settled_ids = []
+        self.forgot = []
 
     def __call__(self, frame):
         if frame.frame_id == self.fail_on:
             raise RuntimeError("scan failed")
         return [*finds_secret(frame), Detection(10, 40, 60, 10, "unread", 1.0, 0, frame.frame_id)]
 
-    def settled(self, frame):
+    def settled(self, frame, forget=True):
         self.settled_ids.append(frame.frame_id)
+        self.forgot.append(forget)
         return finds_secret(frame)
 
 
@@ -325,7 +327,8 @@ def test_looking_ahead_sends_what_later_frames_settled():
     assert no_secret_in(sink.images)
     ids = [frame_id(image) for image in sent]
     assert ids == sorted(ids)
-    assert detect.settled_ids == sorted(detect.settled_ids)
+    # Asked again as later frames come, so never told to forget: order doesn't matter.
+    assert detect.settled_ids and not any(detect.forgot)
 
 
 def test_looking_ahead_waits_within_the_delay():
@@ -334,12 +337,12 @@ def test_looking_ahead_waits_within_the_delay():
     assert min(stats.slack) > 0  # every frame was drawn before it was due
 
 
-def test_a_failed_scan_sends_the_frames_waiting_with_what_they_first_reported():
+def test_a_failed_scan_keeps_what_was_settled_for_the_frames_waiting():
     stats, sink = run_ahead(LookAheadDetector(fail_on=10), look_ahead=0.05)
     waited = [image for image in sink.images[:-1] if frame_id(image) < 10]
     assert waited and no_secret_in(sink.images)
-    # Frames still waiting when the scan failed go out with their black strip.
-    assert any(not shows_incoming(image) for image in waited)
+    # The failed frame never goes out: the last safe picture stands in for it.
+    assert 10 not in [frame_id(image) for image in sink.images[:-1]]
     assert stats.held >= 1
 
 

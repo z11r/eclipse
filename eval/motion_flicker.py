@@ -542,9 +542,15 @@ def _changed_past_edge(now: np.ndarray, before: np.ndarray) -> int:
     return int((now & ~grown_before).sum() + (before & ~grown_now).sum())
 
 
-def _outputs(scene: Scene, look_ahead: int, scan_ms: list):
+def _outputs(scene: Scene, look_ahead: int, scan_ms: list, retain: int = 0):
     """Each frame's image, secrets and output, as the pipeline would send them. With
-    look_ahead, a frame is drawn only after that many later frames have been scanned."""
+    look_ahead, a frame is drawn only after that many later frames have been scanned.
+    With retain, as the pipeline does now: each frame waits unfinished until that many
+    later frames have been scanned, settled and traced back onto it, as it would wait
+    until its output deadline."""
+    if retain:
+        yield from _retained_outputs(scene, retain, scan_ms)
+        return
     detect = TextDetector(reader=AppleVisionReader(), pixel_scale=2)
     if look_ahead:
         detect.look_ahead()
@@ -574,28 +580,89 @@ def _outputs(scene: Scene, look_ahead: int, scan_ms: list):
             yield frame.image, secrets, output, held
 
 
-def _scored(image, output, held):
-    """Held areas show the picture already sent, and already scored, in an earlier frame.
-    Scored again here, old text landing where a secret is now would count as shown."""
+def _retained_outputs(scene: Scene, retain: int, scan_ms: list):
+    from eclipse.compositor.retain import Retained, RetainedFrames
+
+    detect = TextDetector(reader=AppleVisionReader(), pixel_scale=2)
+    detect.look_ahead()
+    detect._detector._unread_read_at = _UNREAD_READ_AT_AHEAD * 2  # as _outputs, above
+    compositor = Compositor(padding=PAD)
+    frames = RetainedFrames()
+    secrets_of = {}
+
+    def finish(record):
+        boxes = record.drawing()
+        held = np.zeros(record.frame.image.shape[:2], bool)
+        if boxes is None:  # unchecked at its deadline: the last safe picture again
+            output = compositor.hold(record.frame).image
+            held[:] = True
+        else:
+            output = compositor.process(record.frame, lambda _: boxes)
+            for d in boxes:
+                if d.category == "held":
+                    held[max(d.y, 0) : d.y + d.h, max(d.x, 0) : d.x + d.w] = True
+        return record.frame.image, secrets_of.pop(record.frame.frame_id), output, held
+
+    for index in range(scene.frames):
+        image, secrets = scene.frame(index)
+        frame = Frame(image, time.monotonic(), "screen", index)
+        started = time.monotonic()
+        found = detect(frame)
+        record = Retained(
+            frame, True, image.nbytes, found, 0, 0.0, detect.motions(), detect.reads(),
+            detect.sightings(),
+        )
+        frames.add(record)
+        frames.refresh(lambda f: detect.settled(f, forget=False))
+        frames.trace(record)
+        detect.forget_before(frames.oldest().frame)
+        scan_ms.append((time.monotonic() - started) * 1000)
+        secrets_of[index] = secrets
+        if len(frames) > retain:
+            yield finish(frames.take(float("inf")))
+    frames.flush()
+    while (record := frames.take(float("inf"))) is not None:
+        yield finish(record)
+
+
+def _scored(image, output, held, previous=None):
+    """Held areas should show the picture already sent, and already scored, in an earlier
+    frame. Scored again here, old text landing where a secret is now would count as
+    shown, so those pixels are left out, but only where the output really is the
+    picture sent before (or black). A held tag alone proves nothing: held pixels showing
+    anything else are scored as they are. Returns the image, the output to score, and
+    how many held pixels showed something other than the earlier picture or black."""
     if not held.any():
-        return image, output
+        return image, output, 0
+    black = (output == 0).all(axis=2)
+    if previous is not None and previous.shape == output.shape:
+        earlier = (output == previous).all(axis=2)
+    else:
+        earlier = np.zeros_like(black)
+    from_before = held & (earlier | black)
     output = output.copy()
-    output[held] = image[held] ^ 1  # never equal to the frame: not shown, not black
-    return image, output
+    output[from_before] = image[from_before] ^ 1  # never equal to the frame: not shown
+    return image, output, int((held & ~from_before).sum())
 
 
-def run(scene: Scene, keep: bool = False, look_ahead: int = 0) -> dict:
+def run(scene: Scene, keep: bool = False, look_ahead: int = 0, retain: int = 0) -> dict:
     exposed, jitter, stray_area, stray_flicker, scan_ms = [], [], [], [], []
     held_frames, held_run, held_longest = 0, 0, 0
+    held_area, held_not_earlier, sent_before = [], 0, None
+    away_area = []  # output pixels changed from the source away from every secret
     before_rel, before_stray = {}, None
-    for image, secrets, output, held in _outputs(scene, look_ahead, scan_ms):
+    for image, secrets, output, held in _outputs(scene, look_ahead, scan_ms, retain):
         if held.any():
             held_frames += 1
             held_run += 1
             held_longest = max(held_longest, held_run)
         else:
             held_run = 0
-        image, output = _scored(image, output, held)
+        held_area.append(int(held.sum()))
+        sent = output
+        image, output, foreign = _scored(image, output, held, sent_before)
+        held_not_earlier += foreign
+        sent_before = sent
         is_black = (output == 0).all(axis=2) & ~(image == 0).all(axis=2)
         height, width = is_black.shape
         near = np.zeros_like(is_black)
@@ -618,7 +685,12 @@ def run(scene: Scene, keep: bool = False, look_ahead: int = 0) -> dict:
         ))
         stray = is_black & ~near
         stray_area.append(int(stray.sum()))
-        stray_flicker.append(0 if before_stray is None else _changed_past_edge(stray, before_stray))
+        if sent.shape == image.shape:
+            away_area.append(int(((sent != image).any(axis=2) & ~near).sum()))
+        stray_flicker.append(
+            0 if before_stray is None or before_stray.shape != stray.shape
+            else _changed_past_edge(stray, before_stray)  # a size change isn't a blink
+        )
         before_rel, before_stray = rel, stray
     result = {
         "scene": scene.name,
@@ -632,6 +704,14 @@ def run(scene: Scene, keep: bool = False, look_ahead: int = 0) -> dict:
         "scan_ms_mean": round(float(np.mean(scan_ms)), 1),
         "held_pane_frames": held_frames,  # panes showing an earlier picture: a stutter
         "longest_hold": held_longest,
+        "held_px_mean": int(np.mean(held_area)) if held_area else 0,
+        # Held pixels that were neither the picture sent before nor black: scored as shown.
+        "held_not_earlier_px": held_not_earlier,
+        "first_exposed_frame": next((i for i, e in enumerate(exposed) if e), None),
+        # Anything changed away from a secret: black, held panes, repeated frames. Max's
+        # principle: nothing changes unless there is something to redact. Target 0.
+        "away_px_mean": int(np.mean(away_area)) if away_area else 0,
+        "frames_changed_away": int(sum(1 for a in away_area if a)),
     }
     if keep:
         result["per_frame"] = list(zip(range(len(exposed)), exposed, jitter, stray_flicker))
@@ -647,10 +727,15 @@ def main(argv=None) -> int:
         "--look-ahead", type=int, default=0,
         help="frames scanned before each frame is drawn, as the pipeline's look-ahead does",
     )
+    parser.add_argument(
+        "--retain", type=int, default=0,
+        help="frames scanned before each frame is drawn, as the pipeline now waits until "
+        "a frame's output deadline, tracing later finds back onto it (60 for a 1 s delay)",
+    )
     args = parser.parse_args(argv)
     names = args.scenes.split(",") if args.scenes else (list(SCENES) if args.scene == "all" else [args.scene])
     for name in names:
-        print(json.dumps(run(SCENES[name](), args.frames, args.look_ahead)), flush=True)
+        print(json.dumps(run(SCENES[name](), args.frames, args.look_ahead, args.retain)), flush=True)
     return 0
 
 

@@ -287,13 +287,39 @@ class IncomingRows:
         while len(self._frames) > self._keep:
             self._frames.popitem(last=False)
 
-    def settled(self, key) -> list[Box] | None:
+    def forget_before(self, key) -> None:
+        """Forget every frame recorded before this one, which has nothing more to settle.
+        Each counts its rows still held, as settled() does when it forgets one."""
+        while self._frames and next(iter(self._frames)) != key:
+            if key not in self._frames:
+                self._frames.clear()
+                return
+            _, record = self._frames.popitem(last=False)
+            self._count_held(record)
+
+    def _count_held(self, record) -> None:
+        """Add a frame's rows no later frame cleared to the counts, once, as it's forgotten."""
+        names = {1: 'unread', 2: 'cut', 3: 'doubtful'}
+        for strip in record.strips:
+            if not (strip.rows != _SETTLED).any():
+                continue
+            lost = int((strip.rows == _LOST).sum())
+            if lost:
+                self._held_rows['lost'] = self._held_rows.get('lost', 0) + lost
+            for code, name in names.items():
+                waiting = strip.rows == _WAITING
+                count = int((waiting & (np.maximum(strip.why, 1) == code)).sum())
+                if count:
+                    self._held_rows[name] = self._held_rows.get(name, 0) + count
+
+    def settled(self, key, forget: bool = True) -> list[Box] | None:
         """A frame's boxes with what later frames read in its strips, or None if it isn't
-        known. It and every frame before it are forgotten."""
+        known. Unless forget is False, it and every frame before it are forgotten; kept,
+        it can be asked again once more frames have settled more of it."""
         record = self._frames.get(key)
         if record is None:
             return None
-        while self._frames:
+        while forget and self._frames:
             first, _ = self._frames.popitem(last=False)
             if first == key:
                 break
@@ -301,17 +327,8 @@ class IncomingRows:
         unread = [box for strip in record.strips for box in strip.boxes() if box[4] == 'unread']
         for strip in record.strips:
             out.extend(box for box in strip.boxes() if box[4] != 'unread')
-        if unread:
-            names = {1: 'unread', 2: 'cut', 3: 'doubtful'}
-            for strip in record.strips:
-                lost = int((strip.rows == _LOST).sum())
-                if lost:
-                    self._held_rows['lost'] = self._held_rows.get('lost', 0) + lost
-                for code, name in names.items():
-                    waiting = strip.rows == _WAITING
-                    count = int((waiting & (np.maximum(strip.why, 1) == code)).sum())
-                    if count:
-                        self._held_rows[name] = self._held_rows.get(name, 0) + count
+        if unread and forget:
+            self._count_held(record)
         # What no later frame could clear, usually a line at the pane's edge, shows the
         # last checked picture there rather than black. Only that, not the whole pane:
         # the rest of the pane moves on, so a scroll doesn't pause for one line.
