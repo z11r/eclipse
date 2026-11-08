@@ -19,3 +19,7 @@ Thumbs.db
 # Personal Claude files
 CLAUDE.local.md
 .claude/settings.local.json
+
+# Local test recordings and IDE settings
+docs/videos/
+.idea/

@@ -41,6 +41,7 @@ let logPollInFlight = false;
 let configPending = false;
 let detectorConfigPending = false;
 let safetyPending = false;
+let coverPending = false;
 let revealTimeouts = new Map();
 
 async function api(path, options={}) {
@@ -75,6 +76,7 @@ function setConnection(value) {
     $('panic-button').disabled=true;$('resume-button').disabled=true;
     $('save-settings').disabled=true;$('save-keywords').disabled=true;
     $('add-keyword').disabled=true;
+    $('cover-blur').disabled=true;
     $('settings-status').textContent='Disconnected';
     $('metric-output').textContent='Unknown';
     $('metric-held').textContent='—';
@@ -125,7 +127,20 @@ function renderState(state) {
   // Preserve any user edits while polling; an unchanged draft follows authoritative state.
   if(!configDirty) draftEnabled=new Set(state.enabled);
   if(!keywordDirty) draftKeywords=[...state.keywords];
-  renderCategories(state);renderKeywords();
+  renderCategories(state);renderKeywords();renderCover(state);
+}
+function renderCover(state){
+  const blur=state.cover_style==='blur';
+  if(!coverPending)$('cover-blur').checked=blur;
+  $('cover-blur').disabled=!connected||coverPending;
+  $('cover-sub').textContent=blur?'Blurred from the colours around each cover':'Solid black';
+}
+async function setCover(style){
+  if(coverPending||!connected)return;
+  coverPending=true;$('cover-blur').disabled=true;
+  try{const state=await api('/api/cover',{method:'PUT',body:JSON.stringify({style})});coverPending=false;renderState(state);}
+  catch(e){notice('Could not change the cover style: '+e.message);coverPending=false;await refreshState();}
+  finally{coverPending=false;if(serverState&&connected)renderCover(serverState);}
 }
 function renderCategories(state) {
   for(const [container,items] of [['text-categories',TEXT],['visual-categories',VISUAL]]) {
@@ -272,6 +287,7 @@ $('keyword-form').addEventListener('submit',e=>{
 });
 $('save-keywords').addEventListener('click',()=>saveConfig('keywords'));
 $('panic-button').addEventListener('click',()=>sendSafety('/api/panic'));
+$('cover-blur').addEventListener('change',e=>setCover(e.target.checked?'blur':'black'));
 $('resume-button').addEventListener('click',()=>sendSafety('/api/resume'));
 refreshState().then(refreshEvents);
 setInterval(refreshState,1000);

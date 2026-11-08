@@ -53,6 +53,7 @@ Useful options:
 | `--ocr windows` | Experimental local Windows OCR. Faster, but has missed keys and card numbers in tests. Use fake secrets for demos; it does not guarantee protection. |
 | `--fps 30` | Capture and send at a different frame rate |
 | `--delay 2` | Seconds behind live |
+| `--cover blur` | Blur covers instead of solid black. The blur is made only from the colours around each cover, never the pixels under it, and hides exactly the same areas. Switch live with the panel's Black bar style toggle |
 | `--test-pattern` | Send a moving pattern with a fake secret instead of your screen, to check OBS |
 | `--no-output` | Do all the work but send nothing, for timing runs |
 
