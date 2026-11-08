@@ -125,6 +125,7 @@ class Compositor:
         self._held: list[tuple[int, int, int, int]] = []  # this frame's held areas
         self._last_safe: Rendered | None = None
         self.held_frames = 0
+        self.unchecked_frames = 0  # frames still unchecked when due: the last safe went out
         self.held_areas = 0  # areas shown as the last safe picture had them: a local stutter
 
     def process(self, frame: Frame, detect: Detector) -> np.ndarray:
@@ -145,6 +146,14 @@ class Compositor:
             image, state, frame.source, frame.frame_id, frame.ts, generation
         )
         return self._last_safe
+
+    def hold(self, frame: Frame, generation: int = 0) -> Rendered:
+        """Send the last safe picture instead of this frame, which isn't fully checked:
+        a repeated frame, not a cover. Black if nothing safe has been drawn yet."""
+        self.unchecked_frames += 1
+        if self._last_safe is not None:
+            return replace(self._last_safe, state="held")
+        return Rendered(np.zeros_like(frame.image), "blackout", None, -1, frame.ts, generation)
 
     @property
     def style(self) -> str:
@@ -203,18 +212,6 @@ class Compositor:
     def _redact(self, frame: Frame) -> np.ndarray:
         output = self._canvas(frame)
         height, width = output.shape[:2]
-        style = self._style  # read once, so every cover in this frame looks the same
-        areas = self.covered_areas(height, width)
-        for left, top, right, bottom in areas:
-            # A solid fill, because blurred text can sometimes be recovered.
-            output[top:bottom, left:right] = FILL
-        if style == BLUR:
-            # Painted over the black, from pixels already safe to show: see frosted().
-            # Every cover is black first, so no ring can reach a secret under another:
-            # it finds black, or a blur already made only from safe pixels.
-            for left, top, right, bottom in areas:
-                if right > left and bottom > top:
-                    output[top:bottom, left:right] = frosted(output, left, top, right, bottom)
         if self._held:
             # Not checked yet, so it shows what the last safe picture showed there: that
             # went out already, so nothing new can. With no such picture, black.
@@ -228,6 +225,20 @@ class Compositor:
                     last.image[top:bottom, left:right] if usable else FILL
                 )
             self.held_areas += len(self._held)
+        # Covers last, so an older picture shown in a held area can never paint over one.
+        style = self._style  # read once, so every cover in this frame looks the same
+        areas = self.covered_areas(height, width)
+        for left, top, right, bottom in areas:
+            # A solid fill, because blurred text can sometimes be recovered.
+            output[top:bottom, left:right] = FILL
+        if style == BLUR:
+            # Painted over the black, from pixels already safe to show: see frosted().
+            # Every cover is black first, so no ring can reach a secret under another:
+            # it finds black, a held area's already-sent picture, or a blur made only
+            # from safe pixels.
+            for left, top, right, bottom in areas:
+                if right > left and bottom > top:
+                    output[top:bottom, left:right] = frosted(output, left, top, right, bottom)
         return output
 
     def _hold(self, frame: Frame, error: Exception, generation: int) -> Rendered:
