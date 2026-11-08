@@ -728,17 +728,22 @@ class Detector:
 
         for _, _, parts in rows:
             parts.sort(key=lambda r: r[0])
-            group = [parts[0]]
-
-            for part in parts[1:]:
-                previous = group[-1]
-                if part[0] - previous[2] <= 2 * (previous[3] - previous[1]):
-                    group.append(part)
+            lanes = []
+            for part in parts:
+                # Fast and accurate OCR can describe the same pixels. Those are
+                # alternatives, not adjacent words: "500" + "500" is not a code.
+                # Keep overlapping observations in separate reading lanes, while
+                # still matching every observation independently in _find_areas.
+                compatible = [
+                    lane for lane in lanes
+                    if 0 <= part[0] - lane[-1][2] <= 2 * (lane[-1][3] - lane[-1][1])
+                ]
+                if compatible:
+                    closest = max(compatible, key=lambda lane: lane[-1][2])
+                    closest.append(part)
                 else:
-                    groups.append(group)
-                    group = [part]
-
-            groups.append(group)
+                    lanes.append([part])
+            groups.extend(lanes)
 
         return [group for group in groups if len(group) > 1]
 

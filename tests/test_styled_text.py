@@ -107,3 +107,32 @@ def test_split_structured_key_and_email_still_match():
                              (['demo@', 'example.com'], 'email')]:
         regions = [(10, 20, 90, 40, pieces[0]), (95, 20, 300, 40, pieces[1])]
         assert any(category == expected for category, _, _ in detector._find_areas(regions))
+
+
+@pytest.mark.parametrize('number', ['500', '17', '20', '28'])
+def test_overlapping_numeric_observations_do_not_manufacture_codes(number):
+    from eclipse.text_detect.detection import Detector
+
+    detector = Detector(reader=lambda image: ([], None))
+    regions = [(10, 20, 50, 40, number), (11, 21, 51, 41, number),
+               (60, 20, 160, 40, 'pages of text')]
+    assert not detector._find_areas(regions)
+    assert all(not (a[0] < b[2] and b[0] < a[2])
+               for group in detector._groups(regions)
+               for a, b in zip(group, group[1:]))
+
+
+@pytest.mark.parametrize('pieces,category', [
+    (['123', '456'], '2fa'),
+    (['+1 (780)', '555-0123'], 'phone'),
+    (['PASSWORD=', 'fake-pass-123'], 'api_key'),
+    (['4111 1111', '1111 1111'], 'card'),
+    (['demo@', 'example.com'], 'email'),
+])
+def test_adjacent_secret_pieces_survive_overlapping_ocr_alternatives(pieces, category):
+    from eclipse.text_detect.detection import Detector
+
+    detector = Detector(reader=lambda image: ([], None))
+    regions = [(10, 20, 100, 40, pieces[0]), (11, 21, 101, 41, pieces[0]),
+               (105, 20, 260, 40, pieces[1]), (106, 21, 261, 41, pieces[1])]
+    assert any(kind == category for kind, _, _ in detector._find_areas(regions))
