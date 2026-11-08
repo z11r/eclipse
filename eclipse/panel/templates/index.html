@@ -15,14 +15,14 @@
 
 <body>
   <!-- One line icon set: 20px grid, 1.5 stroke, round caps. Filled shapes are covers. -->
-  <svg class="icon-sprite" aria-hidden="true" focusable="false">
+  <svg class="icon-sprite" width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
     <symbol id="i-overview" viewBox="0 0 20 20">
       <circle cx="10" cy="10" r="7.25" />
-      <path d="M11.5 3.4a6.75 6.75 0 0 1 0 13.2a5.1 5.1 0 0 0 0-13.2z" class="fill" />
+      <path d="M11.5 3.4a6.75 6.75 0 0 1 0 13.2a5.1 5.1 0 0 0 0-13.2z" class="fill" fill="currentColor" stroke="none" />
     </symbol>
     <symbol id="i-rules" viewBox="0 0 20 20">
       <path d="M3 5.5h14M3 10h14M3 14.5h14" />
-      <rect x="9" y="8.5" width="7" height="3" class="fill" />
+      <rect x="9" y="8.5" width="7" height="3" class="fill" fill="currentColor" stroke="none" />
     </symbol>
     <symbol id="i-activity" viewBox="0 0 20 20">
       <circle cx="10" cy="10" r="7.25" />
@@ -37,14 +37,14 @@
       <path d="M5.75 4.25h10a1.5 1.5 0 0 1 1.5 1.5v7" />
     </symbol>
     <symbol id="i-blackout" viewBox="0 0 20 20">
-      <rect x="3.5" y="5" width="13" height="10" class="fill" />
+      <rect x="3.5" y="5" width="13" height="10" class="fill" fill="currentColor" stroke="none" />
     </symbol>
     <symbol id="i-resume" viewBox="0 0 20 20">
       <path d="M7 5.25v9.5l7.5-4.75z" />
     </symbol>
     <symbol id="i-keyword" viewBox="0 0 20 20">
       <path d="M3 6h3.5M3 14h14" />
-      <rect x="8.25" y="4.25" width="8.75" height="3.5" class="fill" />
+      <rect x="8.25" y="4.25" width="8.75" height="3.5" class="fill" fill="currentColor" stroke="none" />
     </symbol>
     <symbol id="i-desktop" viewBox="0 0 20 20">
       <rect x="2.75" y="3.75" width="14.5" height="9.5" rx="1" />
@@ -70,9 +70,9 @@
         <img class="brand-mark" src="/static/assets/eclipse-mark.svg" alt="" width="40" height="35">
       </a>
       <nav class="side-nav" aria-label="Panel sections">
-        <a href="#overview" class="nav-item active"><svg class="icon"><use href="#i-overview" /></svg>Overview</a>
-        <a href="#protection" class="nav-item"><svg class="icon"><use href="#i-rules" /></svg>What to cover</a>
-        <a href="#activity" class="nav-item"><svg class="icon"><use href="#i-activity" /></svg>Activity</a>
+        <a href="#overview" class="nav-item active"><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><use href="#i-overview" /></svg>Overview</a>
+        <a href="#protection" class="nav-item"><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><use href="#i-rules" /></svg>What to cover</a>
+        <a href="#activity" class="nav-item"><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><use href="#i-activity" /></svg>Activity</a>
       </nav>
       <div class="aside-spacer"></div>
       <div class="sidebar-bottom">
@@ -86,7 +86,7 @@
 
       <div id="notice" role="alert" class="notice hidden"></div>
       <div id="mock-warning" class="mock-warning hidden">
-        <svg class="icon" aria-hidden="true"><use href="#i-warning" /></svg>
+        <svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-warning" /></svg>
         <p><strong>Simulation.</strong> These controls drive a stand-in backend. Nothing is captured and OBS gets
           nothing from this panel.</p>
       </div>
@@ -95,7 +95,7 @@
         <div class="state-block">
           <section class="hero" aria-label="Stream safety state">
             <div class="hero-sky">
-              <svg class="orbital" viewBox="0 0 160 160" aria-hidden="true" focusable="false">
+              <svg class="orbital" viewBox="0 0 160 160" width="168" height="168" aria-hidden="true" focusable="false">
                 <defs>
                   <mask id="crescent-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="160" height="160">
                     <rect width="160" height="160" fill="#fff" />
@@ -145,19 +145,19 @@
 
           <section class="metrics" aria-label="Pipeline readings">
             <div class="metric">
-              <div class="metric-title"><svg class="icon" aria-hidden="true"><use href="#i-camera" /></svg>Virtual camera
+              <div class="metric-title"><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-camera" /></svg>Virtual camera
               </div>
               <div id="metric-output" class="metric-value">—</div>
               <div class="metric-sub">Link to OBS</div>
             </div>
             <div class="metric">
-              <div class="metric-title"><svg class="icon" aria-hidden="true"><use href="#i-frames" /></svg>Frames held
+              <div class="metric-title"><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-frames" /></svg>Frames held
               </div>
               <div id="metric-held" class="metric-value">—</div>
               <div class="metric-sub">Sent an older safe frame instead</div>
             </div>
             <div class="metric metric-health" id="detector-metric">
-              <svg class="health-ring" viewBox="0 0 40 40" aria-hidden="true" focusable="false">
+              <svg class="health-ring" viewBox="0 0 40 40" width="38" height="38" fill="none" aria-hidden="true" focusable="false">
                 <circle class="health-track" cx="20" cy="20" r="16" />
                 <circle class="health-fill" cx="20" cy="20" r="16" pathLength="100" />
               </svg>
@@ -172,9 +172,9 @@
             <h3 id="emergency-title">Blackout</h3>
           </div>
           <p>Sends OBS a black frame straight away. It stays black until you press Resume.</p>
-          <div class="action-row"><button id="panic-button" class="button danger" disabled><svg class="icon"
+          <div class="action-row"><button id="panic-button" class="button danger" disabled><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
                 aria-hidden="true"><use href="#i-blackout" /></svg>Black out stream</button><button
-              id="resume-button" class="button outline" disabled><svg class="icon" aria-hidden="true"><use
+              id="resume-button" class="button outline" disabled><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use
                   href="#i-resume" /></svg>Resume output</button></div>
           <div class="help" id="panic-hint">Connecting to Eclipse…</div>
           <div class="help hotkey-hint">From any app: <kbd>Ctrl</kbd> <kbd>Option</kbd> <kbd>B</kbd>, when the panic
@@ -211,7 +211,7 @@
             <form id="keyword-form"><label class="input-label" for="keyword-input">New keyword</label>
               <div class="keyword-entry"><input id="keyword-input" type="password" autocomplete="off" maxlength="120"
                   placeholder="Type a keyword" /><button type="submit" class="button outline" id="add-keyword"
-                  disabled><svg class="icon" aria-hidden="true"><use href="#i-add" /></svg>Add</button></div>
+                  disabled><svg class="icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-add" /></svg>Add</button></div>
             </form>
             <div id="keyword-list" class="keywords-list">
               <div class="empty">No keywords configured</div>
@@ -248,13 +248,13 @@
               <h3 id="mode-title">Source</h3>
             </div>
             <div class="mode-row">
-              <svg class="mode-emblem icon" aria-hidden="true"><use href="#i-desktop" /></svg>
+              <svg class="mode-emblem icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-desktop" /></svg>
               <div class="mode-info"><strong>Desktop</strong>
                 <p>Text on your screen. Webcam covering is planned.</p>
               </div><span class="mode-active">In use</span>
             </div>
             <div class="mode-row disabled">
-              <svg class="mode-emblem icon" aria-hidden="true"><use href="#i-irl" /></svg>
+              <svg class="mode-emblem icon" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-irl" /></svg>
               <div class="mode-info"><strong>IRL streaming</strong>
                 <p>A moving camera or remote feed</p>
               </div><span class="coming-soon" id="irl-label">Unavailable</span>
