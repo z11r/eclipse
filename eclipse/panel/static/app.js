@@ -66,7 +66,7 @@ function notice(message, info=false) {
 function clearNotice() { $('notice').classList.add('hidden'); }
 function setConnection(value) {
   connected=value;
-  $('connection').textContent=value?'● Stream connected':'● Control service disconnected';
+  $('connection').textContent=value?'Connected to Eclipse':'Not connected to Eclipse';
   $('connection').className='connection '+(value?'good':'bad');
   if (!value) {
     $('status-heading').textContent='Status unavailable';
@@ -81,6 +81,7 @@ function setConnection(value) {
     $('metric-output').textContent='Unknown';
     $('metric-held').textContent='—';
     $('metric-detectors').textContent='—';
+    $('detector-metric').style.setProperty('--ready','0');
     $('metric-detector-sub').textContent='Cannot verify detector health';
     $('output-chip').textContent='Output unverified';
     $('mode-chip').textContent='Mode unverified';
@@ -107,6 +108,7 @@ function renderState(state) {
   const ready=detectorStates.filter(s=>s==='ready').length;
   const degraded=detectorStates.filter(s=>s==='degraded').length;
   $('metric-detectors').textContent=`${ready}/${detectorStates.length} ready`;
+  $('detector-metric').style.setProperty('--ready',String(detectorStates.length?ready/detectorStates.length:0));
   const unavailable=detectorStates.filter(s=>s==='unavailable').length;
   $('metric-detector-sub').textContent=[degraded?`${degraded} degraded`:null,unavailable?`${unavailable} unavailable`:null].filter(Boolean).join(' · ') || 'All detectors available';
   $('irl-label').textContent=state.irl_available?'Available':'Planned';
@@ -229,7 +231,7 @@ function renderEvents(){
   if(eventRows.length===0){const el=document.createElement('div');el.className='empty';el.textContent='No detection events reported.';parent.append(el);return;}
   for(const event of [...eventRows].sort((a,b)=>b.seq-a.seq).slice(0,60)){
     const row=document.createElement('div');row.className='event-row';
-    const icon=document.createElement('span');icon.className='event-icon';icon.textContent='◇';
+    const icon=document.createElement('span');icon.className='event-icon';icon.textContent='◇';icon.setAttribute('aria-hidden','true');
     const copy=document.createElement('div');copy.className='event-copy';
     const name=document.createElement('div');name.className='event-name';name.textContent=CATEGORY_NAMES[event.category] || 'Privacy detection';
     const meta=document.createElement('div');meta.className='event-meta';meta.textContent=`${event.source} · ${new Date(event.time*1000).toLocaleTimeString()}`;

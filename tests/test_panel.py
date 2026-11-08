@@ -81,8 +81,8 @@ def test_docs_and_health(setup):
 def test_frontend_served_with_assets(setup):
     client, _ = setup
     index = client.get("/")
-    assert "Your privacy," in index.text
-    assert "SIMULATION MODE" in index.text
+    assert "Eclipse control panel" in index.text
+    assert "Simulation." in index.text
     assert "/static/app.js" in index.text
     js = client.get("/static/app.js")
     css = client.get("/static/styles.css")
