@@ -51,6 +51,8 @@ On Windows, run this in PowerShell after installing the requirements:
 .\.venv\Scripts\python.exe -m eclipse.main --ocr windows --capture mss --fps 15 --max-width 1920 --delay 1 --no-panel --no-hotkey
 ```
 
+Windows screen mode uses four native OCR threads to read ahead during the delay. Use `--ocr-workers 2` for fewer workers or `--ocr-workers 0` for the previous sequential Windows reader. The Windows worker module loads only with `--ocr windows`; Apple OCR and its process pool are unchanged.
+
 This command runs without the panel and panic shortcut. Ctrl+C stops it.
 
 The default command uses RapidOCR at 60 fps with a 1-second delay. While it runs:

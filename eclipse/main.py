@@ -496,8 +496,16 @@ def main(argv: list[str] | None = None) -> int:
             detect = TextDetector(reader=reader, pixel_scale=2, **careful)
             padding = PADDING * 2
         elif args.ocr == "windows":
+            from eclipse.text_detect.windows_read_ahead import WindowsOcrPool
+
             source = screen_source(args.capture, args.max_width, args.retina, args.fps)
-            detect = TextDetector(reader=WindowsOCRReader())
+            reader = WindowsOCRReader()
+            if args.ocr_workers > 0:
+                try:
+                    reader = read_ahead = ReadAhead(WindowsOcrPool(args.ocr_workers))
+                except ReadError:
+                    print("Windows OCR workers didn't start, so reading one area at a time")
+            detect = TextDetector(reader=reader)
         else:
             source = screen_source(args.capture, args.max_width, args.retina, args.fps)
             detect = TextDetector()

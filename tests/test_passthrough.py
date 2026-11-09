@@ -253,7 +253,7 @@ def test_windows_mode_uses_native_reader_without_changing_rapid_default(monkeypa
         return lambda frame: []
 
     monkeypatch.setattr(app, 'TextDetector', detector)
-    for index, extra in enumerate([['--ocr', 'windows'], []]):
+    for index, extra in enumerate([['--ocr', 'windows', '--ocr-workers', '0'], []]):
         assert app.main(extra + ['--max-frames', '3', '--delay', '0.05',
                                  '--log', str(tmp_path / f'run-{index}.log')]) == 0
     assert seen == [{'reader': reader}, {}]
