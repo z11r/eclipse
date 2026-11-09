@@ -17,7 +17,7 @@ import re
 import unicodedata
 from typing import Iterable, NamedTuple
 
-from eclipse.text_detect import labels
+from eclipse.text_detect import addresses, labels
 
 
 class Span(NamedTuple):
@@ -206,7 +206,8 @@ _WORDS_AFTER_COLON = 6  # most words a "password: correct horse ..." value runs 
 # Values that only name where a secret lives: calls, environment and template variables,
 # and lookups on settings objects. The secret itself isn't on screen.
 _REFERENCE = re.compile(
-    r'(?:[A-Za-z_][\w.]*\s*\('
+    # OCR can read a space after a dot: os. getenv(
+    r'(?:[A-Za-z_][\w.]*(?:\.[ \t]+[A-Za-z_][\w.]*)*\s*\('
     # A lookup by a setting's name, however OCR garbles the call before it: a spell-check
     # underline turned os.getenv("DB_PASSWORD") into R%AoionY("D8_PASSWORD").
     # The closing ) OCR can read as } ] | l J or 1, as under a spell-check underline.
@@ -215,8 +216,8 @@ _REFERENCE = re.compile(
     r'|[S5][{(Il1|]\s*[A-Z][A-Z0-9]*_[A-Z0-9_]+\s*[})Il1|]'
     r'|\$\{|\$\(|\$[A-Z_][A-Z0-9_]*(?![\w])|%[A-Za-z_]\w*%|\{\{|<%'
     # Lookups of the environment, through OCR's usual misreads of t, ( and _ at small
-    # sizes: os.gelenv{"DB, os.getenvl"DB.
-    r'|(?:os\.)?ge[tl1]env|os\.environ|process\.env'
+    # sizes: os.gelenv{"DB, os.getenvl"DB, and a space after the dot: os. getenvl"DB.
+    r'|(?:os\.[ \t]*)?ge[tl1]env|os\.[ \t]*environ|process\.[ \t]*env'
     r'|(?:import\.meta\.env|ENV|env|environ|settings'
     r'|config|conf|cfg|self|this|secrets|vault|args|opts|options|params|request|props)'
     r'(?:\.|\[))'
@@ -578,7 +579,7 @@ def _match(text: str, keywords: tuple[str, ...]) -> list[Span]:
     spans = []
     for found in (
         _emails(standard), _phones(standard), _codes(standard), _keys(standard),
-        _labelled_secrets(standard), _cards(standard),
+        _labelled_secrets(standard), _cards(standard), _addresses(standard),
     ):
         spans.extend(found)
     for word in keywords:
@@ -597,9 +598,51 @@ def _match(text: str, keywords: tuple[str, ...]) -> list[Span]:
     return placed
 
 
+# Endings a real address has. Only checked when a bare number stands before the @.
+_EMAIL_ENDINGS = frozenset({
+    'com', 'org', 'net', 'edu', 'gov', 'mil', 'int', 'io', 'ca', 'co', 'dev', 'ai', 'app',
+    'me', 'us', 'uk', 'de', 'fr', 'nl', 'au', 'jp', 'cn', 'in', 'br', 'ru', 'it', 'es',
+    'se', 'no', 'ch', 'info', 'biz', 'xyz', 'tech', 'online', 'site', 'email', 'mail',
+})
+# Methods a decorator calls: @app.get("/health"), @router.post(...), @pytest.fixture.
+_DECORATOR_CALLS = frozenset({
+    'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'route', 'api', 'websocket',
+    'middleware', 'fixture', 'mark', 'parametrize', 'command', 'group', 'task', 'setter',
+    'getter', 'deleter', 'wraps', 'cache', 'callback', 'listener', 'handler', 'validator',
+    'register', 'event', 'on', 'hook', 'job', 'cron', 'retry', 'skip', 'skipif', 'xfail',
+})
+
+
+def _decorator_not_email(match: re.Match) -> bool:
+    """An editor's line number joined to a decorator, as words are when tried with no
+    space: 31 @app.get("/health") reads as 31@app.getl"/health"), with ( misread as l.
+
+    It's a decorator when the ending is a method called with ( right after it, or the
+    ( misread and a quoted argument after. With a bare number before the @, any ending
+    an address doesn't have counts too (12@pytest.fixture). Endings an address has stay
+    emails, so 12345@gmail.com is still covered."""
+    found = match.group()
+    at = next(index for index, char in enumerate(found) if char in '@©')
+    ending = re.split(r'[\s.,]+', found[at + 1 :].strip())[-1].lower()
+    after = match.string[match.end() : match.end() + 1]
+    if ending in _DECORATOR_CALLS and after == '(':
+        return True
+    if ending[-1:] in ('l', 'i') and ending[:-1] in _DECORATOR_CALLS and after in ('"', "'", ')'):
+        return True
+    name = found[:at].strip(' \t_')
+    return name.isdigit() and ending not in _EMAIL_ENDINGS
+
+
 def _emails(text: str) -> Iterable[Span]:
     for match in _EMAIL.finditer(text):
-        yield Span('email', match.start(), match.end(), match.start(), True)
+        if not _decorator_not_email(match):
+            yield Span('email', match.start(), match.end(), match.start(), True)
+
+
+def _addresses(text: str) -> Iterable[Span]:
+    # Not standalone: an address is several words, and needs them read together.
+    for start, end, anchor in addresses.address_parts(text):
+        yield Span('address', start, end, anchor, False)
 
 
 @functools.lru_cache(maxsize=16384)

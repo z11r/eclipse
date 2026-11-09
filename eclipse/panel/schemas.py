@@ -7,14 +7,14 @@ from enum import Enum
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-TEXT_CATEGORIES = ("two_fa", "email", "phone", "api_key", "card", "keyword")
+TEXT_CATEGORIES = ("two_fa", "email", "phone", "api_key", "card", "address", "keyword")
 VISUAL_CATEGORIES = (
     "street_sign", "house_number", "licence_plate", "mail_label",
     "window_view", "map", "storefront",
 )
 ALL_CATEGORIES = TEXT_CATEGORIES + VISUAL_CATEGORIES
 Category = Literal[
-    "two_fa", "email", "phone", "api_key", "card", "keyword",
+    "two_fa", "email", "phone", "api_key", "card", "address", "keyword",
     "street_sign", "house_number", "licence_plate", "mail_label",
     "window_view", "map", "storefront",
 ]

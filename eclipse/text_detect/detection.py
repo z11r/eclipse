@@ -29,7 +29,7 @@ from eclipse.text_detect.rules import (
 )
 
 Box = tuple[int, int, int, int, str]
-CATEGORIES = frozenset({'email', 'phone', '2fa', 'api_key', 'card', 'keyword'})
+CATEGORIES = frozenset({'email', 'phone', '2fa', 'api_key', 'card', 'address', 'keyword'})
 
 _BAND_MARGIN = 24  # rows re-read above and below a change
 _SIDE_MARGIN = 60  # columns re-read either side of a change
