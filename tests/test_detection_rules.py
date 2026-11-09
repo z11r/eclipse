@@ -5,7 +5,7 @@ Keys are joined from pieces so secret scanners don't mistake them for real ones.
 
 import pytest
 
-from eclipse.text_detect.detection import classify_text
+from eclipse.text_detect.detection import classify_text, find_matches
 
 
 @pytest.mark.parametrize(
@@ -129,3 +129,29 @@ def test_spaced_and_numbered_emails_are_still_emails(text):
 )
 def test_an_env_lookup_read_with_a_spaced_dot_is_not_a_password(text):
     assert "api_key" not in classify_text(text)
+
+
+@pytest.mark.parametrize(
+    "text, number",
+    [
+        # Vision reads "!" as "1", "l", "I" or "|" and joins it to the word before.
+        ("Call me after stream1780-555-0123", "780-555-0123"),
+        ("Call me after streaml780-555-0123", "780-555-0123"),
+        ("Call me after streamI(780) 555-0123", "(780) 555-0123"),
+        ("Call me after stream|780.555.0123", "780.555.0123"),
+    ],
+)
+def test_phone_after_a_misread_exclamation_mark_is_found(text, number):
+    spans = [text[a:b] for category, a, b in find_matches(text) if category == "phone"]
+    assert spans == [number]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "build1780555012",  # digits with no phone separators
+        "item11780-555-0123",  # a digit, not a stray mark, before the number
+    ],
+)
+def test_glued_digits_that_are_not_a_phone_are_left_alone(text):
+    assert not [c for c, _, _ in find_matches(text) if c == "phone"]
