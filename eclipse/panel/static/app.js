@@ -16,7 +16,8 @@ const panelToken=loadPanelToken();
 const TEXT = [
   ['two_fa','2FA verification codes'], ['email','Email addresses'],
   ['phone','Phone numbers'], ['api_key','API keys & tokens'],
-  ['card','Payment card candidates'], ['keyword','Custom keywords']
+  ['card','Payment card candidates'], ['address','Street addresses'],
+  ['keyword','Custom keywords']
 ];
 const VISUAL = [
   ['street_sign','Street signs'], ['house_number','House numbers'],

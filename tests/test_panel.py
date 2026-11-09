@@ -3,6 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 from eclipse.panel.app import create_app
 from eclipse.panel.controller import MockPipelineController
+from eclipse.panel.schemas import ALL_CATEGORIES
 
 
 @pytest.fixture
@@ -19,7 +20,7 @@ def test_initial_mock_state(setup):
     assert state["simulated"] is True
     assert state["output_connected"] is False
     assert state["output_state"] == "stopped"
-    assert len(state["enabled"]) == 13
+    assert len(state["enabled"]) == len(ALL_CATEGORIES)
     assert all(v == "unavailable" for v in state["detector_health"].values())
 
 
@@ -42,7 +43,7 @@ def test_config_is_atomic_and_persists_keywords(setup):
     # Restart: only keywords persist, categories return to all enabled.
     restarted = MockPipelineController(controller._config_path)
     assert restarted.get_state().keywords == good["keywords"]
-    assert len(restarted.get_state().enabled) == 13
+    assert len(restarted.get_state().enabled) == len(ALL_CATEGORIES)
 
 
 def test_irl_rejected_and_desktop_accepted(setup):

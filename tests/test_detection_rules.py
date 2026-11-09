@@ -90,3 +90,42 @@ def test_labeled_phone_is_covered_despite_ocr_digit_errors(text):
 @pytest.mark.parametrize('text', ['Phone: unavailable', 'Phone settings', 'Mobile: version 2'])
 def test_phone_labels_without_numbers_do_not_match(text):
     assert 'phone' not in classify_text(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "12 @pytest.fixture",
+        "7 @functools.lru_cache(maxsize=None)",
+        # As Apple OCR read them live, words joined with no space or with _
+        '31@app.getl"/health")',
+        '31_@app.getl"/health"_)',
+        '75@app.post("/checkout")',
+        '?keys·Hhide35@app.post("/checkout")',
+    ],
+)
+def test_a_line_number_before_a_decorator_is_not_an_email(text):
+    assert "email" not in classify_text(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["12345 @gmail.com", "12345@gmail.com", "alice @example.com", "alice@example.com(work)",
+     "support@shop.co"],
+)
+def test_spaced_and_numbered_emails_are_still_emails(text):
+    assert "email" in classify_text(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'DB_PASSWORD = os. getenv("DB_PASSWORD")',
+        '18 DB_PASSWORD = os. getenv("DB_PASSWORD")',
+        '18_DB_PASSWORD_=_os._getenv("DB_PASSWORD")',
+        # As Apple OCR read it live on main: ( as l, and an unread = marked
+        '18 DB PASSWORD \u2063 os. getenvl"DB_PASSWORD" )',
+    ],
+)
+def test_an_env_lookup_read_with_a_spaced_dot_is_not_a_password(text):
+    assert "api_key" not in classify_text(text)

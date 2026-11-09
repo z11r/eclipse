@@ -19,6 +19,7 @@ Category = Literal[
     "phone",
     "api_key",
     "card",
+    "address",  # a street, a town line with its postal code, a PO box
     "keyword",
     "unread",  # text coming onto the screen, kept covered until it can be read
     "held",  # a pane not yet checked: it shows its last checked picture instead
