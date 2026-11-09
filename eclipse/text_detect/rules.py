@@ -59,6 +59,13 @@ _PHONE_INTERNATIONAL = re.compile(
     r'(?<![\w+])\+[1-9]\d{0,2}(?:[ .\-]?\(?\d{1,5}\)?){1,6}(?![\w+])'
 )
 _PHONE_DIGITS = (8, 15)
+# A number right after a word that ends in a stray 1, l or I: OCR reads "!" as one of
+# these and joins it to the word, so "stream! 780-555-0123" comes back as
+# "stream1780-555-0123". Only a number written with its separators counts, so an ID like
+# "build1780555012" isn't taken for one.
+_PHONE_AFTER_MARK = re.compile(
+    r'(?<=[A-Za-z][1lI])(?:\(\d{3}\) ?|\d{3}[ .\-])\d{3}[ .\-]\d{4}(?!\w)'
+)
 # A labeled phone remains private even when OCR misreads some digits, and in any region's
 # own format. Without a colon the number must start right after the label.
 _PHONE_LABEL = re.compile(
@@ -493,6 +500,8 @@ def _misspelled_passwords(text: str, careful: bool = False) -> Iterable[Span]:
 
 def _phones(text: str) -> Iterable[Span]:
     for match in _PHONE.finditer(text):
+        yield Span('phone', match.start(), match.end(), match.start(), True)
+    for match in _PHONE_AFTER_MARK.finditer(text):
         yield Span('phone', match.start(), match.end(), match.start(), True)
     for match in _PHONE_INTERNATIONAL.finditer(text):
         if _PHONE_DIGITS[0] <= _digits(match.group()) <= _PHONE_DIGITS[1]:
