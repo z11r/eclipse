@@ -130,6 +130,8 @@ Test clips use planted fake secrets and clues only. Never commit a real secret o
 
 ## Credits
 
+- Eclipse was made by: Max, Manan Singh, Ian Lartey, Owen 
+
 - Secret rules are inspired by [gitleaks](https://github.com/gitleaks/gitleaks) patterns.
 - OCR by [RapidOCR](https://github.com/RapidAI/RapidOCR), and Apple's Vision framework through [PyObjC](https://github.com/ronaldoussoren/pyobjc).
 - Screen capture through ScreenCaptureKit (PyObjC) and [mss](https://github.com/BoboTiG/python-mss), image work with [OpenCV](https://opencv.org/).
