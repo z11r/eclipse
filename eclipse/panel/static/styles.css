@@ -29,18 +29,18 @@
 :root {
   color-scheme: dark;
 
-  /* Nebula */
-  --ground: #0A0B24;
-  --surface: #16183C;
-  --surface-raised: #1E2150;
-  --text: #E8E9FF;
-  --muted: #9A9ED0;
-  --flare: #C4A1FF;
+  /* Silver on real stars */
+  --ground: #050505;
+  --surface: #121212;
+  --surface-raised: #1C1C1C;
+  --text: #F2F2F2;
+  --muted: #ABABAB;
+  --flare: #FFFFFF;
   --cover: #02020C;
-  --cover-edge: #2A2D5E;
-  --line: #2A2D5E;
-  --line-soft: rgba(139, 143, 196, .16);
-  --control-edge: #6A6EB0; /* 3:1 or more on ground and surface, for field and switch edges */
+  --cover-edge: #3A3A3A;
+  --line: #3A3A3A;
+  --line-soft: rgba(255, 255, 255, .12);
+  --control-edge: #6E6E6E; /* 3:1 or more on ground and surface, for field and switch edges */
 
   /* Meaning, kept apart from the flare */
   --ok: #7EE2B8;
@@ -67,7 +67,8 @@ html {
 
 body {
   margin: 0;
-  background: var(--ground);
+  /* Real star field: NASA photo art002e012588 (Artemis II crew), public domain. */
+  background: linear-gradient(rgba(5, 5, 5, .5), rgba(5, 5, 5, .5)), var(--ground) url('/static/assets/stars-4k.jpg') center / cover no-repeat fixed;
   color: var(--text);
   font-family: var(--voice);
   font-weight: 400;
@@ -632,7 +633,7 @@ kbd {
 }
 
 .button.primary:hover:not(:disabled) {
-  background: #D4BAFF;
+  background: #E0E0E0;
 }
 
 .button.outline {
@@ -785,7 +786,7 @@ kbd {
 
 .switch input:checked+.switch-track {
   border-color: var(--flare);
-  background: rgba(196, 161, 255, .14);
+  background: rgba(255, 255, 255, .12);
 }
 
 .switch input:checked+.switch-track::after {

@@ -6,23 +6,23 @@
       <circle cx="180" cy="140" r="99" fill="#000"/>
     </mask>
     <linearGradient id="ga" gradientUnits="userSpaceOnUse" x1="90" y1="140" x2="290" y2="140">
-      <stop offset="0" stop-color="#E8E9FF" stop-opacity=".15"/>
-      <stop offset=".55" stop-color="#E8E9FF" stop-opacity=".8"/>
-      <stop offset="1" stop-color="#C4A1FF"/>
+      <stop offset="0" stop-color="#F2F2F2" stop-opacity=".15"/>
+      <stop offset=".55" stop-color="#F2F2F2" stop-opacity=".8"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
     </linearGradient>
     <radialGradient id="ra" gradientUnits="userSpaceOnUse" cx="290" cy="140" r="100">
       <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset=".22" stop-color="#C4A1FF" stop-opacity=".9"/>
-      <stop offset="1" stop-color="#F472B6" stop-opacity="0"/>
+      <stop offset=".22" stop-color="#FFFFFF" stop-opacity=".9"/>
+      <stop offset="1" stop-color="#B8B8B8" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="ha" gradientUnits="userSpaceOnUse" cx="290" cy="140" r="46">
       <stop offset="0" stop-color="#FFFFFF"/>
       <stop offset=".12" stop-color="#FFFFFF" stop-opacity=".95"/>
-      <stop offset=".34" stop-color="#C4A1FF" stop-opacity=".45"/>
-      <stop offset="1" stop-color="#F472B6" stop-opacity="0"/>
+      <stop offset=".34" stop-color="#FFFFFF" stop-opacity=".45"/>
+      <stop offset="1" stop-color="#B8B8B8" stop-opacity="0"/>
     </radialGradient>
   </defs>
-  <rect x="140" y="15" width="250" height="250" rx="56" fill="#0A0B24"/>
+  <rect x="140" y="15" width="250" height="250" rx="56" fill="#050505"/>
   <circle cx="190" cy="140" r="100" fill="url(#ga)" mask="url(#ma)"/>
   <circle cx="290" cy="140" r="46" fill="url(#ha)"/>
   <path d="M388.48 122.64 L290.42 142.36 L191.52 157.36 L289.58 137.64 Z M300.42 199.09 L287.83 140.38 L279.58 80.91 L292.17 139.62 Z M326.04 165.24 L288.97 141.47 L253.96 114.76 L291.03 138.53 Z M264.76 176.04 L288.53 138.97 L315.24 103.96 L291.47 141.03 Z M313.43 145.19 L289.74 141.17 L266.57 134.81 L290.26 138.83 Z M302.90 160.24 L288.99 140.64 L277.10 119.76 L291.01 139.36 Z M284.81 163.43 L288.83 139.74 L295.19 116.57 L291.17 140.26 Z M269.76 152.90 L289.36 138.99 L310.24 127.10 L290.64 141.01 Z" fill="url(#ra)"/>
