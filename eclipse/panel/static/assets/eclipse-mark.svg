@@ -6,20 +6,20 @@
       <circle cx="180" cy="140" r="99" fill="#000"/>
     </mask>
     <linearGradient id="ga" gradientUnits="userSpaceOnUse" x1="90" y1="140" x2="290" y2="140">
-      <stop offset="0" stop-color="#E8E9FF" stop-opacity=".15"/>
-      <stop offset=".55" stop-color="#E8E9FF" stop-opacity=".8"/>
-      <stop offset="1" stop-color="#C4A1FF"/>
+      <stop offset="0" stop-color="#F2F2F2" stop-opacity=".15"/>
+      <stop offset=".55" stop-color="#F2F2F2" stop-opacity=".8"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
     </linearGradient>
     <radialGradient id="ra" gradientUnits="userSpaceOnUse" cx="290" cy="140" r="100">
       <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset=".22" stop-color="#C4A1FF" stop-opacity=".9"/>
-      <stop offset="1" stop-color="#F472B6" stop-opacity="0"/>
+      <stop offset=".22" stop-color="#FFFFFF" stop-opacity=".9"/>
+      <stop offset="1" stop-color="#B8B8B8" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="ha" gradientUnits="userSpaceOnUse" cx="290" cy="140" r="46">
       <stop offset="0" stop-color="#FFFFFF"/>
       <stop offset=".12" stop-color="#FFFFFF" stop-opacity=".95"/>
-      <stop offset=".34" stop-color="#C4A1FF" stop-opacity=".45"/>
-      <stop offset="1" stop-color="#F472B6" stop-opacity="0"/>
+      <stop offset=".34" stop-color="#FFFFFF" stop-opacity=".45"/>
+      <stop offset="1" stop-color="#B8B8B8" stop-opacity="0"/>
     </radialGradient>
   </defs>
   <circle cx="190" cy="140" r="100" fill="url(#ga)" mask="url(#ma)"/>

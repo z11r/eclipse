@@ -1,12 +1,12 @@
 <h1 align="center">
-  <img src="docs/images/eclipse-banner.png" alt="Eclipse" width="100%">
+  <img src="docs/images/eclipse-banner.jpg" alt="Eclipse" width="100%">
 </h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-2A2D5E?style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="Platform: macOS and Windows">
-  <img src="https://img.shields.io/badge/Python-3.11-2A2D5E?logo=python&style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="Python 3.11">
-  <img src="https://img.shields.io/badge/OBS-30%2B-2A2D5E?logo=obsstudio&style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="OBS 30+">
-  <img src="https://img.shields.io/badge/natHacks-2026-2A2D5E?style=flat-square&labelColor=0A0B24&color=2A2D5E&logoColor=E8E9FF" alt="natHacks 2026">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-3A3A3A?style=flat-square&labelColor=050505&color=3A3A3A&logoColor=F2F2F2" alt="Platform: macOS and Windows">
+  <img src="https://img.shields.io/badge/Python-3.11-3A3A3A?logo=python&style=flat-square&labelColor=050505&color=3A3A3A&logoColor=F2F2F2" alt="Python 3.11">
+  <img src="https://img.shields.io/badge/OBS-30%2B-3A3A3A?logo=obsstudio&style=flat-square&labelColor=050505&color=3A3A3A&logoColor=F2F2F2" alt="OBS 30+">
+  <img src="https://img.shields.io/badge/natHacks-2026-3A3A3A?style=flat-square&labelColor=050505&color=3A3A3A&logoColor=F2F2F2" alt="natHacks 2026">
 </p>
 
 <p align="center">
