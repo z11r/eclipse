@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="#preview">Preview</a> ·
   <a href="#setup">Setup</a> ·
   <a href="#running">Running</a> ·
   <a href="#how-it-works">How it works</a> ·
@@ -20,6 +21,14 @@
 <br>
 
 Eclipse is a desktop app that sits between your screen and OBS. It reads the screen, covers secrets with solid black boxes, and sends the result to OBS as a virtual camera, one second behind live. It covers emails, phone numbers, 2FA codes, API keys, card numbers and your own keywords. A frame that hasn't been scanned never goes out. Built for natHacks 2026 (Standard Division, Defense & Security).
+
+## Preview
+
+<p align="center">
+  <img src="docs/images/eclipse-preview.gif" alt="A note with a username and password. In Eclipse's output both values stay under black boxes while the note is moved." width="100%">
+</p>
+
+What viewers see through Eclipse: the note's username and password stay covered while the window moves.
 
 ## Setup
 
